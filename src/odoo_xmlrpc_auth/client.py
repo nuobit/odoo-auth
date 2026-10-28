@@ -1,6 +1,7 @@
 import configparser
 import os
 import stat
+import urllib.parse
 import xmlrpc.client
 
 _SECTION = "odoo"
@@ -21,6 +22,37 @@ def _check_permissions(path, fd=None):
         fix = "700" if stat.S_ISDIR(mode) else "600"
         raise ConfigError(
             f"{path} is accessible by others. Fix with: chmod {fix} {path}"
+        )
+
+
+def _check_url(url, config_path):
+    """Raise ConfigError unless ``url`` is an http or https URL that names a
+    host, with no user info, in one line without spaces.
+
+    xmlrpc.client and http.client quote a url they refuse, and the repr of a
+    ProtocolError or of a ServerProxy quotes its user info; a url line that is
+    wrong can hold the password: no message here quotes the url.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+        # urlsplit leaves the port unchecked: reading it raises ValueError
+        # for a port that is not a number.
+        _ = parts.port
+    except ValueError:
+        # Its message can quote the url: ConfigError is raised after this block.
+        parts = None
+    # urlsplit drops line breaks and tabs: the url itself is checked for them.
+    if parts is None or " " in url or not url.isprintable():
+        raise ConfigError(f"The url in {config_path} cannot be parsed as a URL")
+    elif parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ConfigError(
+            f"The url in {config_path} must start with http:// or https:// "
+            "and name a host"
+        )
+    elif "@" in parts.netloc:
+        raise ConfigError(
+            f"The url in {config_path} must have no user or password before "
+            "its host"
         )
 
 
@@ -67,6 +99,7 @@ def _read_config(profile):
             f"Missing keys in {config_path}: {', '.join(missing)}"
         )
 
+    _check_url(config["url"], config_path)
     config["url"] = config["url"].rstrip("/")
     return config
 
