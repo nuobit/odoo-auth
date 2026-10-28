@@ -77,6 +77,21 @@ proxy.execute_kw("project.task", "write",
 
 Without `profile=`, it behaves exactly like the original `xmlrpc.client.ServerProxy`.
 
+With `profile=`, a failed authentication raises
+`odoo_xmlrpc_auth.client.AuthError`, which names the profile, never its user
+or database. A failure of the transport, in the authentication or in an
+`execute_kw` call (a name that does not resolve, a connection refused or
+dropped, TLS, an HTTP status other than 200), raises
+`odoo_xmlrpc_auth.client.RequestError` instead of the error of `socket`,
+`ssl`, `http.client` or `xmlrpc.client`. It carries the profile (`profile`),
+that error's class name (`error_class`) and its errno or HTTP status, if any
+(`code`), never its text, which can quote the url. It is also an instance of
+that error's class, so `except OSError` and
+`except xmlrpc.client.ProtocolError` keep catching it; as a `ProtocolError`
+it keeps its `errcode`, while its `url` and `errmsg` are empty. An Odoo
+`xmlrpc.client.Fault` comes through as it is. The CLI prints either error on
+one line.
+
 ## Configure a profile
 
 One file per Odoo instance, `chmod 600`:
