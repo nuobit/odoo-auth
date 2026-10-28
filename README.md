@@ -97,7 +97,10 @@ chmod 600 ~/.config/odoo-xmlrpc-auth/customer1.conf
 ```
 
 The tool refuses to run if the config directory or files are accessible by
-group or others (like `ssh` does with `~/.ssh/`).
+group or others (like `ssh` does with `~/.ssh/`), or if `url` is not an http
+or https URL that names a host, on one line and without spaces, or has a user
+or password before its host. The url is not shown: xmlrpc.client would quote
+it, user info included, in its errors.
 
 ## Security model
 

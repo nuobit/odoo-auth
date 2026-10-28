@@ -12,6 +12,7 @@ Run from the repository root:
 import os
 import tempfile
 import unittest
+import xmlrpc.client
 from unittest import mock
 
 from odoo_xmlrpc_auth.client import ConfigError, ServerProxy
@@ -109,6 +110,106 @@ class ServerProxyTest(StoreTestCase):
             ServerProxy(profile="erp")
         self.assertIn("erp.conf is not a valid INI file", str(caught.exception))
         self.assertNeverShows(caught.exception, PASSWORD)
+
+
+class UrlTest(StoreTestCase):
+    """A url xmlrpc.client would refuse, or keep with a password in it, is
+    refused when the store is loaded: their errors quote the url, the repr of
+    a ProtocolError or a ServerProxy quotes its user info, and a url line
+    that is wrong can hold the password."""
+
+    def make_store_with_url(self, url):
+        self.make_store(
+            "[odoo]\n"
+            f"url = {url}\n"
+            "db = odoo_db_test\n"
+            "user = odoo_user_test\n"
+            "password = odoo_dummy_password_test\n"
+        )
+
+    def test_a_url_with_a_password_is_refused_unshown(self):
+        self.make_store_with_url(
+            "https://odoo_user_test:odoo_dummy_password_test@odoo.example.com"
+        )
+        with self.assertRaises(ConfigError) as caught:
+            ServerProxy(profile="erp")
+        self.assertIn("must have no user or password before its host", str(caught.exception))
+        self.assertNeverShows(caught.exception, PASSWORD)
+        self.common.authenticate.assert_not_called()
+
+    def test_a_url_that_runs_onto_the_next_line_is_refused_unshown(self):
+        # An indented line is read as part of the value above it.
+        self.make_store_with_url("https://odoo.example.com\n  odoo_dummy_password_test")
+        with self.assertRaises(ConfigError) as caught:
+            ServerProxy(profile="erp")
+        self.assertIn("cannot be parsed as a URL", str(caught.exception))
+        self.assertNeverShows(caught.exception, PASSWORD)
+
+    def test_a_url_with_a_space_is_refused_unshown(self):
+        self.make_store_with_url("https://odoo.example.com/ odoo_dummy_password_test")
+        with self.assertRaises(ConfigError) as caught:
+            ServerProxy(profile="erp")
+        self.assertIn("cannot be parsed as a URL", str(caught.exception))
+        self.assertNeverShows(caught.exception, PASSWORD)
+
+    def test_a_url_with_a_port_that_is_not_a_number_is_refused_unshown(self):
+        # A host left out reads the user as the host and the password as
+        # its port.
+        self.make_store_with_url("https://odoo_user_test:odoo_dummy_password_test")
+        with self.assertRaises(ConfigError) as caught:
+            ServerProxy(profile="erp")
+        self.assertIn("cannot be parsed as a URL", str(caught.exception))
+        self.assertNeverShows(caught.exception, PASSWORD)
+
+    def test_a_url_line_holding_the_password_is_refused_unshown(self):
+        self.make_store_with_url("odoo_dummy_password_test")
+        with self.assertRaises(ConfigError) as caught:
+            ServerProxy(profile="erp")
+        self.assertIn("must start with http:// or https://", str(caught.exception))
+        self.assertNeverShows(caught.exception, PASSWORD)
+
+    def test_a_user_and_password_on_the_url_line_are_refused_unshown(self):
+        # "odoouser:" reads as a scheme.
+        self.make_store_with_url("odoouser:odoo_dummy_password_test")
+        with self.assertRaises(ConfigError) as caught:
+            ServerProxy(profile="erp")
+        self.assertIn("must start with http:// or https://", str(caught.exception))
+        self.assertNeverShows(caught.exception, PASSWORD)
+
+    def test_a_url_with_another_scheme_is_refused(self):
+        self.make_store_with_url("ftp://odoo.example.com")
+        with self.assertRaisesRegex(
+            ConfigError,
+            r"The url in .*erp\.conf must start with http:// or https:// and "
+            r"name a host$",
+        ):
+            ServerProxy(profile="erp")
+
+    def test_a_url_with_no_host_is_refused_unshown(self):
+        self.make_store_with_url("https:///odoo_dummy_password_test")
+        with self.assertRaises(ConfigError) as caught:
+            ServerProxy(profile="erp")
+        self.assertIn("and name a host", str(caught.exception))
+        self.assertNeverShows(caught.exception, PASSWORD)
+
+    def test_a_url_that_cannot_be_split_is_refused_unshown(self):
+        # NFKC turns the fullwidth solidus of the password into "/": urlsplit
+        # refuses the url, quoting its user info, the password with it.
+        self.make_store_with_url(
+            "https://odoo_user_test:odoo_dummy_password_test／@odoo.example.com"
+        )
+        with self.assertRaises(ConfigError) as caught:
+            ServerProxy(profile="erp")
+        self.assertIn("cannot be parsed as a URL", str(caught.exception))
+        self.assertNeverShows(caught.exception, PASSWORD)
+
+    def test_a_url_with_a_port_passes(self):
+        self.make_store_with_url("https://odoo.example.com:8069")
+        self.common.authenticate.return_value = 7
+        ServerProxy(profile="erp")
+        xmlrpc.client.ServerProxy.assert_called_once_with(
+            "https://odoo.example.com:8069/xmlrpc/2/common", allow_none=True
+        )
 
 
 if __name__ == "__main__":
