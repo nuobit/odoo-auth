@@ -46,6 +46,16 @@ def _read_config(profile):
             f"Create it with a [{_SECTION}] section and keys: "
             + ", ".join(_REQUIRED_KEYS)
         ) from None
+    except (configparser.Error, UnicodeDecodeError):
+        # Their text or repr can quote the store, which holds the password.
+        # Raised here, even `from None`, ConfigError would keep them as its
+        # __context__: it is raised after this block.
+        parser = None
+    if parser is None:
+        raise ConfigError(
+            f"{config_path} is not a valid INI file. Its lines are not "
+            "shown, as they can hold the password."
+        )
 
     if not parser.has_section(_SECTION):
         raise ConfigError(f"Missing [{_SECTION}] section in {config_path}")
