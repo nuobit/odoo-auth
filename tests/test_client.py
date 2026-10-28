@@ -79,6 +79,13 @@ class ServerProxyTest(StoreTestCase):
         ):
             ServerProxy(profile="erp")
 
+    def test_a_missing_store_chains_no_error(self):
+        self.use_home()
+        with self.assertRaises(ConfigError) as caught:
+            ServerProxy(profile="erp")
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+
     def test_a_store_without_a_section_never_shows_its_lines(self):
         self.make_store("password = odoo_dummy_password_test\n")
         with self.assertRaises(ConfigError) as caught:

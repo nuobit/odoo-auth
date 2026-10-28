@@ -79,27 +79,27 @@ def _read_config(profile):
         pass
 
     parser = configparser.RawConfigParser()
+    failure = None
     try:
         with open(config_path, encoding="utf-8") as f:
             _check_permissions(config_path, fd=f.fileno())
             parser.read_file(f)
     except FileNotFoundError:
-        raise ConfigError(
+        failure = ConfigError(
             f"Config file not found: {config_path}\n"
             f"Create it with a [{_SECTION}] section and keys: "
             + ", ".join(_REQUIRED_KEYS)
-        ) from None
+        )
     except (configparser.Error, UnicodeDecodeError):
         # Their text or repr can quote the store, which holds the password.
-        # Raised here, even `from None`, ConfigError would keep them as its
-        # __context__: it is raised after this block.
-        parser = None
-    if parser is None:
-        raise ConfigError(
+        failure = ConfigError(
             f"{config_path} is not a valid INI file. Its lines are not "
             "shown, as they can hold the password."
         )
-
+    # Raised in a handler, even `from None`, ConfigError would keep the
+    # caught error as its __context__: it is raised after them.
+    if failure is not None:
+        raise failure
     if not parser.has_section(_SECTION):
         raise ConfigError(f"Missing [{_SECTION}] section in {config_path}")
 
