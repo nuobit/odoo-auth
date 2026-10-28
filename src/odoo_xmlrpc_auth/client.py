@@ -6,6 +6,7 @@ import xmlrpc.client
 
 _SECTION = "odoo"
 _REQUIRED_KEYS = ("url", "db", "user", "password")
+_URL_SCHEMES = ("http", "https")
 
 
 class ConfigError(Exception):
@@ -26,13 +27,15 @@ def _check_permissions(path, fd=None):
 
 
 def _check_url(url, config_path):
-    """Raise ConfigError unless ``url`` is an http or https URL that names a
-    host, with no user info, in one line without spaces.
+    """Raise ConfigError unless ``url`` names a host after one of
+    _URL_SCHEMES, with a port that is a number if it has one and no user or
+    password, on one line of printable ASCII without spaces.
 
-    xmlrpc.client and http.client quote a url they refuse, and the repr of a
-    ProtocolError or of a ServerProxy quotes its user info; a url line that is
-    wrong can hold the password: no message here quotes the url.
+    The transport quotes a url it refuses, and a url line that is wrong can
+    hold a secret: no message here quotes any part of the url, not even its
+    scheme.
     """
+    failure = None
     try:
         parts = urllib.parse.urlsplit(url)
         # urlsplit leaves the port unchecked: reading it raises ValueError
@@ -40,14 +43,22 @@ def _check_url(url, config_path):
         _ = parts.port
     except ValueError:
         # Its message can quote the url: ConfigError is raised after this block.
-        parts = None
-    # urlsplit drops line breaks and tabs: the url itself is checked for them.
-    if parts is None or " " in url or not url.isprintable():
-        raise ConfigError(f"The url in {config_path} cannot be parsed as a URL")
-    elif parts.scheme not in ("http", "https") or not parts.hostname:
+        failure = ConfigError(f"The url in {config_path} cannot be parsed as a URL")
+    if failure is not None:
+        raise failure
+    # urlsplit drops line breaks and tabs, and keeps spaces and characters
+    # outside ASCII, which the transport refuses with an error that quotes
+    # the url.
+    if " " in url or not url.isprintable() or not url.isascii():
         raise ConfigError(
-            f"The url in {config_path} must start with http:// or https:// "
-            "and name a host"
+            f"The url in {config_path} must be one line of printable ASCII "
+            "without spaces"
+        )
+    elif parts.scheme not in _URL_SCHEMES or not parts.hostname:
+        raise ConfigError(
+            f"The url in {config_path} must start with "
+            + " or ".join(f"{scheme}://" for scheme in _URL_SCHEMES)
+            + " and name a host"
         )
     elif "@" in parts.netloc:
         raise ConfigError(

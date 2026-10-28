@@ -142,15 +142,30 @@ class UrlTest(StoreTestCase):
         self.make_store_with_url("https://odoo.example.com\n  odoo_dummy_password_test")
         with self.assertRaises(ConfigError) as caught:
             ServerProxy(profile="erp")
-        self.assertIn("cannot be parsed as a URL", str(caught.exception))
+        self.assertIn(
+            "must be one line of printable ASCII without spaces", str(caught.exception)
+        )
         self.assertNeverShows(caught.exception, PASSWORD)
 
     def test_a_url_with_a_space_is_refused_unshown(self):
         self.make_store_with_url("https://odoo.example.com/ odoo_dummy_password_test")
         with self.assertRaises(ConfigError) as caught:
             ServerProxy(profile="erp")
-        self.assertIn("cannot be parsed as a URL", str(caught.exception))
+        self.assertIn(
+            "must be one line of printable ASCII without spaces", str(caught.exception)
+        )
         self.assertNeverShows(caught.exception, PASSWORD)
+
+    def test_a_url_outside_ascii_is_refused_unshown(self):
+        # http.client cannot encode such a path, and its error keeps the url.
+        self.make_store_with_url("https://odoo.example.com/odoo_dummy_password_test_€")
+        with self.assertRaises(ConfigError) as caught:
+            ServerProxy(profile="erp")
+        self.assertIn(
+            "must be one line of printable ASCII without spaces", str(caught.exception)
+        )
+        self.assertNeverShows(caught.exception, PASSWORD)
+        self.common.authenticate.assert_not_called()
 
     def test_a_url_with_a_port_that_is_not_a_number_is_refused_unshown(self):
         # A host left out reads the user as the host and the password as
