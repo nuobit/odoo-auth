@@ -4,7 +4,7 @@ import sys
 import xmlrpc.client
 
 from . import __version__
-from .client import AuthError, ConfigError, ServerProxy
+from .client import AuthError, ConfigError, RequestError, ServerProxy
 
 
 def die(msg):
@@ -38,7 +38,7 @@ def main():
             call["model"], call["method"],
             call.get("args", []), call.get("kwargs", {}),
         )
-    except (ConfigError, AuthError) as e:
+    except (ConfigError, AuthError, RequestError) as e:
         die(e)
     except xmlrpc.client.Fault as e:
         die(e.faultString)

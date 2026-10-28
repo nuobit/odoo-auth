@@ -1,4 +1,6 @@
 import configparser
+import functools
+import http.client
 import os
 import stat
 import urllib.parse
@@ -7,6 +9,10 @@ import xmlrpc.client
 _SECTION = "odoo"
 _REQUIRED_KEYS = ("url", "db", "user", "password")
 _URL_SCHEMES = ("http", "https")
+# What a call raises in its transport: the socket's and TLS's errors, a
+# malformed HTTP answer, an HTTP status other than 200. An Odoo Fault is the
+# server's answer, not one of them.
+_TRANSPORT_ERRORS = (OSError, http.client.HTTPException, xmlrpc.client.ProtocolError)
 
 
 class ConfigError(Exception):
@@ -15,6 +21,56 @@ class ConfigError(Exception):
 
 class AuthError(Exception):
     """Raised when XML-RPC authentication fails."""
+
+
+class RequestError(Exception):
+    """Raised instead of the error a call raises in its transport: a name
+    that does not resolve, a connection refused or dropped, TLS, a malformed
+    HTTP answer, an HTTP status other than 200.
+
+    That error's text can quote the url, so this one carries only the
+    profile (``profile``), the error's class name (``error_class``) and its
+    errno or HTTP status, if any (``code``). Its class is also a subclass of
+    that error's class, so ``except OSError``, ``except
+    xmlrpc.client.ProtocolError`` and the like keep catching it.
+    """
+
+    def __init__(self, profile, error_class, code=None):
+        self.profile = profile
+        self.error_class = error_class
+        self.code = code
+        if isinstance(self, xmlrpc.client.ProtocolError):
+            # Its own fields, the status kept, without the url and the
+            # server's text.
+            super().__init__("", code, "", {})
+        else:
+            super().__init__(str(self))
+
+    def __str__(self):
+        code = f", code {self.code}" if self.code is not None else ""
+        return (
+            f"A request of profile {self.profile!r} failed: {self.error_class}"
+            f"{code}. Its message is not shown, as it can quote the "
+            "profile's values."
+        )
+
+
+@functools.lru_cache(maxsize=None)
+def _request_error_class(error_class):
+    """The class of the RequestError raised instead of an ``error_class``: a
+    subclass of both, so that ``except error_class`` keeps catching it."""
+    return type(RequestError.__name__, (RequestError, error_class), {})
+
+
+def _request_error(profile, error):
+    """The RequestError raised instead of ``error``, one of _TRANSPORT_ERRORS."""
+    if isinstance(error, xmlrpc.client.ProtocolError):
+        code = error.errcode
+    elif isinstance(error, OSError):
+        code = error.errno
+    else:
+        code = None
+    return _request_error_class(type(error))(profile, type(error).__name__, code)
 
 
 def _check_permissions(path, fd=None):
@@ -120,7 +176,9 @@ class ServerProxy(xmlrpc.client.ServerProxy):
 
     When ``profile`` is given, reads credentials from the config file,
     authenticates, builds the URL automatically, and prepends
-    db/uid/password to every ``execute_kw`` call.
+    db/uid/password to every ``execute_kw`` call. The authentication and
+    each ``execute_kw`` raise RequestError instead of an error of their
+    transport; an Odoo Fault comes through as it is.
 
     When ``profile`` is not given, behaves exactly like the original.
 
@@ -138,25 +196,34 @@ class ServerProxy(xmlrpc.client.ServerProxy):
         if profile is not None:
             config = _read_config(profile)
             url = config["url"]
+            self._profile = profile
             self._db = config["db"]
 
             kwargs.setdefault("allow_none", True)
 
-            with xmlrpc.client.ServerProxy(
-                f"{url}/xmlrpc/2/common", allow_none=True
-            ) as common:
-                self._uid = common.authenticate(
-                    self._db, config["user"], config["password"], {}
-                )
+            failure = None
+            try:
+                with xmlrpc.client.ServerProxy(
+                    f"{url}/xmlrpc/2/common", allow_none=True
+                ) as common:
+                    self._uid = common.authenticate(
+                        self._db, config["user"], config["password"], {}
+                    )
+            except _TRANSPORT_ERRORS as error:
+                # Its text can quote the url: RequestError, raised after
+                # this block, does not.
+                failure = _request_error(profile, error)
+            if failure is not None:
+                raise failure
 
             if not self._uid:
-                raise AuthError(
-                    f"Authentication failed for {config['user']}@{self._db}"
-                )
+                # The user and the db are values of the store.
+                raise AuthError(f"Authentication failed for profile {profile!r}")
 
             self._password = config["password"]
             uri = f"{url}/xmlrpc/2/object"
         else:
+            self._profile = None
             self._db = None
             self._uid = None
             self._password = None
@@ -164,6 +231,17 @@ class ServerProxy(xmlrpc.client.ServerProxy):
         super().__init__(uri, *args, **kwargs)
 
     def execute_kw(self, *args, **kwargs):
-        if self._db is not None:
-            args = (self._db, self._uid, self._password, *args)
-        return super().__getattr__("execute_kw")(*args, **kwargs)
+        if self._profile is None:
+            return super().__getattr__("execute_kw")(*args, **kwargs)
+        failure = None
+        try:
+            result = super().__getattr__("execute_kw")(
+                self._db, self._uid, self._password, *args, **kwargs
+            )
+        except _TRANSPORT_ERRORS as error:
+            # Its text can quote the url: RequestError, raised after this
+            # block, does not.
+            failure = _request_error(self._profile, error)
+        if failure is not None:
+            raise failure
+        return result

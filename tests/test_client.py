@@ -5,17 +5,28 @@ endpoint that authenticates is replaced, so no test can reach a server. A
 store that cannot be read must not show its text: the error that says so
 carries none of it, in its message, its repr or a chained exception.
 
+A call after the authentication is stopped at xmlrpc.client's Transport,
+which raises what the test gives it. A refused connection is the
+ConnectionRefusedError(111, 'Connection refused') that xmlrpc.client raised
+for 127.0.0.1 port 1 on 2026-10-28; a ProtocolError is what xmlrpc.client
+raises for an HTTP status other than 200, its url being the host and the
+path it called.
+
 Run from the repository root:
     PYTHONPATH=src python3 -m unittest discover -s tests
 """
 
+import contextlib
+import io
 import os
+import sys
 import tempfile
 import unittest
 import xmlrpc.client
 from unittest import mock
 
-from odoo_xmlrpc_auth.client import ConfigError, ServerProxy
+from odoo_xmlrpc_auth import cli
+from odoo_xmlrpc_auth.client import AuthError, ConfigError, RequestError, ServerProxy
 
 PASSWORD = "odoo_dummy_password_test"
 
@@ -231,6 +242,114 @@ class UrlTest(StoreTestCase):
         ServerProxy(profile="erp")
         xmlrpc.client.ServerProxy.assert_called_once_with(
             "https://odoo.example.com:8069/xmlrpc/2/common", allow_none=True
+        )
+
+
+class CallTest(StoreTestCase):
+    """A failure of the transport, in the authentication or in a call, is a
+    RequestError that names the profile and quotes nothing of the store."""
+
+    def setUp(self):
+        super().setUp()
+        self.make_store(
+            "[odoo]\n"
+            "url = https://odoo.example.com\n"
+            "db = odoo_db_test\n"
+            "user = odoo_user_test\n"
+            "password = odoo_dummy_password_test\n"
+        )
+
+    def fail_each_call_with(self, error):
+        """Every call after the authentication raises ``error`` in xmlrpc.client's
+        transport, as if the server could not be reached."""
+        patcher = mock.patch.object(xmlrpc.client.Transport, "request", side_effect=error)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_refused_authentication_names_the_profile_only(self):
+        self.common.authenticate.return_value = False
+        with self.assertRaises(AuthError) as caught:
+            ServerProxy(profile="erp")
+        self.assertEqual(str(caught.exception), "Authentication failed for profile 'erp'")
+        self.assertNeverShows(caught.exception, "odoo_user_test")
+        self.assertNeverShows(caught.exception, "odoo_db_test")
+
+    def test_a_refused_connection_is_a_request_error_with_its_errno(self):
+        self.common.authenticate.side_effect = ConnectionRefusedError(
+            111, "Connection refused"
+        )
+        with self.assertRaises(RequestError) as caught:
+            ServerProxy(profile="erp")
+        self.assertEqual(
+            str(caught.exception),
+            "A request of profile 'erp' failed: ConnectionRefusedError, code 111. "
+            "Its message is not shown, as it can quote the profile's values.",
+        )
+        self.assertIsInstance(caught.exception, ConnectionRefusedError)
+
+    def test_an_http_status_in_the_authentication_never_shows_the_url(self):
+        self.common.authenticate.side_effect = xmlrpc.client.ProtocolError(
+            "odoo.example.com/xmlrpc/2/common", 502, "Bad Gateway", {}
+        )
+        with self.assertRaises(RequestError) as caught:
+            ServerProxy(profile="erp")
+        self.assertNeverShows(caught.exception, "odoo.example.com")
+
+    def test_a_protocol_error_keeps_its_status_for_except_protocol_error(self):
+        self.common.authenticate.side_effect = xmlrpc.client.ProtocolError(
+            "odoo.example.com/xmlrpc/2/common", 502, "Bad Gateway", {}
+        )
+        with self.assertRaises(xmlrpc.client.ProtocolError) as caught:
+            ServerProxy(profile="erp")
+        self.assertEqual(caught.exception.errcode, 502)
+        self.assertEqual(caught.exception.url, "")
+        self.assertEqual(caught.exception.errmsg, "")
+
+    def test_an_http_status_in_a_call_never_shows_the_url(self):
+        self.common.authenticate.return_value = 7
+        proxy = ServerProxy(profile="erp")
+        self.fail_each_call_with(xmlrpc.client.ProtocolError(
+            "odoo.example.com/xmlrpc/2/object", 503, "Service Unavailable", {}
+        ))
+        with self.assertRaises(RequestError) as caught:
+            proxy.execute_kw("res.partner", "read", [[1]])
+        self.assertEqual(caught.exception.code, 503)
+        self.assertNeverShows(caught.exception, "odoo.example.com")
+
+    def test_an_odoo_fault_in_a_call_passes(self):
+        # The server's own answer: its text is what a caller debugs with.
+        self.common.authenticate.return_value = 7
+        proxy = ServerProxy(profile="erp")
+        self.fail_each_call_with(xmlrpc.client.Fault(2, "Record does not exist"))
+        with self.assertRaises(xmlrpc.client.Fault) as caught:
+            proxy.execute_kw("res.partner", "read", [[1]])
+        self.assertNotIsInstance(caught.exception, RequestError)
+        self.assertEqual(caught.exception.faultString, "Record does not exist")
+
+
+class CliTest(StoreTestCase):
+    def test_a_failure_of_the_transport_prints_one_line_without_the_url(self):
+        self.make_store(
+            "[odoo]\n"
+            "url = https://odoo.example.com\n"
+            "db = odoo_db_test\n"
+            "user = odoo_user_test\n"
+            "password = odoo_dummy_password_test\n"
+        )
+        self.common.authenticate.side_effect = xmlrpc.client.ProtocolError(
+            "odoo.example.com/xmlrpc/2/common", 502, "Bad Gateway", {}
+        )
+        argv = ["odoo-xmlrpc-auth", "--profile", "erp", '{"model": "res.partner", "method": "search"}']
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", argv):
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    cli.main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(
+            stderr.getvalue(),
+            "Error: A request of profile 'erp' failed: ProtocolError, code 502. "
+            "Its message is not shown, as it can quote the profile's values.\n",
         )
 
 
