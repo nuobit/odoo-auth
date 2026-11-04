@@ -73,6 +73,11 @@ def _request_error(profile, error):
     return _request_error_class(type(error))(profile, type(error).__name__, code)
 
 
+def _is_one_ascii_line(text):
+    """Whether ``text`` is one line of printable ASCII without spaces."""
+    return " " not in text and text.isprintable() and text.isascii()
+
+
 def _check_permissions(path, fd=None):
     mode = (os.fstat(fd) if fd is not None else os.stat(path)).st_mode
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
@@ -105,7 +110,7 @@ def _check_url(url, config_path):
     # urlsplit drops line breaks and tabs, and keeps spaces and characters
     # outside ASCII, which the transport refuses with an error that quotes
     # the url.
-    if " " in url or not url.isprintable() or not url.isascii():
+    if not _is_one_ascii_line(url):
         raise ConfigError(
             f"The url in {config_path} must be one line of printable ASCII "
             "without spaces"
@@ -171,6 +176,49 @@ def _read_config(profile):
     return config
 
 
+def _log_in(profile, config):
+    """Log in over XML-RPC with the values of ``config``, the store of
+    ``profile``, and return the uid Odoo gives.
+
+    Raises RequestError instead of an error of the transport, and AuthError
+    when Odoo refuses the login.
+    """
+    failure = None
+    try:
+        with xmlrpc.client.ServerProxy(
+            f"{config['url']}/xmlrpc/2/common", allow_none=True
+        ) as common:
+            uid = common.authenticate(
+                config["db"], config["user"], config["password"], {}
+            )
+    except _TRANSPORT_ERRORS as error:
+        # Its text can quote the url: RequestError, raised after this
+        # block, does not.
+        failure = _request_error(profile, error)
+    if failure is not None:
+        raise failure
+
+    if not uid:
+        # The user and the db are values of the store.
+        raise AuthError(f"Authentication failed for profile {profile!r}")
+    return uid
+
+
+def _send(profile, function, *args, **kwargs):
+    """Return ``function(*args, **kwargs)``, a call of ``profile``, raising
+    RequestError instead of an error of its transport."""
+    failure = None
+    try:
+        result = function(*args, **kwargs)
+    except _TRANSPORT_ERRORS as error:
+        # Its text can quote the url: RequestError, raised after this
+        # block, does not.
+        failure = _request_error(profile, error)
+    if failure is not None:
+        raise failure
+    return result
+
+
 class ServerProxy(xmlrpc.client.ServerProxy):
     """Drop-in replacement for xmlrpc.client.ServerProxy with Odoo auth.
 
@@ -195,33 +243,12 @@ class ServerProxy(xmlrpc.client.ServerProxy):
     def __init__(self, uri=None, /, *args, profile=None, **kwargs):
         if profile is not None:
             config = _read_config(profile)
-            url = config["url"]
             self._profile = profile
             self._db = config["db"]
-
-            kwargs.setdefault("allow_none", True)
-
-            failure = None
-            try:
-                with xmlrpc.client.ServerProxy(
-                    f"{url}/xmlrpc/2/common", allow_none=True
-                ) as common:
-                    self._uid = common.authenticate(
-                        self._db, config["user"], config["password"], {}
-                    )
-            except _TRANSPORT_ERRORS as error:
-                # Its text can quote the url: RequestError, raised after
-                # this block, does not.
-                failure = _request_error(profile, error)
-            if failure is not None:
-                raise failure
-
-            if not self._uid:
-                # The user and the db are values of the store.
-                raise AuthError(f"Authentication failed for profile {profile!r}")
-
+            self._uid = _log_in(profile, config)
             self._password = config["password"]
-            uri = f"{url}/xmlrpc/2/object"
+            kwargs.setdefault("allow_none", True)
+            uri = f"{config['url']}/xmlrpc/2/object"
         else:
             self._profile = None
             self._db = None
@@ -233,15 +260,12 @@ class ServerProxy(xmlrpc.client.ServerProxy):
     def execute_kw(self, *args, **kwargs):
         if self._profile is None:
             return super().__getattr__("execute_kw")(*args, **kwargs)
-        failure = None
-        try:
-            result = super().__getattr__("execute_kw")(
-                self._db, self._uid, self._password, *args, **kwargs
-            )
-        except _TRANSPORT_ERRORS as error:
-            # Its text can quote the url: RequestError, raised after this
-            # block, does not.
-            failure = _request_error(self._profile, error)
-        if failure is not None:
-            raise failure
-        return result
+        return _send(
+            self._profile,
+            super().__getattr__("execute_kw"),
+            self._db,
+            self._uid,
+            self._password,
+            *args,
+            **kwargs,
+        )
