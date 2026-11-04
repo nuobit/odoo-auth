@@ -8,14 +8,18 @@ Run from the repository root:
     PYTHONPATH=src python3 -m unittest discover -s tests
 """
 
+import contextlib
+import io
 import json
 import os
+import sys
 import unittest
 import xmlrpc.client
 from unittest import mock
 
 import requests
 
+from odoo_xmlrpc_auth import cli
 from odoo_xmlrpc_auth.client import (
     AuthError,
     Client,
@@ -47,7 +51,7 @@ class StubTestCase(StoreMixin, unittest.TestCase):
         self.addCleanup(stub.stop)
         return stub
 
-    def make_client(self, url, api, password, profile="erp"):
+    def make_profile(self, url, api, password, profile="erp"):
         self.make_store(
             "[odoo]\n"
             f"url = {url}\n"
@@ -57,6 +61,9 @@ class StubTestCase(StoreMixin, unittest.TestCase):
             f"api = {api}\n",
             profile=profile,
         )
+
+    def make_client(self, url, api, password, profile="erp"):
+        self.make_profile(url, api, password, profile)
         client = Client(profile=profile)
         self.addCleanup(client.close)
         return client
@@ -391,6 +398,116 @@ class Json2ClientTest(StubTestCase):
         with self.assertRaisesRegex(TypeError, "ids must be None"):
             self.client.call("res.partner", "read", 7)
         self.assertEqual(self.odoo.requests, [])
+
+
+class CliTest(StubTestCase):
+    """The CLI calls by name through Client, and keeps execute_kw's
+    positional args for an `api = xmlrpc` profile only."""
+
+    def setUp(self):
+        super().setUp()
+        self.xmlrpc_odoo = self.start(XmlRpcOdoo())
+        self.json2_odoo = self.start(Json2Odoo())
+        self.make_profile(self.xmlrpc_odoo.url, "xmlrpc", PASSWORD, "erp-xmlrpc")
+        self.make_profile(self.json2_odoo.url, "json2", KEY, "erp-json2")
+
+    def run_cli(self, profile, payload):
+        """Run the CLI on ``payload`` (JSON text, or a value sent as JSON);
+        return its exit code, its stdout and its stderr."""
+        text = payload if isinstance(payload, str) else json.dumps(payload)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = 0
+        argv = ["odoo-xmlrpc-auth", "--profile", profile, text]
+        with mock.patch.object(sys, "argv", argv):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                try:
+                    cli.main()
+                except SystemExit as exit_:
+                    code = exit_.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_the_named_form_calls_over_json2(self):
+        self.json2_odoo.answers[("res.partner", "read")] = [{"id": 7, "name": "Example"}]
+        code, out, err = self.run_cli(
+            "erp-json2",
+            {"model": "res.partner", "method": "read", "ids": [7], "kwargs": {"fields": ["name"]}},
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(out), [{"id": 7, "name": "Example"}])
+        self.assertEqual(
+            json.loads(self.json2_odoo.requests[0]["body"]), {"ids": [7], "fields": ["name"]}
+        )
+
+    def test_the_named_form_calls_over_xmlrpc(self):
+        self.xmlrpc_odoo.answers[("res.partner", "search_count")] = 3
+        code, out, err = self.run_cli(
+            "erp-xmlrpc",
+            {"model": "res.partner", "method": "search_count", "kwargs": {"domain": []}},
+        )
+        self.assertEqual((code, out, err), (0, "3\n", ""))
+        self.assertEqual(self.xmlrpc_odoo.calls[0]["args"], [])
+        self.assertEqual(self.xmlrpc_odoo.calls[0]["kwargs"], {"domain": []})
+
+    def test_the_args_form_calls_execute_kw_on_an_xmlrpc_profile(self):
+        self.xmlrpc_odoo.answers[("res.partner", "read")] = [{"id": 7}]
+        code, out, err = self.run_cli(
+            "erp-xmlrpc",
+            {"model": "res.partner", "method": "read", "args": [[7]], "kwargs": {"fields": ["id"]}},
+        )
+        self.assertEqual((code, out, err), (0, '[{"id": 7}]\n', ""))
+        self.assertEqual(
+            self.xmlrpc_odoo.calls,
+            [{"model": "res.partner", "method": "read", "args": [[7]], "kwargs": {"fields": ["id"]}}],
+        )
+        self.assertEqual(self.xmlrpc_odoo.logins, 1)
+
+    def test_the_args_form_is_refused_on_a_json2_profile(self):
+        code, out, err = self.run_cli(
+            "erp-json2", {"model": "res.partner", "method": "read", "args": [[7]]}
+        )
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(
+            err,
+            "Error: 'args' is for `api = xmlrpc` profiles, and profile 'erp-json2' has "
+            "`api = json2`: give 'ids' and 'kwargs' instead\n",
+        )
+        self.assertEqual(self.json2_odoo.requests, [])
+
+    def test_an_odoo_error_is_printed_on_stderr(self):
+        self.json2_odoo.answers[("res.partner", "write")] = Answer(
+            422, odoo_error("odoo.exceptions.ValidationError", "Wrong value")
+        )
+        code, out, err = self.run_cli(
+            "erp-json2",
+            {"model": "res.partner", "method": "write", "ids": [7], "kwargs": {"vals": {}}},
+        )
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(
+            err,
+            "Error: Odoo answered a call of profile 'erp-json2' with an error "
+            "(code 422): Wrong value\n",
+        )
+
+    def test_a_payload_that_is_not_a_call_is_refused_before_any_call(self):
+        call = {"model": "res.partner", "method": "read"}
+        refused = {
+            "[]": "the JSON payload must be an object",
+            json.dumps({"model": "res.partner"}): "missing 'method' in JSON payload",
+            json.dumps({**call, "model": 5}): "'model' in the JSON payload must be a string",
+            json.dumps({**call, "kwarg": {}}): "unknown keys in the JSON payload: kwarg",
+            json.dumps({**call, "ids": [7], "args": [[7]]}): (
+                "give 'ids' or 'args' in the JSON payload, not both"
+            ),
+            json.dumps({**call, "ids": 7}): "'ids' in the JSON payload must be a list",
+            json.dumps({**call, "args": {}}): "'args' in the JSON payload must be a list",
+            json.dumps({**call, "kwargs": []}): "'kwargs' in the JSON payload must be an object",
+        }
+        for payload, message in refused.items():
+            with self.subTest(payload=payload):
+                for profile in ("erp-xmlrpc", "erp-json2"):
+                    code, out, err = self.run_cli(profile, payload)
+                    self.assertEqual((code, out, err), (1, "", f"Error: {message}\n"))
+        self.assertEqual((self.xmlrpc_odoo.logins, self.json2_odoo.requests), (0, []))
 
 
 if __name__ == "__main__":

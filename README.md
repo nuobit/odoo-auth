@@ -34,32 +34,48 @@ installing 2.0. `api = xmlrpc` keeps a profile working as before.
 ```
 odoo-xmlrpc-auth --profile <name> '<json>'
          │                │          │
-         │                │          └─ single JSON matching execute_kw signature
+         │                │          └─ one JSON object: the call, by name
          │                └─ profile name → reads ~/.config/odoo-xmlrpc-auth/<name>.conf
-         └─ authenticates via XML-RPC, executes, returns JSON
+         └─ calls Odoo over the API the profile names, prints the result as JSON
 ```
 
-The JSON payload mirrors Odoo's `execute_kw` directly:
+The payload is a `Client.call` (below) written as JSON:
 
 ```json
-{"model": "...", "method": "...", "args": [...], "kwargs": {...}}
+{"model": "...", "method": "...", "ids": [...], "kwargs": {...}}
 ```
+
+`ids` is left out, or null, for a method of the model; `kwargs` holds the
+method's own arguments, by name. Any other key is refused.
 
 ### Examples
 
 ```bash
-# Create a task
-odoo-xmlrpc-auth --profile customer1 \
-  '{"model":"project.task","method":"create","args":[{"name":"Bug: login broken","project_id":42}]}'
-
-# Search with kwargs (fields, limit)
-odoo-xmlrpc-auth --profile customer1 \
-  '{"model":"project.task","method":"search_read","args":[[["project_id","=",5]]],"kwargs":{"fields":["name","stage_id"],"limit":10}}'
-
 # Read a record
 odoo-xmlrpc-auth --profile customer1 \
-  '{"model":"res.partner","method":"read","args":[[1]]}'
+  '{"model":"res.partner","method":"read","ids":[1],"kwargs":{"fields":["name"]}}'
+
+# Search with fields and a limit
+odoo-xmlrpc-auth --profile customer1 \
+  '{"model":"project.task","method":"search_read","kwargs":{"domain":[["project_id","=",5]],"fields":["name","stage_id"],"limit":10}}'
+
+# Rename a task
+odoo-xmlrpc-auth --profile customer1 \
+  '{"model":"project.task","method":"write","ids":[42],"kwargs":{"vals":{"name":"Fixed"}}}'
 ```
+
+On an `api = xmlrpc` profile the payload may instead give `execute_kw`'s
+positional arguments as `args`, the form before 2.0, which `create` needs
+there (see `Client` below):
+
+```bash
+odoo-xmlrpc-auth --profile customer1 \
+  '{"model":"project.task","method":"create","args":[{"name":"Bug: login broken","project_id":42}]}'
+```
+
+An `api = json2` profile refuses `args`, and a payload cannot hold both
+`ids` and `args`. An error is printed on stderr after `Error:`, and the CLI
+exits with status 1.
 
 ## Library usage
 
@@ -167,7 +183,8 @@ profile and never quotes its password or API key:
 
 `ServerProxy` raises `ConfigError`, `AuthError` and `RequestError`; an Odoo
 `xmlrpc.client.Fault` comes through it as it is. The CLI prints
-`ConfigError`, `AuthError` and `RequestError` on one line.
+`ConfigError`, `AuthError` and `RequestError` on one line, and an
+`OdooError` with Odoo's message.
 
 ## Configure a profile
 
