@@ -18,51 +18,29 @@ Run from the repository root:
 
 import contextlib
 import io
-import os
 import sys
-import tempfile
 import unittest
 import xmlrpc.client
 from unittest import mock
 
 from odoo_xmlrpc_auth import cli
-from odoo_xmlrpc_auth.client import AuthError, ConfigError, RequestError, ServerProxy
+from odoo_xmlrpc_auth.client import (
+    AuthError,
+    Client,
+    ConfigError,
+    RequestError,
+    ServerProxy,
+)
+from support import KEY, PASSWORD, StoreMixin
 
-PASSWORD = "odoo_dummy_password_test"
 
-
-class StoreTestCase(unittest.TestCase):
+class StoreTestCase(StoreMixin, unittest.TestCase):
     def setUp(self):
         # Only the proxy that authenticates is replaced: ServerProxy subclasses
         # the real class, bound when the module was imported.
         patcher = mock.patch("xmlrpc.client.ServerProxy")
         self.common = patcher.start().return_value.__enter__.return_value
         self.addCleanup(patcher.stop)
-
-    def use_home(self):
-        home = tempfile.TemporaryDirectory()
-        self.addCleanup(home.cleanup)
-        patcher = mock.patch.dict(os.environ, {"HOME": home.name})
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        return home.name
-
-    def make_store(self, text, encoding="utf-8"):
-        folder = os.path.join(self.use_home(), ".config", "odoo-xmlrpc-auth")
-        os.makedirs(folder)
-        os.chmod(folder, 0o700)
-        path = os.path.join(folder, "erp.conf")
-        with open(path, "w", encoding=encoding) as f:
-            f.write(text)
-        os.chmod(path, 0o600)
-
-    def assertNeverShows(self, error, value):
-        """``value`` is in no text ``error`` carries: not in its message, not
-        in its repr, and no exception is chained to it."""
-        self.assertNotIn(value, str(error))
-        self.assertNotIn(value, repr(error))
-        self.assertIsNone(error.__cause__)
-        self.assertIsNone(error.__context__)
 
 
 class ServerProxyTest(StoreTestCase):
@@ -73,6 +51,7 @@ class ServerProxyTest(StoreTestCase):
             "db = odoo_db_test\n"
             "user = odoo_user_test\n"
             "password = odoo_dummy_password_test\n"
+            "api = xmlrpc\n"
         )
         self.common.authenticate.return_value = 7
         ServerProxy(profile="erp")
@@ -85,8 +64,8 @@ class ServerProxyTest(StoreTestCase):
         with self.assertRaisesRegex(
             ConfigError,
             r"Config file not found: .*/\.config/odoo-xmlrpc-auth/erp\.conf\n"
-            r"Create it with a \[odoo\] section and keys: "
-            r"url, db, user, password",
+            r"Create it with a \[odoo\] section, the keys url, db, user, "
+            r"password, and the line `api = xmlrpc` or `api = json2`$",
         ):
             ServerProxy(profile="erp")
 
@@ -143,6 +122,7 @@ class UrlTest(StoreTestCase):
             "db = odoo_db_test\n"
             "user = odoo_user_test\n"
             "password = odoo_dummy_password_test\n"
+            "api = xmlrpc\n"
         )
 
     def test_a_url_with_a_password_is_refused_unshown(self):
@@ -245,6 +225,111 @@ class UrlTest(StoreTestCase):
         )
 
 
+class ApiLineTest(StoreTestCase):
+    """Every profile says which API its calls go through, with the line
+    `api = xmlrpc` or `api = json2`; there is no default."""
+
+    def make_store_with_api_line(self, line, password="odoo_dummy_password_test"):
+        self.make_store(
+            "[odoo]\n"
+            "url = https://odoo.example.com\n"
+            "db = odoo_db_test\n"
+            "user = odoo_user_test\n"
+            f"password = {password}\n"
+            f"{line}"
+        )
+
+    def test_a_profile_without_an_api_line_is_refused_before_any_call(self):
+        self.make_store_with_api_line("")
+        for open_profile in (Client, ServerProxy):
+            with self.subTest(open_profile=open_profile.__name__):
+                with self.assertRaisesRegex(
+                    ConfigError,
+                    r"^Profile 'erp' has no api line: add `api = xmlrpc` or "
+                    r"`api = json2` to the \[odoo\] section of .*/erp\.conf$",
+                ):
+                    open_profile(profile="erp")
+        self.common.authenticate.assert_not_called()
+
+    def test_another_value_is_refused_unshown(self):
+        for value in ("JSON2", "xml-rpc", "odoo_dummy_password_test"):
+            with self.subTest(value=value):
+                self.make_store_with_api_line(f"api = {value}\n")
+                with self.assertRaises(ConfigError) as caught:
+                    Client(profile="erp")
+                self.assertRegex(
+                    str(caught.exception),
+                    r"^The api line of profile 'erp' must be `api = xmlrpc` or "
+                    r"`api = json2`, in .*/erp\.conf\. Its value is not shown\.$",
+                )
+                self.assertNeverShows(caught.exception, value)
+
+    def test_api_xmlrpc_opens_the_proxy_and_the_client(self):
+        self.make_store_with_api_line("api = xmlrpc\n")
+        self.common.authenticate.return_value = 7
+        ServerProxy(profile="erp")
+        with Client(profile="erp") as odoo:
+            self.assertEqual(odoo.api, "xmlrpc")
+
+    def test_api_json2_opens_the_client(self):
+        self.make_store_with_api_line("api = json2\n", password=KEY)
+        with Client(profile="erp") as odoo:
+            self.assertEqual(odoo.api, "json2")
+
+    def test_the_proxy_refuses_a_json2_profile_and_names_the_client(self):
+        self.make_store_with_api_line("api = json2\n", password=KEY)
+        with self.assertRaisesRegex(
+            ConfigError,
+            r"^Profile 'erp' has `api = json2`, and ServerProxy speaks XML-RPC "
+            r"only: call it through odoo_xmlrpc_auth\.client\.Client"
+            r"\(profile='erp'\)$",
+        ):
+            ServerProxy(profile="erp")
+        self.common.authenticate.assert_not_called()
+
+
+class Json2StoreTest(StoreTestCase):
+    """JSON-2 sends the password and the db in headers, which refuse some
+    values with an error that quotes them: a json2 profile whose values
+    cannot go there is refused before any call, without showing them."""
+
+    def make_json2_store(self, password=KEY, db="odoo_db_test"):
+        self.make_store(
+            "[odoo]\n"
+            "url = https://odoo.example.com\n"
+            f"db = {db}\n"
+            "user = odoo_user_test\n"
+            f"password = {password}\n"
+            "api = json2\n"
+        )
+
+    def test_a_password_that_is_not_an_api_key_is_refused_unshown(self):
+        for password in (PASSWORD, KEY.upper(), KEY + "0", KEY[:-1] + "é"):
+            with self.subTest(password=password):
+                self.make_json2_store(password=password)
+                with self.assertRaises(ConfigError) as caught:
+                    Client(profile="erp")
+                self.assertIn(
+                    "must be an Odoo API key, 40 lowercase hexadecimal digits",
+                    str(caught.exception),
+                )
+                self.assertNeverShows(caught.exception, password)
+
+    def test_a_db_that_cannot_go_in_a_header_is_refused_unshown(self):
+        # An indented line is read as part of the value above it.
+        for db in ("odoo db test", "odoo_db_test_é", "odoo_db_test\n  next"):
+            with self.subTest(db=db):
+                self.make_json2_store(db=db)
+                with self.assertRaises(ConfigError) as caught:
+                    Client(profile="erp")
+                self.assertIn(
+                    "must be one line of printable ASCII without spaces, as "
+                    "JSON-2 sends it in a header",
+                    str(caught.exception),
+                )
+                self.assertNeverShows(caught.exception, db.split("\n")[0])
+
+
 class CallTest(StoreTestCase):
     """A failure of the transport, in the authentication or in a call, is a
     RequestError that names the profile and quotes nothing of the store."""
@@ -257,6 +342,7 @@ class CallTest(StoreTestCase):
             "db = odoo_db_test\n"
             "user = odoo_user_test\n"
             "password = odoo_dummy_password_test\n"
+            "api = xmlrpc\n"
         )
 
     def fail_each_call_with(self, error):
@@ -335,6 +421,7 @@ class CliTest(StoreTestCase):
             "db = odoo_db_test\n"
             "user = odoo_user_test\n"
             "password = odoo_dummy_password_test\n"
+            "api = xmlrpc\n"
         )
         self.common.authenticate.side_effect = xmlrpc.client.ProtocolError(
             "odoo.example.com/xmlrpc/2/common", 502, "Bad Gateway", {}
