@@ -5,10 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "odoo-xmlrpc-auth"
 dynamic = ["version"]
-description = "Minimal CLI proxy and library for Odoo XML-RPC calls — injects credentials transparently"
+description = "Minimal CLI proxy and library for Odoo calls over XML-RPC or JSON-2 — injects credentials transparently"
 requires-python = ">=3.8"
 license = "Apache-2.0"
 readme = "README.md"
+dependencies = [
+    "requests>=2.27",
+]
 
 [project.scripts]
 odoo-xmlrpc-auth = "odoo_xmlrpc_auth.cli:main"
