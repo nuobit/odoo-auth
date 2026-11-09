@@ -130,11 +130,12 @@ class XmlRpcOdoo:
     """Odoo's /xmlrpc/2/common and /xmlrpc/2/object, as far as Client and
     ServerProxy use them.
 
-    ``authenticate`` gives UID for DB, USER and ``password`` (PASSWORD unless
-    the test sets another), False otherwise. ``execute_kw`` checks the same
-    db, uid and password, records the call in ``calls`` and answers from
-    ``answers``: the value set for its model and method, or a Fault to
-    raise.
+    ``authenticate`` raises ``login_fault`` when the test sets one, such as
+    Odoo's Fault for a db it does not hold; else it gives UID for DB, USER
+    and ``password`` (PASSWORD unless the test sets another), False
+    otherwise. ``execute_kw`` checks the same db, uid and password, records
+    the call in ``calls`` and answers from ``answers``: the value set for
+    its model and method, or a Fault to raise.
     """
 
     def __init__(self):
@@ -142,6 +143,7 @@ class XmlRpcOdoo:
         self.calls = []
         self.logins = 0
         self.password = PASSWORD
+        self.login_fault = None
 
         class Handler(xmlrpc.server.SimpleXMLRPCRequestHandler):
             rpc_paths = ("/xmlrpc/2/common", "/xmlrpc/2/object")
@@ -163,6 +165,8 @@ class XmlRpcOdoo:
 
     def authenticate(self, db, user, password, user_agent_env):
         self.logins += 1
+        if self.login_fault is not None:
+            raise self.login_fault
         return UID if (db, user, password) == (DB, USER, self.password) else False
 
     def execute_kw(self, db, uid, password, model, method, args, kwargs):

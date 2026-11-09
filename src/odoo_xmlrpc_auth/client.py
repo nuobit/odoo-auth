@@ -552,13 +552,15 @@ class _XmlRpc:
         )
 
     def call(self, model, method, ids, named):
-        if self._uid is None:
-            self._uid = _log_in(self._profile, self._config)
         # execute_kw takes the records as its one positional argument, and
         # none for a method of the model; everything else goes by name.
         args = [] if ids is None else [ids]
         failure = None
         try:
+            # The login's Fault too, such as a db the server does not hold,
+            # is an error Odoo answers.
+            if self._uid is None:
+                self._uid = _log_in(self._profile, self._config)
             result = _send(
                 self._profile,
                 lambda: self._object.execute_kw(
