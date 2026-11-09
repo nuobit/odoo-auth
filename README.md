@@ -93,9 +93,13 @@ odoo-xmlrpc-auth --profile customer1 \
 
 An `api = json2` profile refuses `args`, a payload cannot hold both `ids`
 and `args`, and without `args` it cannot hold `ids` inside `kwargs`: the
-records go in `ids`. An error is printed on stderr after `Error:`, and the
-CLI exits with status 1; it is one of the errors of `Client` below, in both
-forms of the payload.
+records go in `ids`. An error is printed on stderr after `Error:`, on one
+line, and the CLI exits with status 1, never with a traceback: one of the
+errors of `Client` below, in both forms of the payload, a call `Client`
+refuses (`ArgumentError`, such as an empty model, or NaN over JSON-2)
+among them, or a payload Python's json cannot read (`invalid JSON: …`,
+also for an int longer than it converts or nesting deeper than it
+follows).
 
 ## Library usage
 
@@ -232,10 +236,12 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   such as the JSON of a text a `repr` wrote, is not covered: such a
   message can show them.
 - `ArgumentError`: a call `Client` cannot send, refused before anything is
-  sent, the login included: a value its API cannot carry (over XML-RPC, a
-  type `xmlrpc.client` cannot marshal, such as a set or a date, or an int
-  beyond 32 bits; over JSON-2, a value JSON cannot hold, NaN among them;
-  over either, a value nested deeper than the encoder follows). It carries
+  sent, the login included: `ids` that are not a list, a model or a method
+  that is not a name (empty, `.` or `..`), or a value its API cannot carry
+  (over XML-RPC, a type `xmlrpc.client` cannot marshal, such as a set or a
+  date, or an int beyond 32 bits; over JSON-2, a value JSON cannot hold,
+  NaN among them; over either, a value nested deeper than the encoder
+  follows). It carries
   the profile (`profile`) and the encoder's own text (`reason`), masked as
   above, and is also an instance of the `TypeError`, `ValueError`,
   `OverflowError` or `RecursionError` it stands for. Over XML-RPC the call's

@@ -165,16 +165,17 @@ class OdooError(Exception):
 
 class ArgumentError(Exception):
     """Raised by Client.call for a call it cannot send, before anything is
-    sent: a value its API cannot carry (over XML-RPC, a type xmlrpc.client
+    sent: ids that are not a list, a model or a method that is not a name,
+    or a value its API cannot carry (over XML-RPC, a type xmlrpc.client
     cannot marshal or an int beyond 32 bits; over JSON-2, a value JSON
     cannot hold, NaN among them; over either, one nested deeper than the
     encoder follows).
 
-    It carries the profile (``profile``) and the reason (``reason``), the
-    encoder's own text, which shows *** wherever it held the profile's
-    password or API key. Its class is also a subclass of the error it stands
-    for, a TypeError, a ValueError, an OverflowError or a RecursionError, so
-    ``except TypeError`` and the like keep catching it.
+    It carries the profile (``profile``) and the reason (``reason``), for a
+    value the encoder's own text, which shows *** wherever it held the
+    profile's password or API key. Its class is also a subclass of the error
+    it stands for, a TypeError, a ValueError, an OverflowError or a
+    RecursionError, so ``except TypeError`` and the like keep catching it.
     """
 
     def __init__(self, profile, reason):
@@ -1137,19 +1138,22 @@ class Client:
         method's own parameters, by their base names, ``context`` among them:
         ``create`` takes ``vals_list``, a list of values, and answers the new
         ids. Over XML-RPC the leading ones of six ORM methods go positionally
-        (_LEADING_ON_RECORDS, _LEADING_ON_THE_MODEL).
+        (_LEADING_ON_RECORDS, _LEADING_ON_THE_MODEL). A call it cannot send
+        raises ArgumentError before anything is sent.
         """
         if ids is not None and not isinstance(ids, (list, tuple)):
-            raise TypeError(
+            raise _error_class(ArgumentError, TypeError)(
+                self.profile,
                 "ids must be None, for a method of the model, or a list of the "
-                "records' ids"
+                "records' ids",
             )
         if model in ("", ".", "..") or method in ("", ".", ".."):
             # Over JSON-2 both are segments of the call's url, and such a
             # segment would send the call to another path of the server
             # (requests drops "." and "..").
-            raise ValueError(
-                "A model and a method are names: neither can be empty, '.' or '..'"
+            raise _error_class(ArgumentError, ValueError)(
+                self.profile,
+                "A model and a method are names: neither can be empty, '.' or '..'",
             )
         return self._transport.call(
             model, method, None if ids is None else list(ids), named

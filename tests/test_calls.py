@@ -697,15 +697,17 @@ class Json2ClientTest(StubTestCase):
     def test_a_model_or_a_method_that_is_not_a_name_is_refused_before_sending(self):
         for name in ("", ".", ".."):
             with self.subTest(name=name):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(ValueError) as caught:
                     self.client.call(name, "read", [7])
+                self.assertIsInstance(caught.exception, odoo_xmlrpc_auth.client.ArgumentError)
                 with self.assertRaises(ValueError):
                     self.client.call("res.partner", name, [7])
         self.assertEqual(self.odoo.requests, [])
 
     def test_ids_that_are_not_a_list_are_refused_before_sending(self):
-        with self.assertRaisesRegex(TypeError, "ids must be None"):
+        with self.assertRaisesRegex(TypeError, "ids must be None") as caught:
             self.client.call("res.partner", "read", 7)
+        self.assertIsInstance(caught.exception, odoo_xmlrpc_auth.client.ArgumentError)
         self.assertEqual(self.odoo.requests, [])
 
 
@@ -1028,6 +1030,83 @@ class CliTest(StubTestCase):
                 for profile in ("erp-xmlrpc", "erp-json2"):
                     code, out, err = self.run_cli(profile, payload)
                     self.assertEqual((code, out, err), (1, "", f"Error: {message}\n"))
+        self.assertEqual((self.xmlrpc_odoo.logins, self.json2_odoo.requests), (0, []))
+
+    def test_json_python_cannot_read_ends_as_one_message(self):
+        # Errors of json other than a JSONDecodeError. Python refuses an int
+        # longer than 4300 digits from 3.10.7 on and converts it before, so
+        # json's ValueError for it, as 3.11 words it, is raised here.
+        too_long = ValueError(
+            "Exceeds the limit (4300 digits) for integer string conversion: value "
+            "has 5000 digits; use sys.set_int_max_str_digits() to increase the limit"
+        )
+        with mock.patch("json.loads", side_effect=too_long):
+            result = self.run_cli(
+                "erp-xmlrpc",
+                '{"model": "res.partner", "method": "read", "ids": [' + "1" * 5000 + "]}",
+            )
+        self.assertEqual(
+            result,
+            (
+                1,
+                "",
+                "Error: invalid JSON: Exceeds the limit (4300 digits) for integer "
+                "string conversion: value has 5000 digits; use "
+                "sys.set_int_max_str_digits() to increase the limit\n",
+            ),
+        )
+        # An array nested deeper than json's parser follows, on any version.
+        code, out, err = self.run_cli("erp-xmlrpc", "[" * 100000 + "]" * 100000)
+        self.assertEqual((code, out), (1, ""))
+        self.assertTrue(err.startswith("Error: invalid JSON: "))
+        self.assertEqual(err.count("\n"), 1)
+        self.assertEqual(self.xmlrpc_odoo.logins, 0)
+
+    def test_a_value_json2_cannot_send_ends_as_one_message(self):
+        # NaN is no JSON, but Python's json reads it; JSON-2 cannot send it.
+        # From Python 3.13 json's text names the value too.
+        code, out, err = self.run_cli(
+            "erp-json2",
+            '{"model": "res.partner", "method": "search_read", "kwargs": {"limit": NaN}}',
+        )
+        self.assertEqual((code, out), (1, ""))
+        self.assertRegex(
+            err,
+            r"\AError: A call of profile 'erp-json2' cannot be sent: Out of range "
+            r"float values are not JSON compliant(: nan)?\n\Z",
+        )
+        self.assertEqual(self.json2_odoo.requests, [])
+
+    def test_a_call_client_refuses_ends_as_one_message(self):
+        refusals = [
+            (
+                "erp-xmlrpc",
+                {"model": "", "method": "read", "ids": [7]},
+                "A model and a method are names: neither can be empty, '.' or '..'",
+            ),
+            (
+                "erp-json2",
+                {"model": "res.partner", "method": "..", "ids": [7]},
+                "A model and a method are names: neither can be empty, '.' or '..'",
+            ),
+            (
+                "erp-xmlrpc",
+                {"model": "res.partner", "method": "read", "ids": [2**40]},
+                "int exceeds XML-RPC limits",
+            ),
+            (
+                "erp-xmlrpc",
+                {"model": "res.partner", "method": "read", "args": [[2**40]]},
+                "int exceeds XML-RPC limits",
+            ),
+        ]
+        for profile, payload, reason in refusals:
+            with self.subTest(profile=profile, payload=payload):
+                code, out, err = self.run_cli(profile, payload)
+                self.assertEqual(
+                    (code, out, err),
+                    (1, "", f"Error: A call of profile '{profile}' cannot be sent: {reason}\n"),
+                )
         self.assertEqual((self.xmlrpc_odoo.logins, self.json2_odoo.requests), (0, []))
 
 

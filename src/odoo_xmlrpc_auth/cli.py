@@ -4,6 +4,7 @@ import sys
 
 from . import __version__
 from .client import (
+    ArgumentError,
     AuthError,
     Client,
     ConfigError,
@@ -26,7 +27,10 @@ def _payload(text):
     """The call ``text`` describes, as a dict, once checked."""
     try:
         call = json.loads(text)
-    except json.JSONDecodeError as e:
+    except (ValueError, RecursionError) as e:
+        # A JSONDecodeError is a ValueError, and so is an int longer than
+        # Python converts (4300 digits by default); a RecursionError, an
+        # array or an object nested deeper than the parser follows.
         die(f"invalid JSON: {e}")
     if not isinstance(call, dict):
         die("the JSON payload must be an object")
@@ -97,7 +101,7 @@ def main():
                     call.get("ids"),
                     **call.get("kwargs", {}),
                 )
-    except (ConfigError, AuthError, RequestError, OdooError) as e:
+    except (ConfigError, AuthError, RequestError, OdooError, ArgumentError) as e:
         die(e)
 
     print(json.dumps(result))
