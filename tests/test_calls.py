@@ -110,9 +110,10 @@ class XmlRpcClientTest(StubTestCase):
 
     def test_the_leading_arguments_of_the_orm_methods_go_positionally(self):
         # Odoo calls the database's last override, whose names can differ
-        # from the base's (on 16, res.company.write takes values): the ids
-        # first, for a method of records, then the leading arguments; every
-        # other one by name.
+        # from the base's (on 16, res.company.write takes values), and older
+        # bases use other names than 19's (args, fields_list): the ids first,
+        # for a method of records, then the leading arguments; every other
+        # one by name.
         domain = [["is_company", "=", True]]
         calls = {
             "write": (([7],), {"vals": {"name": "Example"}}),
@@ -123,6 +124,8 @@ class XmlRpcClientTest(StubTestCase):
                 (),
                 {"domain": domain, "fields": ["name"], "limit": 10, "context": {"lang": "ca_ES"}},
             ),
+            "name_search": ((), {"name": "Ex", "domain": domain, "operator": "=ilike", "limit": 5}),
+            "default_get": ((), {"fields": ["name"], "context": {"lang": "ca_ES"}}),
         }
         sent = {
             "write": ([[7], {"name": "Example"}], {}),
@@ -130,6 +133,8 @@ class XmlRpcClientTest(StubTestCase):
             "search": ([domain], {"offset": 5, "limit": 10, "order": "name"}),
             "search_count": ([domain], {}),
             "search_read": ([domain, ["name"]], {"limit": 10, "context": {"lang": "ca_ES"}}),
+            "name_search": (["Ex", domain], {"operator": "=ilike", "limit": 5}),
+            "default_get": ([["name"]], {"context": {"lang": "ca_ES"}}),
         }
         for method, (ids, named) in calls.items():
             with self.subTest(method=method):
@@ -152,6 +157,14 @@ class XmlRpcClientTest(StubTestCase):
         self.assertEqual(
             (self.odoo.calls[0]["args"], self.odoo.calls[0]["kwargs"]),
             ([[["id", "=", 7]]], {}),
+        )
+
+    def test_a_domain_given_without_a_name_comes_after_an_empty_name(self):
+        self.odoo.answers[("res.partner", "name_search")] = []
+        self.client.call("res.partner", "name_search", domain=[["id", "=", 7]], limit=8)
+        self.assertEqual(
+            (self.odoo.calls[0]["args"], self.odoo.calls[0]["kwargs"]),
+            (["", [["id", "=", 7]]], {"limit": 8}),
         )
 
     def test_an_orm_method_called_against_its_kind_goes_as_it_is_written(self):
@@ -453,15 +466,34 @@ class Json2ClientTest(StubTestCase):
     def test_the_leading_arguments_of_the_orm_methods_go_by_name(self):
         # Odoo 19 binds the body to the names of the method's signature
         # (addons/rpc/controllers/json2.py, signature.bind): no client can
-        # send them otherwise.
-        self.odoo.answers[("res.partner", "write")] = True
-        self.odoo.answers[("res.partner", "search_read")] = []
-        self.client.call("res.partner", "write", [7], vals={"name": "Example"})
-        self.client.call("res.partner", "search_read", fields=["name"], limit=5)
-        self.assertEqual(
-            [self.sent_body(0), self.sent_body(1)],
-            [{"ids": [7], "vals": {"name": "Example"}}, {"fields": ["name"], "limit": 5}],
-        )
+        # send them otherwise. These are the eight methods whose leading
+        # arguments go positionally over XML-RPC; only the ids are added.
+        domain = [["is_company", "=", True]]
+        calls = {
+            "write": (([7],), {"vals": {"name": "Example"}}),
+            "read": (([7],), {"fields": ["name"], "load": "_classic_read"}),
+            "create": ((), {"vals_list": [{"name": "Example"}]}),
+            "search": ((), {"domain": domain, "offset": 5, "limit": 10, "order": "name"}),
+            "search_count": ((), {"domain": domain}),
+            "search_read": ((), {"fields": ["name"], "limit": 5}),
+            "name_search": ((), {"name": "Ex", "domain": domain, "operator": "=ilike"}),
+            "default_get": ((), {"fields": ["name"], "context": {"lang": "ca_ES"}}),
+        }
+        sent = {
+            "write": {"ids": [7], "vals": {"name": "Example"}},
+            "read": {"ids": [7], "fields": ["name"], "load": "_classic_read"},
+            "create": {"vals_list": [{"name": "Example"}]},
+            "search": {"domain": domain, "offset": 5, "limit": 10, "order": "name"},
+            "search_count": {"domain": domain},
+            "search_read": {"fields": ["name"], "limit": 5},
+            "name_search": {"name": "Ex", "domain": domain, "operator": "=ilike"},
+            "default_get": {"fields": ["name"], "context": {"lang": "ca_ES"}},
+        }
+        for number, (method, (ids, named)) in enumerate(calls.items()):
+            with self.subTest(method=method):
+                self.odoo.answers[("res.partner", method)] = []
+                self.client.call("res.partner", method, *ids, **named)
+                self.assertEqual(self.sent_body(number), sent[method])
 
     def test_create_gets_its_vals_list_by_name(self):
         # The same call as over XML-RPC, where vals_list goes positionally.
