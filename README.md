@@ -172,7 +172,8 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   does not resolve, a connection refused or dropped, TLS, an HTTP status
   other than 200 that carries no error of Odoo (such as the 404 page Odoo
   sends when `X-Odoo-Database` names no database it serves), an answer that
-  is not JSON, a redirect to another origin. It carries the profile
+  is not JSON, a request or a redirect to another origin (`InvalidURL`,
+  `RedirectError`). It carries the profile
   (`profile`), that error's class name (`error_class`) and its errno or HTTP
   status, if any (`code`), never its text, which can quote the url, nor the
   request of `requests`, which holds the API key. It is also an instance of
@@ -223,10 +224,14 @@ chmod 600 ~/.config/odoo-xmlrpc-auth/customer1.conf
 
 The tool refuses to run if the config directory or files are accessible by
 group or others (like `ssh` does with `~/.ssh/`), or if `url` is not an http
-or https URL that names a host, with a port that is a number if it has one,
+or https URL that names a host, with a port from 1 to 65535 if it has one,
 on one line of printable ASCII without spaces, or has a user or password
-before its host. The url is not shown, not even its scheme: xmlrpc.client
-would quote it, user info included, in its errors. An `api = json2` profile
+before its host, or holds a backslash. The url is not shown, not even its
+scheme: xmlrpc.client would quote it, user info included, in its errors. A
+backslash and port 0 are refused because the two parsers of a url read
+them in different ways: requests ends the host at a backslash and sends a
+port 0 to the scheme's default port, where the profile's origin is read
+otherwise. An `api = json2` profile
 is refused too if its `password` is not an Odoo API key (40 lowercase
 hexadecimal digits) or its `db` is not one line of printable ASCII without
 spaces: JSON-2 sends both in headers. Neither is shown.
@@ -240,9 +245,11 @@ spaces: JSON-2 sends both in headers. Neither is shown.
 | API results | Yes — returned from Odoo via XML-RPC or JSON-2 |
 
 The wrapper is like `psql` reading `~/.pgpass` — credentials stay local,
-only the queries go over the wire. Over JSON-2, a redirect to another origin
-is refused before anything is sent there, and the client takes no proxy and
-no `~/.netrc` from the environment, as xmlrpc.client does not either.
+only the queries go over the wire. Over JSON-2, each request is checked as
+`requests` prepared it, the url as the connection reads it: one for another
+origin gets no key and is not sent, and a redirect to another origin is
+refused before anything is sent there. The client takes no proxy and no
+`~/.netrc` from the environment, as xmlrpc.client does not either.
 
 What the transports take from the environment, and what they do not:
 
