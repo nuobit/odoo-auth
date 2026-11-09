@@ -141,9 +141,31 @@ def _request_error(profile, error):
     return _request_error_class(type(error))(profile, type(error).__name__, code)
 
 
-def _hidden(text, secret):
-    """``text`` with ``secret``, a password or an API key, shown as ***."""
-    return text.replace(secret, "***") if secret != "" else text
+class _Secret:
+    """A password or an API key of the store.
+
+    Its repr shows only its length. A test runner or a debugger prints the
+    locals of every frame of a traceback (``pytest -l``), and a frame of
+    this module that holds the profile's values holds this, never the
+    value: ``reveal()`` gives the value inside the expression that sends
+    it, so that no frame keeps it in a variable.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value):
+        self._value = value
+
+    def reveal(self):
+        """The value, for the call that sends it."""
+        return self._value
+
+    def hidden(self, text):
+        """``text`` with the value shown as ***."""
+        return text.replace(self._value, "***") if self._value != "" else text
+
+    def __repr__(self):
+        return f"<{len(self._value)} chars>"
 
 
 def _is_one_ascii_line(text):
@@ -160,17 +182,18 @@ def _check_permissions(path, fd=None):
         )
 
 
-def _check_api(profile, config, config_path):
-    """Raise ConfigError unless the profile has one of _ACCEPTED_API_LINES.
+def _check_api(profile, section, config_path):
+    """Raise ConfigError unless ``section``, the profile's, has one of
+    _ACCEPTED_API_LINES.
 
     A wrong value is not quoted: the line can hold the password.
     """
-    if "api" not in config:
+    if "api" not in section:
         raise ConfigError(
             f"Profile {profile!r} has no api line: add {_ACCEPTED_API_LINES} "
             f"to the [{_SECTION}] section of {config_path}"
         )
-    elif config["api"] not in _APIS:
+    elif section["api"] not in _APIS:
         raise ConfigError(
             f"The api line of profile {profile!r} must be "
             f"{_ACCEPTED_API_LINES}, in {config_path}. Its value is not shown."
@@ -226,7 +249,7 @@ def _check_json2(profile, config, config_path):
     Each is checked before any call, since the transport would refuse it
     with an error that quotes it. Neither is quoted here.
     """
-    if not _API_KEY.fullmatch(config["password"]):
+    if not _API_KEY.fullmatch(config["password"].reveal()):
         raise ConfigError(
             f"The password of profile {profile!r}, in {config_path}, must be "
             "an Odoo API key, 40 lowercase hexadecimal digits: `api = json2` "
@@ -240,7 +263,20 @@ def _check_json2(profile, config, config_path):
         )
 
 
-def _read_config(profile):
+def _load_config(profile):
+    """The values of the store of ``profile``, checked: url, db, user, api,
+    and the password as a _Secret. ConfigError otherwise."""
+    return _checked_config(profile, *_read_section(profile))
+
+
+def _read_section(profile):
+    """The [odoo] section of the store of ``profile``, every key of it, and
+    the path of its file, once the folder and the file pass their checks
+    and the section holds every key of _REQUIRED_KEYS. ConfigError
+    otherwise.
+
+    The section, not a dict of it: its repr shows no value.
+    """
     if os.sep in profile or profile.startswith("."):
         raise ConfigError(f"Invalid profile name: {profile}")
     config_dir = os.path.expanduser("~/.config/odoo-xmlrpc-auth")
@@ -277,60 +313,93 @@ def _read_config(profile):
     if not parser.has_section(_SECTION):
         raise ConfigError(f"Missing [{_SECTION}] section in {config_path}")
 
-    config = dict(parser[_SECTION])
-    missing = [k for k in _REQUIRED_KEYS if k not in config]
+    section = parser[_SECTION]
+    missing = [k for k in _REQUIRED_KEYS if k not in section]
     if missing:
         raise ConfigError(
             f"Missing keys in {config_path}: {', '.join(missing)}"
         )
+    return section, config_path
 
-    _check_api(profile, config, config_path)
-    _check_url(config["url"], config_path)
-    config["url"] = config["url"].rstrip("/")
+
+def _checked_config(profile, section, config_path):
+    """The values of ``section``, the [odoo] section of the store of
+    ``profile`` in ``config_path``, checked: url, db, user, api, and the
+    password as a _Secret. ConfigError otherwise.
+
+    The checks read the section, whose repr shows no value, and the
+    password as a _Secret: no frame of a ConfigError holds the password.
+    """
+    _check_api(profile, section, config_path)
+    _check_url(section["url"], config_path)
+    config = {
+        "url": section["url"].rstrip("/"),
+        "db": section["db"],
+        "user": section["user"],
+        "password": _Secret(section["password"]),
+        "api": section["api"],
+    }
     # Only JSON-2 sends values of the store in headers.
     if config["api"] == "json2":
         _check_json2(profile, config, config_path)
     return config
 
 
+def _read_config(profile):
+    """The [odoo] section of the store of ``profile``, every key of it, as
+    1.2.0 gave it: a dict with the password in clear and the url without its
+    trailing slashes, once the profile passes the checks of _load_config.
+
+    The library reads a profile with _load_config. This one is kept for the
+    scripts that read a profile's values themselves, such as a web login
+    that downloads a report, or a key of their own the section holds: they
+    call it by this name.
+    """
+    section, config_path = _read_section(profile)
+    config = _checked_config(profile, section, config_path)
+    return {**section, "url": config["url"]}
+
+
 def _log_in(profile, config):
     """Log in over XML-RPC with the values of ``config``, the store of
-    ``profile``, and return the uid Odoo gives.
+    ``profile`` as _load_config gives it, and return the uid Odoo gives.
 
     Raises RequestError instead of an error of the transport, and AuthError
     when Odoo refuses the login.
     """
-    failure = None
-    try:
-        with xmlrpc.client.ServerProxy(
-            f"{config['url']}/xmlrpc/2/common", allow_none=True
-        ) as common:
-            uid = common.authenticate(
-                config["db"], config["user"], config["password"], {}
-            )
-    except _TRANSPORT_ERRORS as error:
-        # Its text can quote the url: RequestError, raised after this
-        # block, does not.
-        failure = _request_error(profile, error)
-    if failure is not None:
-        raise failure
-
+    with xmlrpc.client.ServerProxy(
+        f"{config['url']}/xmlrpc/2/common", allow_none=True
+    ) as common:
+        uid = _send(
+            profile,
+            lambda: common.authenticate(
+                config["db"], config["user"], config["password"].reveal(), {}
+            ),
+        )
     if not uid:
         # The user and the db are values of the store.
         raise AuthError(f"Authentication failed for profile {profile!r}")
     return uid
 
 
-def _send(profile, function, *args, **kwargs):
-    """Return ``function(*args, **kwargs)``, a call of ``profile``, raising
-    RequestError instead of an error of its transport."""
+def _send(profile, call):
+    """Return ``call()``, a call of ``profile``, raising RequestError instead
+    of an error of its transport.
+
+    ``call`` takes no argument and reveals the password in the expression
+    that sends it: no frame here holds the password, and so no frame the
+    RequestError raised gets from here does. A caller's frame can:
+    ServerProxy.execute_kw's holds the ServerProxy, which shows it one
+    attribute down, in _password, readable as in 1.x.
+    """
     failure = None
     try:
-        result = function(*args, **kwargs)
+        result = call()
     except _TRANSPORT_ERRORS as error:
         # Its text can quote the url, and an error of requests keeps the
-        # request, which holds the API key: RequestError, raised after this
-        # block, keeps neither.
+        # request, which holds the API key, as the frames of its traceback
+        # hold the password: RequestError, raised after this block, keeps
+        # none of them.
         failure = _request_error(profile, error)
     if failure is not None:
         raise failure
@@ -361,7 +430,7 @@ class ServerProxy(xmlrpc.client.ServerProxy):
 
     def __init__(self, uri=None, /, *args, profile=None, **kwargs):
         if profile is not None:
-            config = _read_config(profile)
+            config = _load_config(profile)
             if config["api"] != "xmlrpc":
                 # The profile decides the API. Odoo 19 logs a deprecation
                 # warning for each XML-RPC call, and an error for each method
@@ -374,7 +443,11 @@ class ServerProxy(xmlrpc.client.ServerProxy):
             self._profile = profile
             self._db = config["db"]
             self._uid = _log_in(profile, config)
-            self._password = config["password"]
+            # Readable as in 1.x: scripts that log in to Odoo's web
+            # themselves read it. An attribute, not a local, so no local
+            # shows it; but a frame that holds the proxy, as each of its
+            # calls' frames does, shows it one attribute down to a debugger.
+            self._password = config["password"].reveal()
             kwargs.setdefault("allow_none", True)
             uri = f"{config['url']}/xmlrpc/2/object"
         else:
@@ -386,16 +459,12 @@ class ServerProxy(xmlrpc.client.ServerProxy):
         super().__init__(uri, *args, **kwargs)
 
     def execute_kw(self, *args, **kwargs):
+        execute_kw = super().__getattr__("execute_kw")
         if self._profile is None:
-            return super().__getattr__("execute_kw")(*args, **kwargs)
+            return execute_kw(*args, **kwargs)
         return _send(
             self._profile,
-            super().__getattr__("execute_kw"),
-            self._db,
-            self._uid,
-            self._password,
-            *args,
-            **kwargs,
+            lambda: execute_kw(self._db, self._uid, self._password, *args, **kwargs),
         )
 
 
@@ -426,18 +495,19 @@ def _loaded(content):
 
 
 class _BearerKey(requests.auth.AuthBase):
-    """Puts the API key in the Authorization header of each request the
-    session prepares. Its repr shows only the key's length."""
+    """Puts the API key (``key``, a _Secret) in the Authorization header of
+    each request the session prepares. Its repr shows only the key's
+    length."""
 
     def __init__(self, key):
         self._key = key
 
     def __call__(self, request):
-        request.headers["Authorization"] = f"Bearer {self._key}"
+        request.headers["Authorization"] = f"Bearer {self._key.reveal()}"
         return request
 
     def __repr__(self):
-        return f"<{len(self._key)} chars>"
+        return repr(self._key)
 
 
 class _OriginSession(requests.Session):
@@ -491,20 +561,21 @@ class _XmlRpc:
         try:
             result = _send(
                 self._profile,
-                self._object.execute_kw,
-                self._config["db"],
-                self._uid,
-                self._config["password"],
-                model,
-                method,
-                args,
-                named,
+                lambda: self._object.execute_kw(
+                    self._config["db"],
+                    self._uid,
+                    self._config["password"].reveal(),
+                    model,
+                    method,
+                    args,
+                    named,
+                ),
             )
         except xmlrpc.client.Fault as fault:
             failure = OdooError(
                 self._profile,
                 fault.faultCode,
-                _hidden(str(fault.faultString), self._config["password"]),
+                self._config["password"].hidden(str(fault.faultString)),
             )
         if failure is not None:
             raise failure
@@ -536,16 +607,17 @@ class _Json2:
         path = "/".join(urllib.parse.quote(name, safe="") for name in (model, method))
         response = _send(
             self._profile,
-            self._session.post,
-            f"{self._url}/json/2/{path}",
-            data=body.encode("ascii"),
-            headers={
-                "Content-Type": "application/json",
-                # Without a session, Odoo takes the database from this header
-                # when the server holds several (odoo/http.py,
-                # Request._get_session_and_dbname).
-                "X-Odoo-Database": self._db,
-            },
+            lambda: self._session.post(
+                f"{self._url}/json/2/{path}",
+                data=body.encode("ascii"),
+                headers={
+                    "Content-Type": "application/json",
+                    # Without a session, Odoo takes the database from this
+                    # header when the server holds several (odoo/http.py,
+                    # Request._get_session_and_dbname).
+                    "X-Odoo-Database": self._db,
+                },
+            ),
         )
         return self._result(response)
 
@@ -570,7 +642,7 @@ class _Json2:
             # any other answer is the transport's.
             if isinstance(answer, dict) and isinstance(answer.get("message"), str):
                 raise OdooError(
-                    self._profile, status, _hidden(answer["message"], self._key)
+                    self._profile, status, self._key.hidden(answer["message"])
                 )
             else:
                 raise _request_error_class(requests.HTTPError)(
@@ -603,10 +675,10 @@ class Client:
     """
 
     def __init__(self, profile):
-        config = _read_config(profile)
+        config = _load_config(profile)
         self.profile = profile
         self.api = config["api"]
-        # _read_config lets through only the two values of _APIS.
+        # _load_config lets through only the two values of _APIS.
         transport = _XmlRpc if self.api == "xmlrpc" else _Json2
         self._transport = transport(profile, config)
 

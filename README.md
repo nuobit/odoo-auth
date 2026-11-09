@@ -155,7 +155,12 @@ the profile decides the API.
 ## Errors
 
 Every `Client` call raises the same errors, whatever the API. Each names the
-profile and never quotes its password or API key:
+profile and never quotes its password or API key, and no frame of its
+traceback holds them in a local, which a test runner or a debugger can
+print (`pytest -l`). `ServerProxy`'s own errors never quote the password
+either, and no local of their frames shows it; but a frame that holds the
+`ServerProxy`, as each of its calls' frames does, shows it one attribute
+down, in `_password`, which stays readable as in 1.x. The errors:
 
 - `ConfigError`: the profile is missing, malformed or accessible by
   others, has no valid `api` line, or holds a value its API cannot send

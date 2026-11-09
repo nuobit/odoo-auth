@@ -23,9 +23,11 @@ from odoo_xmlrpc_auth import cli
 from odoo_xmlrpc_auth.client import (
     AuthError,
     Client,
+    ConfigError,
     OdooError,
     RedirectError,
     RequestError,
+    ServerProxy,
     _origin,
 )
 from support import (
@@ -398,6 +400,83 @@ class Json2ClientTest(StubTestCase):
         with self.assertRaisesRegex(TypeError, "ids must be None"):
             self.client.call("res.partner", "read", 7)
         self.assertEqual(self.odoo.requests, [])
+
+
+class FramesTest(StubTestCase):
+    """No frame of an error the library raises holds the password or the
+    API key in a local: a test runner or a debugger prints each frame's
+    locals (pytest -l), and a log or a report can keep them. A frame that
+    holds a ServerProxy, as each of its calls' frames does, shows its
+    password one attribute down, in _password, readable as in 1.x:
+    support._shown does not open a ServerProxy."""
+
+    def test_no_frame_of_a_failed_xmlrpc_call_of_client_holds_the_password(self):
+        odoo = self.start(XmlRpcOdoo())
+        odoo.answers[("res.partner", "search_count")] = 3
+        after_login = self.make_client(odoo.url, "xmlrpc", PASSWORD, "after-login")
+        after_login.call("res.partner", "search_count", domain=[])
+        odoo.stop()
+        cases = {
+            "a connection refused at the login": self.make_client(
+                f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD, "refused"
+            ),
+            "a connection refused after the login": after_login,
+        }
+        for case, client in cases.items():
+            with self.subTest(case=case):
+                error = self.raised(
+                    RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+                )
+                self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_no_frame_of_a_refused_login_of_client_holds_the_password(self):
+        odoo = self.start(XmlRpcOdoo())
+        client = self.make_client(odoo.url, "xmlrpc", "odoo_wrong_password_test")
+        error = self.raised(
+            AuthError, lambda: client.call("res.partner", "search_count", domain=[])
+        )
+        self.assertNoFrameHolds(error, "odoo_wrong_password_test")
+
+    def test_no_frame_of_a_failed_login_of_server_proxy_holds_the_password(self):
+        odoo = self.start(XmlRpcOdoo())
+        self.make_profile(f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD, "refused")
+        self.make_profile(odoo.url, "xmlrpc", "odoo_wrong_password_test", "wrong")
+        cases = {
+            "refused": (RequestError, PASSWORD),
+            "wrong": (AuthError, "odoo_wrong_password_test"),
+        }
+        for profile, (error_class, password) in cases.items():
+            with self.subTest(profile=profile):
+                error = self.raised(error_class, lambda: ServerProxy(profile=profile))
+                self.assertNoFrameHolds(error, password)
+
+    def test_no_frame_of_a_failed_call_of_server_proxy_holds_the_password(self):
+        odoo = self.start(XmlRpcOdoo())
+        self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+        proxy = ServerProxy(profile="erp")
+        odoo.stop()
+        error = self.raised(
+            RequestError, lambda: proxy.execute_kw("res.partner", "search_count", [[]])
+        )
+        self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_no_frame_of_a_refused_profile_holds_the_password(self):
+        # Each is refused after the password is read.
+        self.make_profile("ftp://odoo.example.com", "xmlrpc", PASSWORD, "bad-url")
+        self.make_store(
+            "[odoo]\n"
+            "url = https://odoo.example.com\n"
+            "db = odoo db test\n"
+            f"user = {USER}\n"
+            f"password = {KEY}\n"
+            "api = json2\n",
+            profile="bad-db",
+        )
+        cases = {"bad-url": PASSWORD, "bad-db": KEY}
+        for profile, password in cases.items():
+            with self.subTest(profile=profile):
+                error = self.raised(ConfigError, lambda: Client(profile=profile))
+                self.assertNoFrameHolds(error, password)
 
 
 class CliTest(StubTestCase):
