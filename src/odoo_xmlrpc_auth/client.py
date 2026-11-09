@@ -1,4 +1,5 @@
 import configparser
+import decimal
 import functools
 import http.client
 import json
@@ -6,7 +7,9 @@ import os
 import re
 import stat
 import urllib.parse
+import xml.parsers.expat
 import xmlrpc.client
+import zlib
 
 import requests
 
@@ -27,11 +30,44 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 # lowercase hexadecimal (Odoo 19, odoo/addons/base/models/res_users.py,
 # API_KEY_SIZE and ResUsersApikeys._generate).
 _API_KEY = re.compile(r"[0-9a-f]{40}")
+# What xmlrpc.client's parser raises for an answer that is not XML-RPC (read
+# in Python 3.11's xmlrpc/client.py, the Unmarshaller and
+# Transport.parse_response): text that is not XML, such as a login page; XML
+# that is not an answer; a value it cannot read (an int, a double, base64);
+# a boolean neither 0 nor 1, a struct key that is not a string, a fault that
+# is not a struct of faultCode and faultString; a struct name without its
+# value, a fault without one (IndexError, a LookupError); XML that names an
+# encoding Python does not know (LookupError, from expat's handler of
+# unknown encodings); a bigdecimal that is not a number; a gzip body cut
+# short or corrupt. A body that is not gzip at all is an OSError.
+_PARSE_ERRORS = (
+    xml.parsers.expat.ExpatError,
+    xmlrpc.client.ResponseError,
+    ValueError,
+    TypeError,
+    LookupError,
+    decimal.InvalidOperation,
+    EOFError,
+    zlib.error,
+)
+
+
+class _InvalidAnswer(Exception):
+    """Raised by Client's XML-RPC transports for an answer that is not
+    XML-RPC, whatever their parser raised for it: a RequestError stands for
+    it as xmlrpc.client's ResponseError."""
+
+
 # What a call raises in its transport: the socket's and TLS's errors, a
-# malformed HTTP answer, an HTTP status other than 200, and every error of
-# requests, which are OSErrors. An Odoo Fault is the server's answer, not one
-# of them.
-_TRANSPORT_ERRORS = (OSError, http.client.HTTPException, xmlrpc.client.ProtocolError)
+# malformed HTTP answer, an HTTP status other than 200, every error of
+# requests, which are OSErrors, and an answer that is not XML-RPC. An Odoo
+# Fault is the server's answer, not one of them.
+_TRANSPORT_ERRORS = (
+    OSError,
+    http.client.HTTPException,
+    xmlrpc.client.ProtocolError,
+    _InvalidAnswer,
+)
 # What _loaded returns for a body that is not JSON: None is JSON's null.
 _NOT_JSON = object()
 
@@ -50,7 +86,8 @@ class RequestError(Exception):
     """Raised instead of the error a call raises in its transport: a name
     that does not resolve, a connection refused or dropped, TLS, a malformed
     HTTP answer, an HTTP status other than 200 that carries no error of
-    Odoo, a redirect to another origin.
+    Odoo, an answer that is not XML-RPC or JSON, a request or a redirect to
+    another origin, a redirect to a location that cannot be read.
 
     That error's text can quote the url, and an error of requests keeps the
     request, which holds the API key, so this one carries only the profile
@@ -59,7 +96,9 @@ class RequestError(Exception):
     error's class, so ``except OSError``, ``except
     xmlrpc.client.ProtocolError``, ``except requests.ConnectionError`` and the
     like keep catching it; standing for an error of requests, its
-    ``request`` and ``response`` are None.
+    ``request`` and ``response`` are None. For an answer that is not XML-RPC,
+    Client's stands for xmlrpc.client's ResponseError, whatever the parser
+    raised.
     """
 
     def __init__(self, profile, error_class, code=None):
@@ -115,7 +154,8 @@ class OdooError(Exception):
 
 class RedirectError(requests.RequestException):
     """Raised when an answer over JSON-2 redirects a call to another origin
-    than the profile's url: another scheme, host or port.
+    than the profile's url (another scheme, host or port), or to a location
+    that cannot be read as a URL.
 
     The redirect is refused, whatever its status, before anything is sent
     there. Client.call raises it as a RequestError, whose ``code`` is the
@@ -141,7 +181,14 @@ def _request_error(profile, error):
         code = error.errno
     else:
         code = None
-    return _request_error_class(type(error))(profile, type(error).__name__, code)
+    # An answer that is not XML-RPC stands for xmlrpc.client's own error
+    # for it, as its parser's errors are no class a caller catches.
+    stands_for = (
+        xmlrpc.client.ResponseError
+        if isinstance(error, _InvalidAnswer)
+        else type(error)
+    )
+    return _request_error_class(stands_for)(profile, stands_for.__name__, code)
 
 
 class _Secret:
@@ -407,15 +454,50 @@ def _read_config(profile):
     return {**section, "url": config["url"]}
 
 
-def _log_in(profile, config):
+class _AnswerParsing:
+    """For xmlrpc.client's transports: an answer they cannot parse as
+    XML-RPC raises _InvalidAnswer, whatever their parser raised for it.
+    Client's transports have it; ServerProxy keeps xmlrpc.client's own."""
+
+    def parse_response(self, response):
+        failure = None
+        try:
+            answer = super().parse_response(response)
+        except _PARSE_ERRORS:
+            # Their text can quote the answer, and their traceback's frames
+            # hold the request: _InvalidAnswer, raised after this block,
+            # keeps neither, nor does the RequestError raised for it.
+            failure = _InvalidAnswer()
+        if failure is not None:
+            raise failure
+        return answer
+
+
+class _Transport(_AnswerParsing, xmlrpc.client.Transport):
+    """xmlrpc.client's transport for http, with _AnswerParsing."""
+
+
+class _SafeTransport(_AnswerParsing, xmlrpc.client.SafeTransport):
+    """xmlrpc.client's transport for https, with _AnswerParsing."""
+
+
+def _xmlrpc_transport(url):
+    """The transport of Client's XML-RPC calls to ``url``, which _check_url
+    let through: for its scheme, https or http, as xmlrpc.client picks it."""
+    https = urllib.parse.urlsplit(url).scheme == "https"
+    return _SafeTransport() if https else _Transport()
+
+
+def _log_in(profile, config, transport=None):
     """Log in over XML-RPC with the values of ``config``, the store of
     ``profile`` as _load_config gives it, and return the uid Odoo gives.
 
-    Raises RequestError instead of an error of the transport, and AuthError
-    when Odoo refuses the login.
+    It goes through ``transport``, xmlrpc.client's own when None, as for
+    ServerProxy. Raises RequestError instead of an error of the transport,
+    and AuthError when Odoo refuses the login.
     """
     with xmlrpc.client.ServerProxy(
-        f"{config['url']}/xmlrpc/2/common", allow_none=True
+        f"{config['url']}/xmlrpc/2/common", allow_none=True, transport=transport
     ) as common:
         uid = _send(
             profile,
@@ -535,9 +617,10 @@ def _loaded(content):
     """``content``, the body of an answer, parsed as JSON, or _NOT_JSON."""
     try:
         return json.loads(content)
-    except ValueError:
+    except (ValueError, RecursionError):
         # Its doc holds the body, which can echo the request: nothing is
-        # raised over it.
+        # raised over it. A body nested deeper than the parser can follow
+        # is no JSON it reads either.
         return _NOT_JSON
 
 
@@ -591,6 +674,27 @@ class _OriginSession(requests.Session):
         self.trust_env = False
         self.auth = _BearerKey(key, url)
 
+    def get_redirect_target(self, resp):
+        # requests decodes a redirect's Location as UTF-8, then parses it
+        # with urllib.parse, before rebuild_auth sees it: a Location it
+        # cannot decode or parse raises a UnicodeDecodeError or a ValueError,
+        # which are not errors of requests, and can quote it. It is parsed
+        # here as requests will, and refused before.
+        failure = None
+        try:
+            target = super().get_redirect_target(resp)
+            if target is not None:
+                urllib.parse.urlsplit(target)
+        except ValueError:
+            # A UnicodeDecodeError is a ValueError.
+            failure = RedirectError(
+                "A redirect to a location that is not a URL is refused",
+                response=resp,
+            )
+        if failure is not None:
+            raise failure
+        return target
+
     def rebuild_auth(self, prepared_request, response):
         # requests calls it on each redirect with the url it would follow,
         # before it sends anything there. Within the origin, the request
@@ -609,8 +713,13 @@ class _XmlRpc:
         self._profile = profile
         self._config = config
         self._uid = None
+        # The login's and the calls': an answer that is not XML-RPC raises
+        # _InvalidAnswer, one of _TRANSPORT_ERRORS.
+        self._transport = _xmlrpc_transport(config["url"])
         self._object = xmlrpc.client.ServerProxy(
-            f"{config['url']}/xmlrpc/2/object", allow_none=True
+            f"{config['url']}/xmlrpc/2/object",
+            allow_none=True,
+            transport=self._transport,
         )
 
     def call(self, model, method, ids, named):
@@ -622,7 +731,7 @@ class _XmlRpc:
             # The login's Fault too, such as a db the server does not hold,
             # is an error Odoo answers.
             if self._uid is None:
-                self._uid = _log_in(self._profile, self._config)
+                self._uid = _log_in(self._profile, self._config, self._transport)
             result = _send(
                 self._profile,
                 lambda: self._object.execute_kw(

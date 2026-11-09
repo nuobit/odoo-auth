@@ -9,6 +9,7 @@ Run from the repository root:
 """
 
 import contextlib
+import gzip
 import io
 import json
 import os
@@ -34,14 +35,17 @@ from support import (
     DB,
     KEY,
     PASSWORD,
+    UID,
     USER,
     Answer,
     HttpRecorder,
     Json2Odoo,
+    RawXmlRpc,
     StoreMixin,
     XmlRpcOdoo,
     free_port,
     odoo_error,
+    xmlrpc_answer,
 )
 
 
@@ -185,6 +189,91 @@ class XmlRpcClientTest(StubTestCase):
             client.call("res.partner", "read", [7])
         self.assertIsInstance(caught.exception, ConnectionRefusedError)
         self.assertNeverShows(caught.exception, PASSWORD)
+
+
+def _gzip_corrupt():
+    """A gzip body whose first deflate byte is no block type: zlib's error."""
+    body = bytearray(gzip.compress(xmlrpc.client.dumps((UID,), methodresponse=True).encode()))
+    body[10] = 0xFF
+    return bytes(body)
+
+
+class NotXmlRpcTest(StubTestCase):
+    """An answer that is not XML-RPC, to the login or to a call, is a
+    RequestError that stands for xmlrpc.client's ResponseError, whatever its
+    parser raised; no frame of it holds the password."""
+
+    # Each answer, after what xmlrpc.client's parser raises for it.
+    ANSWERS = {
+        "ExpatError: a page that is not XML": Answer(200, b"<html><body>Log in</html>"),
+        "ResponseError: XML that is no answer": Answer(200, b"<html><body>Log in</body></html>"),
+        "ValueError: an int that is not one": Answer(200, xmlrpc_answer("<int>seven</int>")),
+        "UnicodeEncodeError: base64 outside ASCII": Answer(
+            200, xmlrpc_answer("<base64>é</base64>")
+        ),
+        "TypeError: a boolean neither 0 nor 1": Answer(200, xmlrpc_answer("<boolean>2</boolean>")),
+        "TypeError: a fault that is not a struct": Answer(
+            200,
+            b"<?xml version='1.0'?><methodResponse><fault><value><int>1</int></value>"
+            b"</fault></methodResponse>",
+        ),
+        "IndexError: a struct name without its value": Answer(
+            200, xmlrpc_answer("<struct><member><name>id</name></member></struct>")
+        ),
+        "LookupError: XML that names an encoding Python does not know": Answer(
+            200,
+            b"<?xml version='1.0' encoding='x-unknown-test'?><methodResponse>"
+            b"<params><param><value><int>7</int></value></param></params>"
+            b"</methodResponse>",
+        ),
+        "InvalidOperation: a bigdecimal that is not a number": Answer(
+            200, xmlrpc_answer("<bigdecimal>seven</bigdecimal>")
+        ),
+        "EOFError: a gzip body cut short": Answer(
+            200,
+            gzip.compress(xmlrpc.client.dumps((UID,), methodresponse=True).encode())[:-12],
+            {"Content-Encoding": "gzip"},
+        ),
+        "zlib.error: a gzip body corrupt": Answer(
+            200, _gzip_corrupt(), {"Content-Encoding": "gzip"}
+        ),
+    }
+
+    def assertIsAnswerError(self, error):
+        self.assertIsInstance(error, xmlrpc.client.ResponseError)
+        self.assertEqual((error.error_class, error.code), ("ResponseError", None))
+        self.assertNeverShows(error, PASSWORD)
+        self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_an_answer_to_a_call_that_is_not_xml_rpc_is_a_request_error(self):
+        odoo = self.start(RawXmlRpc())
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        for case, answer in self.ANSWERS.items():
+            with self.subTest(case=case):
+                odoo.call_answer = answer
+                self.assertIsAnswerError(
+                    self.raised(
+                        RequestError,
+                        lambda: client.call("res.partner", "search_count", domain=[]),
+                    )
+                )
+
+    def test_an_answer_to_the_login_that_is_not_xml_rpc_is_a_request_error(self):
+        odoo = self.start(RawXmlRpc())
+        for number, (case, answer) in enumerate(self.ANSWERS.items()):
+            with self.subTest(case=case):
+                odoo.login_answer = answer
+                client = self.make_client(odoo.url, "xmlrpc", PASSWORD, f"login-{number}")
+                self.assertIsAnswerError(
+                    self.raised(
+                        RequestError,
+                        lambda: client.call("res.partner", "search_count", domain=[]),
+                    )
+                )
+        self.assertEqual(
+            [request["path"] for request in odoo.requests],
+            ["/xmlrpc/2/common"] * len(self.ANSWERS),
+        )
 
 
 class Json2ClientTest(StubTestCase):
@@ -336,6 +425,32 @@ class Json2ClientTest(StubTestCase):
         )
         with self.assertRaises(RedirectError):
             self.client.call("res.partner", "read", [7])
+
+    def test_a_redirect_to_a_location_that_is_not_a_url_is_refused(self):
+        # A header goes as Latin-1: each character below is one byte sent.
+        locations = {
+            "not UTF-8": "/json/2/\xff\xfe",
+            "a host that NFKC makes another": "http://a\xef\xbc\x8f@127.0.0.1/json/2/x",
+            "an IPv6 host left open": "http://[::1/json/2/res.partner/read",
+        }
+        for case, location in locations.items():
+            with self.subTest(case=case):
+                self.odoo.answers[("res.partner", "read")] = Answer(
+                    307, b"", {"Location": location}
+                )
+                error = self.raised(
+                    RequestError, lambda: self.client.call("res.partner", "read", [7])
+                )
+                self.assertIsInstance(error, RedirectError)
+                self.assertEqual(error.code, 307)
+                self.assertNeverShows(error, KEY)
+                self.assertNoFrameHolds(error, KEY)
+
+    def test_a_200_nested_deeper_than_the_parser_follows_is_a_request_error(self):
+        self.odoo.answers[("res.partner", "read")] = Answer(200, b"[" * 100000 + b"]" * 100000)
+        error = self.raised(RequestError, lambda: self.client.call("res.partner", "read", [7]))
+        self.assertIsInstance(error, requests.JSONDecodeError)
+        self.assertEqual((error.error_class, error.code), ("JSONDecodeError", 200))
 
     def test_a_redirect_within_the_origin_is_followed_with_the_key(self):
         self.odoo.answers[("res.partner", "read")] = Answer(

@@ -251,7 +251,7 @@ class UrlTest(StoreTestCase):
         self.common.authenticate.return_value = 7
         ServerProxy(profile="erp")
         xmlrpc.client.ServerProxy.assert_called_once_with(
-            "https://odoo.example.com:8069/xmlrpc/2/common", allow_none=True
+            "https://odoo.example.com:8069/xmlrpc/2/common", allow_none=True, transport=None
         )
 
 
