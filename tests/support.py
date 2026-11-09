@@ -265,6 +265,29 @@ class Json2Odoo(HttpRecorder):
         return answer if isinstance(answer, Answer) else Answer(200, answer)
 
 
+class RawXmlRpc(HttpRecorder):
+    """Odoo's /xmlrpc/2/common and /xmlrpc/2/object, answering with the
+    Answer the test sets, whatever was asked: ``login_answer`` for the
+    first (UID, by default), ``call_answer`` for the second. For answers no
+    XML-RPC server sends."""
+
+    def __init__(self):
+        self.login_answer = Answer(200, xmlrpc.client.dumps((UID,), methodresponse=True).encode())
+        self.call_answer = None
+        super().__init__()
+
+    def answer(self, request):
+        return self.login_answer if request["path"] == "/xmlrpc/2/common" else self.call_answer
+
+
+def xmlrpc_answer(value):
+    """An XML-RPC answer whose one value is ``value``, written as XML."""
+    return (
+        "<?xml version='1.0'?><methodResponse><params><param><value>"
+        f"{value}</value></param></params></methodResponse>"
+    ).encode()
+
+
 def odoo_error(name, message):
     """The body of an error Odoo's JSON-2 dispatcher sends."""
     return {

@@ -172,15 +172,18 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   does not resolve, a connection refused or dropped, TLS, an HTTP status
   other than 200 that carries no error of Odoo (such as the 404 page Odoo
   sends when `X-Odoo-Database` names no database it serves), an answer that
-  is not JSON, a request or a redirect to another origin (`InvalidURL`,
-  `RedirectError`). It carries the profile
-  (`profile`), that error's class name (`error_class`) and its errno or HTTP
-  status, if any (`code`), never its text, which can quote the url, nor the
-  request of `requests`, which holds the API key. It is also an instance of
-  that error's class, so `except OSError`,
+  is not JSON, or not XML-RPC (such as a login page), a request or a
+  redirect to another origin (`InvalidURL`, `RedirectError`), a redirect to
+  a location that cannot be read as a URL (`RedirectError`). It carries the
+  profile (`profile`), that error's class name (`error_class`) and its
+  errno or HTTP status, if any (`code`), never its text, which can quote
+  the url, nor the request of `requests`, which holds the API key. It is
+  also an instance of that error's class, so `except OSError`,
   `except xmlrpc.client.ProtocolError`, `except requests.ConnectionError`
   and the like keep catching it; as a `ProtocolError` it keeps its
-  `errcode`, while its `url` and `errmsg` are empty.
+  `errcode`, while its `url` and `errmsg` are empty. For an answer that is
+  not XML-RPC it stands for `xmlrpc.client.ResponseError`, whatever the
+  parser raised (an `ExpatError`, a `ValueError`…).
 - `OdooError`: Odoo answers the call with an error, an XML-RPC `Fault`
   (the login's too, such as Odoo's for a `db` it does not hold) or a JSON-2
   error body. It carries the profile (`profile`), Odoo's code for it
@@ -188,8 +191,9 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   Odoo's message (`message`), which shows `***` wherever it held the
   profile's password or API key.
 
-`ServerProxy` raises `ConfigError`, `AuthError` and `RequestError`; an Odoo
-`xmlrpc.client.Fault` comes through it as it is. The CLI prints
+`ServerProxy` raises `ConfigError`, `AuthError` and `RequestError`, as in
+1.x; an Odoo `xmlrpc.client.Fault`, and an answer that is not XML-RPC,
+come through it as xmlrpc.client raises them. The CLI prints
 `ConfigError`, `AuthError` and `RequestError` on one line, and an
 `OdooError` with Odoo's message.
 
