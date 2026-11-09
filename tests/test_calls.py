@@ -14,8 +14,10 @@ import gzip
 import io
 import json
 import os
+import socket
 import ssl
 import sys
+import threading
 import unittest
 import xmlrpc.client
 from unittest import mock
@@ -25,6 +27,7 @@ import requests
 import odoo_xmlrpc_auth.client
 from odoo_xmlrpc_auth import cli
 from odoo_xmlrpc_auth.client import (
+    ArgumentError,
     AuthError,
     Client,
     ConfigError,
@@ -33,6 +36,7 @@ from odoo_xmlrpc_auth.client import (
     RequestError,
     ServerProxy,
     _origin,
+    _SafeTransport,
 )
 from support import (
     DB,
@@ -76,6 +80,21 @@ class StubTestCase(StoreMixin, unittest.TestCase):
         client = Client(profile=profile)
         self.addCleanup(client.close)
         return client
+
+    def record_timeouts(self):
+        """The list where each timeout given to a socket, from now to the end
+        of the test, is recorded in order. The stubs' sockets get none."""
+        timeouts = []
+        settimeout = socket.socket.settimeout
+
+        def recording(sock, seconds):
+            timeouts.append(seconds)
+            settimeout(sock, seconds)
+
+        patcher = mock.patch.object(socket.socket, "settimeout", recording)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return timeouts
 
 
 class XmlRpcClientTest(StubTestCase):
@@ -904,6 +923,305 @@ class FramesTest(StubTestCase):
                 self.assertNoFrameHolds(error, password)
 
 
+# How long, in seconds, a stub holds a request at most before it lets the
+# connection go: far above the timeouts the tests give Client (0.2 s), far
+# below the 120 s the mutant runner waits for the suite. A test whose
+# timeout does not fire then fails in seconds, on the error of a connection
+# let go, instead of waiting forever.
+HOLD = 10
+
+
+def close_after_hold(test, closable):
+    """Close ``closable``, a socket of ``test``, after HOLD seconds, unless
+    the test ends first."""
+    timer = threading.Timer(HOLD, closable.close)
+    timer.daemon = True
+    timer.start()
+    test.addCleanup(timer.cancel)
+
+
+class HeldXmlRpcCall(RawXmlRpc):
+    """RawXmlRpc that answers the login and holds the call, unanswered,
+    until the test releases it, or HOLD seconds have passed."""
+
+    def __init__(self):
+        self.released = threading.Event()
+        super().__init__()
+
+    def answer(self, request):
+        if request["path"] == "/xmlrpc/2/common":
+            answer = self.login_answer
+        else:
+            self.released.wait(HOLD)
+            answer = None
+        return answer
+
+
+class HalfAnswer:
+    """A server that reads one request, sends a 200 whose body stops after
+    its first byte, and holds the rest until it stops, or HOLD seconds
+    have passed."""
+
+    def __init__(self):
+        self.released = threading.Event()
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(1)
+        self.url = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        connection, _ = self.listener.accept()
+        with connection:
+            connection.recv(65536)
+            connection.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 2\r\n\r\n{"
+            )
+            self.released.wait(HOLD)
+
+    def stop(self):
+        self.released.set()
+        self.thread.join(5)
+        self.listener.close()
+
+
+class TimeoutTest(StubTestCase):
+    """Each request of Client, the login's too, has the connect timeout to
+    connect, then the read timeout for its answer: 30 s and 600 s, or the
+    pair given at its creation. When one fires, the RequestError says which,
+    and after the read timeout that the call may still complete. ServerProxy
+    sets none, as before 2.0."""
+
+    def held(self):
+        """The url of a server whose system takes each connection, and which
+        never reads a request nor answers it, for HOLD seconds: its listener
+        closes then, and the system resets the connections it took."""
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        close_after_hold(self, listener)
+        return f"http://127.0.0.1:{listener.getsockname()[1]}"
+
+    def full(self):
+        """The url of a server whose queue of connections is full, so that a
+        new connection never opens: Linux drops its SYN. For HOLD seconds:
+        its listener closes then, and the next SYN is refused."""
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(0)
+        filler = socket.create_connection(listener.getsockname())
+        self.addCleanup(filler.close)
+        close_after_hold(self, listener)
+        return f"http://127.0.0.1:{listener.getsockname()[1]}"
+
+    def test_each_request_has_30_s_to_connect_and_600_s_for_its_answer_by_default(self):
+        xmlrpc_odoo = self.start(XmlRpcOdoo())
+        xmlrpc_odoo.answers[("res.partner", "search_count")] = 3
+        json2_odoo = self.start(Json2Odoo())
+        json2_odoo.answers[("res.partner", "search_count")] = 3
+        # The XML-RPC stub closes the connection after each answer: the login
+        # and the call each open one.
+        cases = {
+            "xmlrpc": (
+                self.make_client(xmlrpc_odoo.url, "xmlrpc", PASSWORD, "erp-xmlrpc"),
+                [30, 600, 30, 600],
+            ),
+            "json2": (
+                self.make_client(json2_odoo.url, "json2", KEY, "erp-json2"),
+                [30, 600],
+            ),
+        }
+        timeouts = self.record_timeouts()
+        for api, (client, expected) in cases.items():
+            with self.subTest(api=api):
+                timeouts.clear()
+                self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                self.assertEqual(timeouts, expected)
+
+    def test_a_client_takes_its_two_timeouts_at_creation(self):
+        xmlrpc_odoo = self.start(XmlRpcOdoo())
+        xmlrpc_odoo.answers[("res.partner", "search_count")] = 3
+        json2_odoo = self.start(Json2Odoo())
+        json2_odoo.answers[("res.partner", "search_count")] = 3
+        self.make_profile(xmlrpc_odoo.url, "xmlrpc", PASSWORD, "erp-xmlrpc")
+        self.make_profile(json2_odoo.url, "json2", KEY, "erp-json2")
+        cases = {"erp-xmlrpc": [2, 9.5, 2, 9.5], "erp-json2": [2, 9.5]}
+        timeouts = self.record_timeouts()
+        for profile, expected in cases.items():
+            with self.subTest(profile=profile):
+                timeouts.clear()
+                with Client(profile, timeout=(2, 9.5)) as client:
+                    client.call("res.partner", "search_count", domain=[])
+                self.assertEqual(timeouts, expected)
+
+    def test_a_client_refuses_a_timeout_that_is_not_two_positive_numbers(self):
+        # No profile "erp" exists: each is refused before the profile is read.
+        cases = {
+            "one number": (30, TypeError),
+            "a list": ([30, 600], TypeError),
+            "one member": ((30,), TypeError),
+            "three members": ((30, 600, 5), TypeError),
+            "a string": ((30, "600"), TypeError),
+            "a bool": ((True, 600), TypeError),
+            "None": (None, TypeError),
+            "zero": ((0, 600), ValueError),
+            "negative": ((30, -1), ValueError),
+            "NaN": ((30, float("nan")), ValueError),
+            "infinite": ((30, float("inf")), ValueError),
+            "beyond what a socket takes": ((30, 1e10), ValueError),
+        }
+        for case, (timeout, error_class) in cases.items():
+            with self.subTest(case=case):
+                error = self.raised(
+                    ArgumentError, lambda: Client("erp", timeout=timeout)
+                )
+                self.assertIsInstance(error, error_class)
+                self.assertIn("timeout", str(error))
+
+    def test_a_client_takes_the_largest_timeout_a_socket_takes(self):
+        odoo = self.start(Json2Odoo())
+        odoo.answers[("res.partner", "search_count")] = 3
+        self.make_profile(odoo.url, "json2", KEY)
+        largest = threading.TIMEOUT_MAX
+        timeouts = self.record_timeouts()
+        with Client("erp", timeout=(largest, largest)) as client:
+            self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertEqual(timeouts, [largest, largest])
+
+    def test_a_connect_timeout_says_it_fired_before_anything_was_sent(self):
+        # Every socket's own timeout ends the wait should a connection get
+        # none: Linux resends a dropped SYN for about two minutes.
+        self.addCleanup(socket.setdefaulttimeout, socket.getdefaulttimeout())
+        socket.setdefaulttimeout(5)
+        url = self.full()
+        cases = {
+            "xmlrpc": (PASSWORD, socket.timeout, "TimeoutError"),
+            "json2": (KEY, requests.ConnectTimeout, "ConnectTimeout"),
+        }
+        for api, (secret, original, name) in cases.items():
+            with self.subTest(api=api):
+                self.make_profile(url, api, secret, f"erp-{api}")
+                with Client(f"erp-{api}", timeout=(0.2, 5)) as client:
+                    error = self.raised(
+                        RequestError,
+                        lambda: client.call("res.partner", "search_count", domain=[]),
+                    )
+                self.assertIsInstance(error, original)
+                self.assertEqual(error.timeout_fired, "connect")
+                self.assertEqual(
+                    str(error),
+                    f"A request of profile 'erp-{api}' failed: {name}. The connect "
+                    "timeout fired, before anything was sent. Its message is not "
+                    "shown, as it can quote the profile's values.",
+                )
+                self.assertNeverShows(error, secret)
+                self.assertNoFrameHolds(error, secret)
+
+    def test_an_xmlrpc_tls_handshake_is_under_the_connect_timeout(self):
+        # Every socket's own timeout ends the wait should the handshake get
+        # none: the timeouts recorded then tell.
+        self.addCleanup(socket.setdefaulttimeout, socket.getdefaulttimeout())
+        socket.setdefaulttimeout(5)
+        self.make_profile(self.held().replace("http://", "https://"), "xmlrpc", PASSWORD)
+        timeouts = self.record_timeouts()
+        with Client("erp", timeout=(0.2, 9)) as client:
+            error = self.raised(
+                RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        self.assertEqual(error.timeout_fired, "connect")
+        # The TLS socket takes over the timeout of the socket it wraps, and
+        # sets it again once its handshake ends (ssl.SSLSocket.do_handshake).
+        self.assertEqual(timeouts, [0.2, 0.2, 0.2])
+
+    def test_an_xmlrpc_https_connection_reads_under_the_read_timeout(self):
+        # The transport gives the connection both timeouts as it builds it,
+        # before it connects: no TLS server is needed, and no socket is
+        # opened. The TCP socket and the TLS socket are fakes; the context
+        # that wraps one into the other is the one the connection makes.
+        tcp_socket = mock.create_autospec(socket.socket, instance=True)
+        tls_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+        with mock.patch("socket.create_connection", return_value=tcp_socket) as connect:
+            with mock.patch.object(ssl.SSLContext, "wrap_socket", return_value=tls_socket) as wrap:
+                _SafeTransport((2, 9.5)).make_connection("127.0.0.1").connect()
+        connect.assert_called_once_with(("127.0.0.1", 443), 2, None)
+        wrap.assert_called_once_with(tcp_socket, server_hostname="127.0.0.1")
+        tls_socket.settimeout.assert_called_once_with(9.5)
+
+    def test_a_read_timeout_says_the_server_may_still_complete_the_call(self):
+        held_call = self.start(HeldXmlRpcCall())
+        self.addCleanup(held_call.released.set)
+        held = self.held()
+        cases = {
+            "the xmlrpc login": (held, "xmlrpc", PASSWORD, socket.timeout, "TimeoutError"),
+            "an xmlrpc call": (held_call.url, "xmlrpc", PASSWORD, socket.timeout, "TimeoutError"),
+            "a json2 call": (held, "json2", KEY, requests.ReadTimeout, "ReadTimeout"),
+        }
+        for case, (url, api, secret, original, name) in cases.items():
+            with self.subTest(case=case):
+                self.make_profile(url, api, secret)
+                with Client("erp", timeout=(5, 0.2)) as client:
+                    error = self.raised(
+                        RequestError,
+                        lambda: client.call("res.partner", "search_count", domain=[]),
+                    )
+                self.assertIsInstance(error, original)
+                self.assertEqual(error.timeout_fired, "read")
+                self.assertEqual(
+                    str(error),
+                    f"A request of profile 'erp' failed: {name}. The read timeout "
+                    "fired: the server may still complete the call, so do not "
+                    "repeat it before reading back what it did. Its message is "
+                    "not shown, as it can quote the profile's values.",
+                )
+                self.assertNeverShows(error, secret)
+                self.assertNoFrameHolds(error, secret)
+        self.assertEqual(
+            [request["path"] for request in held_call.requests],
+            ["/xmlrpc/2/common", "/xmlrpc/2/object"],
+        )
+
+    def test_a_json2_answer_whose_body_stops_coming_is_a_read_timeout(self):
+        half = self.start(HalfAnswer())
+        self.make_profile(half.url, "json2", KEY)
+        with Client("erp", timeout=(5, 0.2)) as client:
+            error = self.raised(
+                RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        self.assertIsInstance(error, requests.ConnectionError)
+        self.assertEqual(error.timeout_fired, "read")
+        self.assertIn("The read timeout fired", str(error))
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_server_proxy_sets_no_timeout(self):
+        odoo = self.start(XmlRpcOdoo())
+        odoo.answers[("res.partner", "search_count")] = 3
+        self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+        timeouts = self.record_timeouts()
+        with ServerProxy(profile="erp") as proxy:
+            self.assertEqual(proxy.execute_kw("res.partner", "search_count", [[]], {}), 3)
+        self.assertEqual(timeouts, [])
+
+    def test_a_timeout_of_server_proxy_is_none_of_clients(self):
+        # Sockets get this timeout when nothing sets theirs: a script can set
+        # it for ServerProxy, whose error then reads as before 2.0.
+        self.addCleanup(socket.setdefaulttimeout, socket.getdefaulttimeout())
+        socket.setdefaulttimeout(0.2)
+        self.make_profile(self.held(), "xmlrpc", PASSWORD)
+        error = self.raised(RequestError, lambda: ServerProxy(profile="erp"))
+        self.assertIsInstance(error, socket.timeout)
+        self.assertIsNone(error.timeout_fired)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: TimeoutError. Its message is not "
+            "shown, as it can quote the profile's values.",
+        )
+
+
 class CliTest(StubTestCase):
     """The CLI calls by name through Client, and keeps execute_kw's
     positional args for an `api = xmlrpc` profile only."""
@@ -929,6 +1247,23 @@ class CliTest(StubTestCase):
                 except SystemExit as exit_:
                     code = exit_.code
         return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_the_cli_calls_under_the_clients_default_timeouts(self):
+        self.xmlrpc_odoo.answers[("res.partner", "search_count")] = 3
+        self.json2_odoo.answers[("res.partner", "search_count")] = 3
+        # The XML-RPC stub closes the connection after each answer: the login
+        # and the call each open one.
+        cases = {"erp-xmlrpc": [30, 600, 30, 600], "erp-json2": [30, 600]}
+        timeouts = self.record_timeouts()
+        for profile, expected in cases.items():
+            with self.subTest(profile=profile):
+                timeouts.clear()
+                result = self.run_cli(
+                    profile, {"model": "res.partner", "method": "search_count",
+                              "kwargs": {"domain": []}}
+                )
+                self.assertEqual(result, (0, "3\n", ""))
+                self.assertEqual(timeouts, expected)
 
     def test_the_named_form_calls_over_json2(self):
         self.json2_odoo.answers[("res.partner", "read")] = [{"id": 7, "name": "Example"}]

@@ -192,7 +192,8 @@ class Answer:
 class HttpRecorder:
     """An HTTP server that records each request it gets in ``requests``
     (method, path, headers with lower-case names, body) and answers with
-    ``answer(request)``: by default 404 with an empty body."""
+    ``answer(request)``: by default 404 with an empty body; None answers
+    nothing."""
 
     def __init__(self):
         self.requests = []
@@ -209,6 +210,9 @@ class HttpRecorder:
                 }
                 recorder.requests.append(request)
                 answer = recorder.answer(request)
+                if answer is None:
+                    # No answer: the connection closes.
+                    return
                 body = (
                     answer.body
                     if isinstance(answer.body, bytes)

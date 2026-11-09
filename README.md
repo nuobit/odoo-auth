@@ -61,7 +61,9 @@ The payload is a `Client.call` (below) written as JSON:
 ```
 
 `ids` is left out, or null, for a method of the model; `kwargs` holds the
-method's own arguments, by name. Any other key is refused.
+method's own arguments, by name. Any other key is refused. The CLI calls
+under `Client`'s default timeouts (below), and has no option to change
+them.
 
 ### Examples
 
@@ -174,6 +176,29 @@ version, and a list of them, `vals_list=[{...}, ...]`, from Odoo 12: up to
 Odoo 11 the base's `create` takes one dict. With a single dict, XML-RPC
 answers the new id and JSON-2 the list of its id.
 
+Each request of a `Client`, the XML-RPC login included, has 30 seconds to
+connect and then 600 to get its answer. `timeout`, given when the `Client`
+is created, changes both, as a `(connect, read)` tuple of seconds, the form
+`requests` takes:
+
+```python
+with Client(profile="customer1", timeout=(10, 1800)) as odoo:
+    ...
+```
+
+Each value is a number of seconds above 0 and at most
+`threading.TIMEOUT_MAX`; anything else is refused with an `ArgumentError`
+when the `Client` is created. Over XML-RPC the request itself goes out
+under the read timeout; over JSON-2, under the connect timeout, as
+`requests` sends it. When a timeout fires, the call raises a `RequestError`
+that says which ([Errors](#errors)).
+
+The connect timeout applies to each address the host's name resolves to,
+in turn, as both APIs connect (`socket.create_connection` over XML-RPC,
+urllib3's over JSON-2): a name with several addresses that do not answer
+waits that long for each one. The name's resolution itself is under
+neither timeout: it takes as long as the system's resolver takes.
+
 ### ServerProxy: the XML-RPC drop-in
 
 Drop-in replacement for `xmlrpc.client.ServerProxy`, for `api = xmlrpc`
@@ -198,7 +223,9 @@ proxy.execute_kw("project.task", "write",
 
 Without `profile=`, it behaves exactly like the original `xmlrpc.client.ServerProxy`.
 An `api = json2` profile is refused with a `ConfigError` that names `Client`:
-the profile decides the API.
+the profile decides the API. It sets no timeout, as in 1.x: a request waits
+as long as the server takes, unless the script sets one for every socket
+(`socket.setdefaulttimeout`), whose error then names no timeout of `Client`.
 
 ## Errors
 
@@ -232,7 +259,15 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   and the like keep catching it; as a `ProtocolError` it keeps its
   `errcode`, while its `url` and `errmsg` are empty. For an answer that is
   not XML-RPC it stands for `xmlrpc.client.ResponseError`, whatever the
-  parser raised (an `ExpatError`, a `ValueError`…).
+  parser raised (an `ExpatError`, a `ValueError`…). When one of `Client`'s
+  timeouts fires, `timeout_fired` says which, `"connect"` or `"read"`
+  (`None` otherwise), and so does the message. After the connect timeout
+  nothing was sent. After the read timeout the server may still complete
+  the call: read back what it did before repeating it. It is then an
+  instance of `socket.timeout` (`TimeoutError`) over XML-RPC, and of
+  `requests.ConnectTimeout`, `requests.ReadTimeout` or
+  `requests.ConnectionError` over JSON-2, where `requests` reports a TLS
+  handshake that times out as a `ReadTimeout`, which counts as read.
 - `OdooError`: Odoo answers the call with an error, an XML-RPC `Fault`
   (the login's too, such as Odoo's for a `db` it does not hold) or a JSON-2
   error body. It carries the profile (`profile`), Odoo's code for it
@@ -256,7 +291,10 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   `OverflowError` or `RecursionError` it stands for. Over XML-RPC the call's
   own values are marshalled once without the credentials before the call:
   marshalled with them, a value it cannot write would raise from frames
-  that hold the password.
+  that hold the password. `Client(...)` raises it too, before the profile
+  is read, for a `timeout` that is not a `(connect, read)` tuple of two
+  numbers (a `TypeError`) or whose values are not above 0 and at most
+  `threading.TIMEOUT_MAX` (a `ValueError`).
 
 `ServerProxy` raises `ConfigError`, `AuthError` and `RequestError`, as in
 1.x; an Odoo `xmlrpc.client.Fault`, and an answer that is not XML-RPC,

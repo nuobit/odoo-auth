@@ -5,7 +5,9 @@ import http.client
 import json
 import os
 import re
+import socket
 import stat
+import threading
 import urllib.parse
 import xml.parsers.expat
 import xmlrpc.client
@@ -13,6 +15,19 @@ import zlib
 
 import requests
 
+# A Client's timeouts by default, in seconds, as (connect, read): to open
+# the connection, then to wait for the answer once connected. A Client
+# takes others at its creation.
+_DEFAULT_TIMEOUT = (30, 600)
+# What a RequestError adds to its message when one of Client's timeouts
+# fired, by its timeout_fired.
+_TIMEOUT_NOTES = {
+    "connect": "The connect timeout fired, before anything was sent. ",
+    "read": (
+        "The read timeout fired: the server may still complete the call, so "
+        "do not repeat it before reading back what it did. "
+    ),
+}
 _SECTION = "odoo"
 _REQUIRED_KEYS = ("url", "db", "user", "password")
 # The values of a profile a caller may print (Client's repr shows the api):
@@ -56,6 +71,16 @@ class _InvalidAnswer(Exception):
     """Raised by Client's XML-RPC transports for an answer that is not
     XML-RPC, whatever their parser raised for it: a RequestError stands for
     it as xmlrpc.client's ResponseError."""
+
+
+class _ConnectTimeout(socket.timeout):
+    """Raised by Client's XML-RPC connections when the connect timeout fires:
+    a RequestError stands for it as the socket's timeout it replaces."""
+
+
+class _ReadTimeout(socket.timeout):
+    """Raised by Client's XML-RPC transports when the read timeout fires:
+    a RequestError stands for it as the socket's timeout it replaces."""
 
 
 # What a call raises in its transport: the socket's and TLS's errors, a
@@ -110,12 +135,17 @@ class RequestError(Exception):
     ``request`` and ``response`` are None. For an answer that is not XML-RPC,
     Client's stands for xmlrpc.client's ResponseError, whatever the parser
     raised.
+
+    When one of Client's timeouts fired, ``timeout_fired`` says which,
+    "connect" or "read" (None otherwise), and so does the message: after a
+    read timeout the server may still complete the call.
     """
 
-    def __init__(self, profile, error_class, code=None):
+    def __init__(self, profile, error_class, code=None, timeout_fired=None):
         self.profile = profile
         self.error_class = error_class
         self.code = code
+        self.timeout_fired = timeout_fired
         if isinstance(self, xmlrpc.client.ProtocolError):
             # Its own fields, the status kept, without the url and the
             # server's text.
@@ -131,9 +161,12 @@ class RequestError(Exception):
 
     def __str__(self):
         code = f", code {self.code}" if self.code is not None else ""
+        note = (
+            _TIMEOUT_NOTES[self.timeout_fired] if self.timeout_fired is not None else ""
+        )
         return (
             f"A request of profile {self.profile!r} failed: {self.error_class}"
-            f"{code}. Its message is not shown, as it can quote the "
+            f"{code}. {note}Its message is not shown, as it can quote the "
             "profile's values."
         )
 
@@ -169,7 +202,8 @@ class ArgumentError(Exception):
     or a value its API cannot carry (over XML-RPC, a type xmlrpc.client
     cannot marshal or an int beyond 32 bits; over JSON-2, a value JSON
     cannot hold, NaN among them; over either, one nested deeper than the
-    encoder follows).
+    encoder follows). Raised by Client too, before the profile is read, for
+    a timeout that is not a (connect, read) tuple of positive numbers.
 
     It carries the profile (``profile``) and the reason (``reason``), for a
     value the encoder's own text, which shows *** wherever it held the
@@ -217,14 +251,56 @@ def _request_error(profile, error):
         code = error.errno
     else:
         code = None
-    # An answer that is not XML-RPC stands for xmlrpc.client's own error
-    # for it, as its parser's errors are no class a caller catches.
-    stands_for = (
-        xmlrpc.client.ResponseError
-        if isinstance(error, _InvalidAnswer)
-        else type(error)
+    # The library's own signals stand for the public class they are: an
+    # answer that is not XML-RPC for xmlrpc.client's own error for it, as
+    # its parser's errors are no class a caller catches; a timeout of
+    # Client's for the socket's timeout it replaces.
+    if isinstance(error, _InvalidAnswer):
+        stands_for = xmlrpc.client.ResponseError
+    elif isinstance(error, (_ConnectTimeout, _ReadTimeout)):
+        stands_for = socket.timeout
+    else:
+        stands_for = type(error)
+    return _error_class(RequestError, stands_for)(
+        profile, stands_for.__name__, code, _timeout_fired(error)
     )
-    return _error_class(RequestError, stands_for)(profile, stands_for.__name__, code)
+
+
+def _timeout_fired(error):
+    """Which of Client's timeouts ``error``, one of _TRANSPORT_ERRORS, stands
+    for: "connect", "read", or None for none, as for every error of
+    ServerProxy, which sets no timeout.
+
+    Over XML-RPC, Client's transports raise _ConnectTimeout and _ReadTimeout.
+    Over JSON-2, requests raises ConnectTimeout and ReadTimeout, and a
+    ConnectionError over the socket's timeout when the answer's body stops
+    coming (requests' Response.iter_content) or the request stops going
+    out. requests also reports a TLS handshake that times out as a
+    ReadTimeout (urllib3 2.8's HTTPConnectionPool._make_request), which
+    counts as read: its note says what is safe, not what is sure.
+    """
+    if isinstance(error, (_ConnectTimeout, requests.ConnectTimeout)):
+        fired = "connect"
+    elif isinstance(error, (_ReadTimeout, requests.ReadTimeout)) or (
+        isinstance(error, requests.ConnectionError) and _over_socket_timeout(error)
+    ):
+        fired = "read"
+    else:
+        fired = None
+    return fired
+
+
+def _over_socket_timeout(error):
+    """Whether ``error`` was raised over a socket's timeout: one is among the
+    errors of its chain, by __cause__ or else __context__."""
+    chain = []
+    cause = error.__cause__ or error.__context__
+    # Python keeps a chain free of cycles when it sets __context__; a cause
+    # set by hand may close one, which ends the walk too.
+    while cause is not None and cause not in chain:
+        chain.append(cause)
+        cause = cause.__cause__ or cause.__context__
+    return any(isinstance(cause, socket.timeout) for cause in chain)
 
 
 def _argument_error(profile, error, causes, secret):
@@ -664,19 +740,105 @@ class _AnswerParsing:
         return answer
 
 
-class _Transport(_AnswerParsing, xmlrpc.client.Transport):
-    """xmlrpc.client's transport for http, with _AnswerParsing."""
+class _TimedConnection:
+    """For http.client's connections: connect under the connection's own
+    timeout, the connect timeout (the TLS handshake too, for https), then
+    give the socket ``read_timeout`` for everything sent and received once
+    connected. A connect that times out raises _ConnectTimeout."""
+
+    def __init__(self, *args, read_timeout, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._read_timeout = read_timeout
+
+    def connect(self):
+        failure = None
+        try:
+            super().connect()
+        except socket.timeout:
+            # _ConnectTimeout, raised after this block, tells the connect
+            # timeout from the read timeout.
+            failure = _ConnectTimeout()
+        if failure is not None:
+            raise failure
+        self.sock.settimeout(self._read_timeout)
 
 
-class _SafeTransport(_AnswerParsing, xmlrpc.client.SafeTransport):
-    """xmlrpc.client's transport for https, with _AnswerParsing."""
+class _HTTPConnection(_TimedConnection, http.client.HTTPConnection):
+    """http.client's connection for http, with _TimedConnection."""
 
 
-def _xmlrpc_transport(url):
+class _HTTPSConnection(_TimedConnection, http.client.HTTPSConnection):
+    """http.client's connection for https, with _TimedConnection."""
+
+
+class _Timeouts:
+    """For Client's XML-RPC transports, whose connections are
+    _TimedConnections under ``timeout``, a (connect, read) pair of seconds:
+    the socket's timeout raised once connected, the read timeout's, raises
+    _ReadTimeout. xmlrpc.client sends a timed out request only once
+    (Transport.request retries a reset connection, not a timeout).
+
+    Each transport opens the connection of its scheme in _connect_to."""
+
+    def __init__(self, timeout):
+        super().__init__()
+        self._timeout = timeout
+
+    def make_connection(self, host):
+        # xmlrpc.client's own (Python 3.11, Transport.make_connection and
+        # SafeTransport.make_connection), which keeps one connection per host
+        # for keep-alive, with the timeouts.
+        if self._connection and host == self._connection[0]:
+            return self._connection[1]
+        chost, self._extra_headers, x509 = self.get_host_info(host)
+        connect, read = self._timeout
+        self._connection = host, self._connect_to(
+            chost, x509, timeout=connect, read_timeout=read
+        )
+        return self._connection[1]
+
+    def single_request(self, host, handler, request_body, verbose=False):
+        failure = None
+        try:
+            answer = super().single_request(host, handler, request_body, verbose)
+        except _ConnectTimeout:
+            raise
+        except socket.timeout:
+            # Raised once connected, where the socket's timeout is the read
+            # timeout. The frames of its traceback hold the request:
+            # _ReadTimeout, raised after this block, keeps none of them.
+            failure = _ReadTimeout()
+        if failure is not None:
+            raise failure
+        return answer
+
+
+class _Transport(_Timeouts, _AnswerParsing, xmlrpc.client.Transport):
+    """xmlrpc.client's transport for http, with _Timeouts and
+    _AnswerParsing."""
+
+    def _connect_to(self, chost, x509, **timeouts):
+        # As xmlrpc.client's Transport.make_connection, which leaves x509 out.
+        return _HTTPConnection(chost, **timeouts)
+
+
+class _SafeTransport(_Timeouts, _AnswerParsing, xmlrpc.client.SafeTransport):
+    """xmlrpc.client's transport for https, with _Timeouts and
+    _AnswerParsing."""
+
+    def _connect_to(self, chost, x509, **timeouts):
+        # As xmlrpc.client's SafeTransport.make_connection.
+        return _HTTPSConnection(
+            chost, None, context=self.context, **timeouts, **(x509 or {})
+        )
+
+
+def _xmlrpc_transport(url, timeout):
     """The transport of Client's XML-RPC calls to ``url``, which _check_url
-    let through: for its scheme, https or http, as xmlrpc.client picks it."""
+    let through, with ``timeout``, a (connect, read) pair of seconds: for its
+    scheme, https or http, as xmlrpc.client picks it."""
     https = urllib.parse.urlsplit(url).scheme == "https"
-    return _SafeTransport() if https else _Transport()
+    return _SafeTransport(timeout) if https else _Transport(timeout)
 
 
 def _log_in(profile, config, transport=None):
@@ -926,15 +1088,17 @@ _LEADING_LEFT_OUT = {"domain": (), "name": ""}
 
 class _XmlRpc:
     """Client.call over XML-RPC: execute_kw on /xmlrpc/2/object, after a
-    login at the first call, as ServerProxy does it."""
+    login at the first call, as ServerProxy does it, every request under
+    ``timeout``, a (connect, read) pair of seconds."""
 
-    def __init__(self, profile, config):
+    def __init__(self, profile, config, timeout):
         self._profile = profile
         self._config = config
         self._uid = None
         # The login's and the calls': an answer that is not XML-RPC raises
-        # _InvalidAnswer, one of _TRANSPORT_ERRORS.
-        self._transport = _xmlrpc_transport(config["url"])
+        # _InvalidAnswer, one of _TRANSPORT_ERRORS, and each connection takes
+        # the timeouts.
+        self._transport = _xmlrpc_transport(config["url"], timeout)
         self._object = xmlrpc.client.ServerProxy(
             f"{config['url']}/xmlrpc/2/object",
             allow_none=True,
@@ -1020,13 +1184,15 @@ class _XmlRpc:
 class _Json2:
     """Client.call over Odoo's External JSON-2 API (Odoo 19 and later): one
     POST to /json/2/<model>/<method> per call, the API key as a bearer
-    token and the profile's db in the X-Odoo-Database header."""
+    token and the profile's db in the X-Odoo-Database header, under
+    ``timeout``, a (connect, read) pair of seconds, as requests takes it."""
 
-    def __init__(self, profile, config):
+    def __init__(self, profile, config, timeout):
         self._profile = profile
         self._url = config["url"]
         self._db = config["db"]
         self._key = config["password"]
+        self._timeout = timeout
         self._session = _OriginSession(self._url, self._key)
 
     def call(self, model, method, ids, named):
@@ -1055,6 +1221,7 @@ class _Json2:
                     # Request._get_session_and_dbname).
                     "X-Odoo-Database": self._db,
                 },
+                timeout=self._timeout,
             ),
         )
         return self._result(response)
@@ -1091,14 +1258,47 @@ class _Json2:
         self._session.close()
 
 
+def _check_timeout(profile, timeout):
+    """Raise ArgumentError unless ``timeout``, Client's, is a (connect, read)
+    tuple of two numbers of seconds above 0 and at most the largest timeout
+    Python's blocking calls take (threading.TIMEOUT_MAX): a socket refuses
+    more, while it sends the call."""
+    if not (
+        isinstance(timeout, tuple)
+        and len(timeout) == 2
+        and all(
+            isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
+            for seconds in timeout
+        )
+    ):
+        raise _error_class(ArgumentError, TypeError)(
+            profile, "timeout must be a (connect, read) tuple of two numbers of seconds"
+        )
+    if not all(0 < seconds <= threading.TIMEOUT_MAX for seconds in timeout):
+        raise _error_class(ArgumentError, ValueError)(
+            profile,
+            "each timeout must be a number of seconds above 0 and at most "
+            "threading.TIMEOUT_MAX",
+        )
+
+
 class Client:
     """Calls to Odoo for one profile, by name, over the API its `api` line
     names: XML-RPC or JSON-2.
 
-    ``Client(profile)`` reads the profile and sends nothing; over XML-RPC
-    the first call logs in. Every call raises the same errors whatever the
-    API: ConfigError, AuthError, RequestError, and OdooError for an error
-    Odoo answers. Close it when done, or use it as a context manager.
+    ``Client(profile)`` reads the profile and sends nothing: it raises
+    ConfigError for a profile it refuses, and ArgumentError for a
+    ``timeout`` it refuses. Over XML-RPC the first call logs in. Every call
+    raises the same errors whatever the API: AuthError, RequestError,
+    OdooError for an error Odoo answers, and ArgumentError for a call it
+    cannot send, before anything is sent. Close it when done, or use it as
+    a context manager.
+
+    Each request, the login's too, has 30 seconds to connect and then 600
+    to get its answer. ``timeout``, a (connect, read) tuple of seconds,
+    changes both: ``Client(profile, timeout=(10, 1800))``. When one fires,
+    the RequestError says which; after the read timeout the server may still
+    complete the call.
 
     Usage::
 
@@ -1112,13 +1312,14 @@ class Client:
             odoo.call("res.partner", "write", [7], vals={"name": "Example"})
     """
 
-    def __init__(self, profile):
+    def __init__(self, profile, *, timeout=_DEFAULT_TIMEOUT):
+        _check_timeout(profile, timeout)
         config = _load_config(profile)
         self.profile = profile
         self.api = config["api"]
         # _load_config lets through only the two values of _APIS.
         transport = _XmlRpc if self.api == "xmlrpc" else _Json2
-        self._transport = transport(profile, config)
+        self._transport = transport(profile, config, timeout)
 
     def __repr__(self):
         return f"Client(profile={self.profile!r}, api={self.api!r})"
