@@ -515,23 +515,28 @@ def _read_section(profile):
     config_dir = os.path.expanduser("~/.config/odoo-xmlrpc-auth")
     config_path = os.path.join(config_dir, f"{profile}.conf")
 
-    try:
-        _check_permissions(config_dir)
-    except FileNotFoundError:
-        pass
-
     parser = configparser.RawConfigParser()
     failure = None
     try:
+        _check_permissions(config_dir)
         with open(config_path, encoding="utf-8") as f:
             _check_permissions(config_path, fd=f.fileno())
             parser.read_file(f)
     except FileNotFoundError:
+        # The folder or the file: the file cannot exist without its folder.
         failure = ConfigError(
             f"Config file not found: {config_path}\n"
             f"Create it with a [{_SECTION}] section, the keys "
             + ", ".join(_REQUIRED_KEYS)
             + f", and the line {_ACCEPTED_API_LINES}"
+        )
+    except OSError as error:
+        # A file this user may not read, a folder in its place: the reason
+        # the system gives, which quotes nothing of the store.
+        reason = error.strerror if error.strerror is not None else type(error).__name__
+        failure = ConfigError(
+            f"{config_path} cannot be read ({reason}): it must be a file this "
+            "user can read."
         )
     except (configparser.Error, UnicodeDecodeError):
         # Their text or repr can quote the store, which holds the password.
