@@ -217,6 +217,28 @@ class UrlTest(StoreTestCase):
         self.assertIn("cannot be parsed as a URL", str(caught.exception))
         self.assertNeverShows(caught.exception, PASSWORD)
 
+    def test_a_url_with_a_backslash_is_refused_unshown(self):
+        # requests ends the host at the backslash: the calls would go to
+        # evil.example, where urllib.parse reads the profile's origin as the
+        # whole name.
+        self.make_store_with_url("https://evil.example\\.odoo.example.com")
+        with self.assertRaises(ConfigError) as caught:
+            ServerProxy(profile="erp")
+        self.assertIn("must hold no backslash", str(caught.exception))
+        self.assertNeverShows(caught.exception, "evil.example")
+        self.common.authenticate.assert_not_called()
+
+    def test_a_url_with_port_0_is_refused(self):
+        # requests drops port 0 and goes to the scheme's default port.
+        self.make_store_with_url("https://odoo.example.com:0")
+        with self.assertRaisesRegex(
+            ConfigError,
+            r"The url in .*erp\.conf must name a port from 1 to 65535, if it "
+            r"names one$",
+        ):
+            ServerProxy(profile="erp")
+        self.common.authenticate.assert_not_called()
+
     def test_a_url_with_a_port_passes(self):
         self.make_store_with_url("https://odoo.example.com:8069")
         self.common.authenticate.return_value = 7

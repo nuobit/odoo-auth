@@ -348,6 +348,32 @@ class Json2ClientTest(StubTestCase):
         self.assertEqual(followed["headers"]["authorization"], f"Bearer {KEY}")
         self.assertEqual(self.sent_body(1), {"ids": [7]})
 
+    def test_a_request_for_another_origin_gets_no_key_and_is_not_sent(self):
+        elsewhere = self.start(HttpRecorder())
+        url = f"{elsewhere.url}/json/2/res.partner/read"
+        session = self.client._transport._session
+        prepared = requests.Request("POST", url).prepare()
+        with self.assertRaises(requests.exceptions.InvalidURL):
+            session.auth(prepared)
+        self.assertNotIn("Authorization", prepared.headers)
+        with self.assertRaises(requests.exceptions.InvalidURL):
+            session.post(url, data=b"{}")
+        self.assertEqual(elsewhere.requests, [])
+
+    def test_a_call_that_requests_would_send_to_another_host_is_refused(self):
+        # The load check refuses this url (test_client.UrlTest); it is
+        # patched out here to reach the check of each request behind it.
+        # requests ends the host at the backslash: the call would go to
+        # 127.0.0.1, port 80.
+        with mock.patch("odoo_xmlrpc_auth.client._check_url"):
+            client = self.make_client(
+                "http://127.0.0.1\\.odoo.example.com:8069", "json2", KEY, "other"
+            )
+        error = self.raised(RequestError, lambda: client.call("res.partner", "read", [7]))
+        self.assertIsInstance(error, requests.exceptions.InvalidURL)
+        self.assertEqual((error.error_class, error.code), ("InvalidURL", None))
+        self.assertNeverShows(error, KEY)
+
     def test_netrc_is_never_read(self):
         netrc_path = os.path.join(self._home, ".netrc")
         with open(netrc_path, "w", encoding="utf-8") as f:

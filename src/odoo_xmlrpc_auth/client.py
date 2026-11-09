@@ -202,12 +202,16 @@ def _check_api(profile, section, config_path):
 
 def _check_url(url, config_path):
     """Raise ConfigError unless ``url`` names a host after one of
-    _URL_SCHEMES, with a port that is a number if it has one and no user or
-    password, on one line of printable ASCII without spaces.
+    _URL_SCHEMES, with a port from 1 to 65535 if it has one, no user or
+    password and no backslash, on one line of printable ASCII without
+    spaces.
 
     The transport quotes a url it refuses, and a url line that is wrong can
     hold a secret: no message here quotes any part of the url, not even its
-    scheme.
+    scheme. A backslash and port 0 are read one way by urllib.parse, which
+    gives the profile's origin, and another by urllib3, which connects: the
+    host ends at a backslash for urllib3, and it drops port 0 for the
+    scheme's default.
     """
     failure = None
     try:
@@ -238,6 +242,17 @@ def _check_url(url, config_path):
         raise ConfigError(
             f"The url in {config_path} must have no user or password before "
             "its host"
+        )
+    elif "\\" in url:
+        raise ConfigError(
+            f"The url in {config_path} must hold no backslash: the JSON-2 "
+            "transport ends the host at one, and would send the calls to "
+            "another host"
+        )
+    elif parts.port == 0:
+        raise ConfigError(
+            f"The url in {config_path} must name a port from 1 to 65535, if "
+            "it names one"
         )
 
 
@@ -496,13 +511,28 @@ def _loaded(content):
 
 class _BearerKey(requests.auth.AuthBase):
     """Puts the API key (``key``, a _Secret) in the Authorization header of
-    each request the session prepares. Its repr shows only the key's
-    length."""
+    each request the session prepares for the origin of ``url``, and of no
+    other: a request for another origin raises InvalidURL before the key is
+    set, and nothing is sent. Its repr shows only the key's length."""
 
-    def __init__(self, key):
+    def __init__(self, key, url):
         self._key = key
+        self._origin = _origin(url)
+
+    def goes_to(self, url):
+        """Whether the key may go to ``url``: one of its own origin."""
+        return _origin(url) == self._origin
 
     def __call__(self, request):
+        # requests calls it with the url as it prepared it, the one the
+        # connection reads, after urllib3 parsed it: where urllib3 reads
+        # another origin than urllib.parse read in the profile's url, the
+        # request goes nowhere.
+        if not self.goes_to(request.url):
+            raise requests.exceptions.InvalidURL(
+                "The request would go to another origin than the profile's "
+                "url: the key was not set, and nothing was sent"
+            )
         request.headers["Authorization"] = f"Bearer {self._key.reveal()}"
         return request
 
@@ -511,9 +541,10 @@ class _BearerKey(requests.auth.AuthBase):
 
 
 class _OriginSession(requests.Session):
-    """A requests session that sends the API key with each request, and
-    follows a redirect only within the origin of ``url``: any other raises
-    RedirectError before anything is sent there.
+    """A requests session whose auth sends the API key only to the origin
+    of ``url``, and which follows a redirect only within that origin: a
+    request or a redirect for any other raises before anything is sent
+    there.
 
     It takes no proxy from the environment, which for an http url would
     receive the key (xmlrpc.client, the other transport, uses none), no
@@ -526,14 +557,13 @@ class _OriginSession(requests.Session):
     def __init__(self, url, key):
         super().__init__()
         self.trust_env = False
-        self.auth = _BearerKey(key)
-        self._origin = _origin(url)
+        self.auth = _BearerKey(key, url)
 
     def rebuild_auth(self, prepared_request, response):
         # requests calls it on each redirect with the url it would follow,
         # before it sends anything there. Within the origin, the request
         # keeps the Authorization header it was prepared with.
-        if _origin(prepared_request.url) != self._origin:
+        if not self.auth.goes_to(prepared_request.url):
             raise RedirectError(
                 "A redirect to another origin is refused", response=response
             )
