@@ -191,6 +191,89 @@ def _request_error(profile, error):
     return _request_error_class(stands_for)(profile, stands_for.__name__, code)
 
 
+# The pieces of a form of a secret, for _at_any_depth: each a run of
+# backslashes, maybe empty, and the one character after it, if any.
+_FORM_PIECES = re.compile(r"(\\*)([^\\]?)")
+
+
+def _at_any_depth(form):
+    """A regular expression for ``form``, a text in which an error writes a
+    secret, and for every text that reprs write of it, any number of times:
+    a repr of a text that holds it, a repr of that repr, and so on.
+
+    Each repr doubles every backslash, and puts one more before each quote
+    of its own kind: before each ' when it writes between single quotes,
+    which it does unless its text holds a ' and no " (JSON puts one before
+    each "). So whichever quotes each repr picks, a run of backslashes of
+    ``form`` becomes a run at least as long, and a quote that follows none
+    may come after a run of any length, and the expression matches any
+    such run. So it also matches a few texts no repr writes, such as an
+    odd run before a letter, which hold the secret's characters all the
+    same and are masked too. A repr writes a character that does not print
+    as an escape: for a form that holds one, the expression stands for the
+    form as it is only, and the form's repr is another form (_Secret).
+
+    A form that starts with a run, or with a quote, is matched from the
+    start of a run of the text only ((?<!\\)), so that a search tries each
+    run of the text once, not once from each of its backslashes.
+
+    A run that ends the form matches the whole run of the text there, the
+    backslashes of an escape that follows included, such as a \\n's: they
+    are masked with it. It cannot tell its own from theirs, as the number
+    of each depends on the reprs and their quotes; masking them masks more,
+    never less. When the next occurrence starts right there, its leading
+    run is taken too, and that occurrence is matched from the start of the
+    run, inside the match before, as the search tries every start (_spans).
+    """
+    pattern = "".join(
+        _at_any_depth_piece(run, char) for run, char in _FORM_PIECES.findall(form)
+    )
+    return (r"(?<!\\)" if _starts_with_a_run(form) else "") + pattern
+
+
+def _at_any_depth_piece(run, char):
+    """The regular expression of a piece of a form (_FORM_PIECES) at any
+    depth: a run at least as long as ``run``, or of any length before a
+    quote, then ``char``."""
+    before = r"\\{%d,}" % len(run) if run or char in ("'", '"') else ""
+    return before + re.escape(char)
+
+
+def _starts_with_a_run(form):
+    """Whether ``form`` starts with a run, or with a quote, which a repr can
+    put a run before."""
+    return form.startswith(("\\", "'", '"'))
+
+
+def _spans(pattern, text):
+    """The (start, end) of each match of ``pattern``, a form's expression
+    (_at_any_depth), in ``text``: one from every position a match starts
+    at, those inside an earlier match included, so that occurrences that
+    overlap, as abcab's do in abcabcab, are each found whole. Each search
+    starts one character after the start of the match before: every start
+    of the text is tried once, in order, as one search tries them, and the
+    search stays linear in the text's length."""
+    spans = []
+    match = pattern.search(text)
+    while match is not None:
+        spans.append(match.span())
+        match = pattern.search(text, match.start() + 1)
+    return spans
+
+
+def _merged(spans):
+    """``spans``, the (start, end) of matches sorted by their start, as the
+    stretches they cover: those that overlap merged into one, in order.
+    Two that only touch stay apart."""
+    stretches = []
+    for start, end in spans:
+        if stretches and start < stretches[-1][1]:
+            stretches[-1] = (stretches[-1][0], max(stretches[-1][1], end))
+        else:
+            stretches.append((start, end))
+    return stretches
+
+
 class _Secret:
     """A password or an API key of the store.
 
@@ -201,22 +284,80 @@ class _Secret:
     it, so that no frame keeps it in a variable.
     """
 
-    __slots__ = ("_value",)
+    __slots__ = ("_value", "_patterns")
 
     def __init__(self, value):
         self._value = value
+        if value == "":
+            # An empty value hides nothing.
+            self._patterns = ()
+        else:
+            # The forms in which an error can write the value: as it is, as
+            # Python's ascii writes it, the repr of its UTF-8 bytes, and as
+            # JSON writes it, with or without its escapes of characters
+            # outside ASCII.
+            written = (
+                value,
+                ascii(value)[1:-1],
+                repr(value.encode("utf-8"))[2:-1],
+                json.dumps(value)[1:-1],
+                json.dumps(value, ensure_ascii=False)[1:-1],
+            )
+            # Then each of them inside any number of reprs of the texts that
+            # hold it, a repr of a repr, whichever quotes each repr picks
+            # (_at_any_depth). A repr writes a character that does not print
+            # as an escape, which _at_any_depth's runs do not stand for: a
+            # form that holds one also has its repr as a form, the value's
+            # repr among them. Another encoder over a repr, such as JSON over
+            # a repr's text, is not covered. Each form once.
+            forms = dict.fromkeys(
+                [
+                    *written,
+                    *(repr(form)[1:-1] for form in written if not form.isprintable()),
+                ]
+            )
+            # Each form is searched on its own, from every start of the text
+            # (_spans), and the mask covers whatever any of the matches
+            # covers (hidden). As the branches of one alternation, the first
+            # branch to match takes its text, and no order of the branches is
+            # right for every value: a form tried before a longer one it
+            # starts cuts that one short (the ascii form of a value that ends
+            # in «Ã» (U+00C3), \xc3, starts the repr of its UTF-8 bytes,
+            # \xc3\x83), and the longer, tried first, can take the start of
+            # the next occurrence of the shorter and leave its rest (that
+            # repr, for a value that also starts with the text \x83, takes the
+            # \\x83 that starts the next occurrence ascii writes). A search
+            # that goes on from the end of each match misses an occurrence
+            # that starts inside it: abcab's second in abcabcab, or the
+            # ascii form of \x83\x83 right after the repr of its UTF-8 bytes,
+            # \xc2\x83\xc2\x83\x83\x83, where the last \x83 of the bytes
+            # and the first of the ascii form are an occurrence of that form
+            # too, which overlaps the next. Searched from every start, each
+            # is found whole.
+            self._patterns = tuple(re.compile(_at_any_depth(form)) for form in forms)
 
     def reveal(self):
         """The value, for the call that sends it."""
         return self._value
 
     def hidden(self, text):
-        """``text`` with the value shown as ***."""
-        return text.replace(self._value, "***") if self._value != "" else text
+        """``text`` with the value, in any of its forms, shown as ***: once
+        for each stretch that the forms' matches cover, those that overlap
+        merged into one (_merged)."""
+        stretches = _merged(
+            sorted(span for pattern in self._patterns for span in _spans(pattern, text))
+        )
+        # What shows: the text before the first stretch, between each two,
+        # and after the last.
+        shown_starts = [0, *(end for _, end in stretches)]
+        shown_ends = [*(start for start, _ in stretches), len(text)]
+        return "***".join(
+            text[start:end] for start, end in zip(shown_starts, shown_ends)
+        )
 
     def occurs_in(self, text):
-        """Whether ``text`` holds the value."""
-        return self._value != "" and self._value in text
+        """Whether ``text`` holds the value, in any of its forms."""
+        return any(pattern.search(text) is not None for pattern in self._patterns)
 
     def __repr__(self):
         return f"<{len(self._value)} chars>"
@@ -256,7 +397,8 @@ def _check_api(profile, section, config_path):
 
 def _check_public_fields(profile, section, password, config_path):
     """Raise ConfigError when a value of _PUBLIC_KEYS in ``section``, the
-    profile's, holds ``password``, a _Secret.
+    profile's, holds ``password``, a _Secret, in any of the forms an error
+    is masked in.
 
     A caller may print those values: a password written on the wrong line
     would show through them. The check fails closed: a password short or

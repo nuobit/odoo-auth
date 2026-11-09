@@ -189,7 +189,12 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   error body. It carries the profile (`profile`), Odoo's code for it
   (`code`: the Fault's `faultCode`, or the HTTP status over JSON-2) and
   Odoo's message (`message`), which shows `***` wherever it held the
-  profile's password or API key.
+  profile's password or API key: as it is, or escaped as Python's `repr`
+  or `ascii` writes it, between either quotes, or its UTF-8 bytes, or as
+  JSON writes it, and each of these inside any number of reprs of a text
+  that holds it (a `repr` of a `repr`). Another encoder over a `repr`,
+  such as the JSON of a text a `repr` wrote, is not covered: such a
+  message can show them.
 
 `ServerProxy` raises `ConfigError`, `AuthError` and `RequestError`, as in
 1.x; an Odoo `xmlrpc.client.Fault`, and an answer that is not XML-RPC,
@@ -240,8 +245,9 @@ is refused too if its `password` is not an Odoo API key (40 lowercase
 hexadecimal digits) or its `db` is not one line of printable ASCII without
 spaces: JSON-2 sends both in headers. Neither is shown.
 
-A profile whose `url`, `db`, `user` or `api` holds its `password` is
-refused as well, with a message that names the field and shows neither:
+A profile whose `url`, `db`, `user` or `api` holds its `password`, in any
+of the forms an error is masked in (§ Errors, above), is refused as well,
+with a message that names the field and shows neither:
 a caller may print those values (`Client`'s repr shows the `api`). The
 check fails closed, so a password short or common enough to occur in one
 of them by chance is refused too, and has to change.
