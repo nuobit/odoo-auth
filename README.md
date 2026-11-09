@@ -76,9 +76,10 @@ odoo-xmlrpc-auth --profile customer1 \
   '{"model":"project.task","method":"create","args":[{"name":"Bug: login broken","project_id":42}]}'
 ```
 
-An `api = json2` profile refuses `args`, and a payload cannot hold both
-`ids` and `args`. An error is printed on stderr after `Error:`, and the CLI
-exits with status 1; it is one of the errors of `Client` below, in both
+An `api = json2` profile refuses `args`, a payload cannot hold both `ids`
+and `args`, and without `args` it cannot hold `ids` inside `kwargs`: the
+records go in `ids`. An error is printed on stderr after `Error:`, and the
+CLI exits with status 1; it is one of the errors of `Client` below, in both
 forms of the payload.
 
 ## Library usage

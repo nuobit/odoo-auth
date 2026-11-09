@@ -859,6 +859,32 @@ class CliTest(StubTestCase):
             "(code 4): Access denied for *** on res.partner\n",
         )
 
+    def test_the_args_form_passes_its_kwargs_as_they_are(self):
+        # ids in kwargs is the named form's refusal only: the form before 2.0
+        # gives execute_kw its kwargs as 1.x did.
+        self.xmlrpc_odoo.answers[("res.partner", "read")] = [{"id": 7}]
+        code, _, _ = self.run_cli(
+            "erp-xmlrpc",
+            {"model": "res.partner", "method": "read", "args": [[7]], "kwargs": {"ids": [8]}},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            (self.xmlrpc_odoo.calls[0]["args"], self.xmlrpc_odoo.calls[0]["kwargs"]),
+            ([[7]], {"ids": [8]}),
+        )
+
+    def test_kwargs_holding_ids_are_refused_before_any_call(self):
+        # The records go in the payload's ids, as Client.call takes them.
+        payload = {"model": "res.partner", "method": "read", "kwargs": {"ids": [7]}}
+        for profile in ("erp-xmlrpc", "erp-json2"):
+            with self.subTest(profile=profile):
+                code, out, err = self.run_cli(profile, payload)
+                self.assertEqual(
+                    (code, out, err),
+                    (1, "", "Error: 'ids' goes at the top of the JSON payload, not in 'kwargs'\n"),
+                )
+        self.assertEqual((self.xmlrpc_odoo.logins, self.json2_odoo.requests), (0, []))
+
     def test_the_args_form_is_refused_on_a_json2_profile(self):
         code, out, err = self.run_cli(
             "erp-json2", {"model": "res.partner", "method": "read", "args": [[7]]}

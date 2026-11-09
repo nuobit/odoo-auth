@@ -47,6 +47,10 @@ def _payload(text):
         die("'args' in the JSON payload must be a list")
     if "kwargs" in call and not isinstance(call["kwargs"], dict):
         die("'kwargs' in the JSON payload must be an object")
+    # In the named form, the records are the payload's ids: Client.call
+    # takes no second ids by name.
+    if "args" not in call and "ids" in call.get("kwargs", {}):
+        die("'ids' goes at the top of the JSON payload, not in 'kwargs'")
     return call
 
 
