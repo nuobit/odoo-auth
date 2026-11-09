@@ -896,28 +896,32 @@ class _OriginSession(requests.Session):
             )
 
 
-# The ORM methods whose leading parameters go positionally over XML-RPC, with
-# their names in order: those of records, called with ids, which go first,
-# and those of the model, called without. Odoo calls the database's last
-# override of a method with the names the client sends, and overrides do not
-# all name them as the base does: on 16, res.company.write and website.write
-# take values, not vals. Positionally the name does not matter. Odoo's call_kw
-# also reads create's values back from its first positional argument (16.0's
-# odoo/api.py, _call_kw_model_create; 19.0's odoo/service/model.py, call_kw).
-# The names are the base's, the same in 16.0 to 19.0 (odoo/models.py, and
-# odoo/orm/models.py in 19.0). A call that gives ids to a method of the model,
-# or none to a method of records, goes as it is written, for Odoo to refuse.
+# The ORM methods whose leading parameters go positionally over XML-RPC, by
+# the names 19.0's base gives them (odoo/orm/models.py), in order: those of
+# records, called with ids, which go first, and those of the model, called
+# without. Odoo calls the database's last override of a method with the names
+# the client sends, and the names differ: older bases give some others
+# (search's and search_count's domain is args up to 15.0, name_search's up to
+# 18.0; default_get's fields is fields_list up to 18.0), and overrides rename
+# them (on 16, res.company.write and website.write take values, not vals).
+# Positionally the name does not matter. Odoo's call_kw also reads create's
+# values back from its first positional argument (16.0's odoo/api.py,
+# _call_kw_model_create; 19.0's odoo/service/model.py, call_kw). A call that
+# gives ids to a method of the model, or none to a method of records, goes as
+# it is written, for Odoo to refuse.
 _LEADING_ON_RECORDS = {"write": ("vals",), "read": ("fields",)}
 _LEADING_ON_THE_MODEL = {
     "create": ("vals_list",),
     "search": ("domain",),
     "search_count": ("domain",),
     "search_read": ("domain", "fields"),
+    "name_search": ("name", "domain"),
+    "default_get": ("fields",),
 }
 # What a leading parameter that is not given stands for, when a later one is:
-# only search_read's domain comes before another, and Odoo reads an empty one
-# as no filter.
-_LEADING_LEFT_OUT = {"domain": ()}
+# search_read's domain, empty, which Odoo reads as no filter, and
+# name_search's name, empty, the base's default in every version.
+_LEADING_LEFT_OUT = {"domain": (), "name": ""}
 
 
 class _XmlRpc:
@@ -1135,11 +1139,13 @@ class Client:
         ``ids`` is None for a method of the model (``search_read``,
         ``search_count``, ``create``), or the list of the ids of the records
         a method of records works on (``read``, ``write``). ``named`` are the
-        method's own parameters, by their base names, ``context`` among them:
-        ``create`` takes ``vals_list``, a list of values, and answers the new
-        ids. Over XML-RPC the leading ones of six ORM methods go positionally
-        (_LEADING_ON_RECORDS, _LEADING_ON_THE_MODEL). A call it cannot send
-        raises ArgumentError before anything is sent.
+        method's own parameters, by the names of Odoo 19's base, ``context``
+        among them: ``create`` takes ``vals_list``, a list of values (one dict
+        up to Odoo 11), and answers the new ids. Over XML-RPC the leading ones
+        of eight ORM methods go positionally, so that the call works where an
+        older base or an override names them otherwise (_LEADING_ON_RECORDS,
+        _LEADING_ON_THE_MODEL). A call it cannot send raises ArgumentError
+        before anything is sent.
         """
         if ids is not None and not isinstance(ids, (list, tuple)):
             raise _error_class(ArgumentError, TypeError)(
