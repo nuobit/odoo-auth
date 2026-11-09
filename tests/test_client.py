@@ -18,7 +18,10 @@ Run from the repository root:
 
 import contextlib
 import io
+import itertools
+import json
 import sys
+import time
 import unittest
 import xmlrpc.client
 from unittest import mock
@@ -31,6 +34,7 @@ from odoo_xmlrpc_auth.client import (
     RequestError,
     ServerProxy,
     _read_config,
+    _Secret,
 )
 from support import KEY, PASSWORD, StoreMixin
 
@@ -255,6 +259,289 @@ class UrlTest(StoreTestCase):
         )
 
 
+def _quote_sequences(longest):
+    """Every sequence of 1 to ``longest`` quotes, each ' or ": the quote
+    added before a text at each repr of it, which makes repr write that
+    text between double quotes where it can (a '), or between single
+    quotes (a ")."""
+    return [
+        quotes
+        for length in range(1, longest + 1)
+        for quotes in itertools.product("'\"", repeat=length)
+    ]
+
+
+class SecretTest(unittest.TestCase):
+    """The mask of a password covers every form Python's repr and ascii
+    write it in, inside a longer text: between the double quotes or the
+    single quotes of that text, and as its UTF-8 bytes; and each of them,
+    and JSON's, inside any number of reprs of a text that holds it."""
+
+    PASSWORD = "odoo_dummy'pass\\word_é_test"
+    # The characters repr escapes, each in a password of its own.
+    SPECIALS = {
+        "a single quote": "'",
+        "a double quote": '"',
+        "a backslash": "\\",
+        "a newline": "\n",
+        "a tab": "\t",
+        "a control character": "\x07",
+        "a line separator": " ",
+    }
+
+    def assertMaskedOnce(self, masked):
+        """``masked`` shows *** once, where the password was, and keeps the
+        words around it."""
+        self.assertNotIn("dummy", masked)
+        self.assertNotIn("word", masked)
+        self.assertEqual(masked.count("***"), 1)
+        self.assertIn("left", masked)
+        self.assertIn("right", masked)
+
+    def test_a_repr_of_a_repr_of_the_password_is_masked_at_any_depth(self):
+        # Each repr doubles the backslashes of the one inside it, and escapes
+        # the quotes of its own kind.
+        for case, special in self.SPECIALS.items():
+            password = f"dummy{special}word"
+            secret = _Secret(password)
+            for quotes in _quote_sequences(4):
+                text = f"left {password} right"
+                for quote in quotes:
+                    text = repr(quote + text)
+                with self.subTest(case=case, quotes="".join(quotes)):
+                    self.assertMaskedOnce(secret.hidden(text))
+
+    def test_reprs_of_each_escaped_form_of_the_password_are_masked(self):
+        encoders = {
+            "ascii": ascii,
+            "UTF-8 bytes": lambda text: repr(text.encode("utf-8")),
+            "JSON": json.dumps,
+            "JSON outside ASCII": lambda text: json.dumps(text, ensure_ascii=False),
+        }
+        for case, special in self.SPECIALS.items():
+            password = f"dummy{special}word"
+            secret = _Secret(password)
+            for form, encode in encoders.items():
+                for quotes in _quote_sequences(3):
+                    text = encode(f"left {password} right")
+                    for quote in quotes:
+                        text = repr(quote + text)
+                    with self.subTest(case=case, form=form, quotes="".join(quotes)):
+                        self.assertMaskedOnce(secret.hidden(text))
+
+    def test_each_form_masks_a_text_that_no_other_form_masks(self):
+        # Each text holds the password in the form its case names only:
+        # no other form of the password matches it.
+        cases = {
+            "as it is": ("dummy\x07word", lambda text: text, "left *** right"),
+            "ascii": ("dummy_é_word", ascii, "'left *** right'"),
+            "the repr of its UTF-8 bytes": (
+                "dummy_é_word",
+                lambda text: repr(text.encode("utf-8")),
+                "b'left *** right'",
+            ),
+            "JSON": ("dummy_é_word", json.dumps, '"left *** right"'),
+            "JSON without its escapes": (
+                "dummy_é\x01word",
+                lambda text: json.dumps(text, ensure_ascii=False),
+                '"left *** right"',
+            ),
+            "its repr": ("dummy_é\x01word", repr, "'left *** right'"),
+            "the repr of JSON without its escapes": (
+                "dummy\x07 é_word",
+                lambda text: repr(json.dumps(text, ensure_ascii=False)),
+                "'\"left *** right\"'",
+            ),
+        }
+        for case, (password, encode, masked) in cases.items():
+            with self.subTest(case=case):
+                text = encode(f"left {password} right")
+                self.assertEqual(_Secret(password).hidden(text), masked)
+
+    def test_no_form_is_cut_short_by_a_shorter_one_it_starts_with(self):
+        # The form ascii writes of a password that ends in «Ã» (U+00C3),
+        # \xc3, starts the repr of its UTF-8 bytes, \xc3\x83: matched in its
+        # place, the shorter left the longer's last byte unmasked. «Â» (U+00C2),
+        # whose UTF-8 is \xc3\x82, is next to it: its ascii form, \xc2,
+        # starts none of its other forms. Each form as it is, twice in a
+        # row, and inside a repr.
+        cases = {
+            "Ã": {
+                "as it is, and as JSON without its escapes": "odoo_dummy_Ã",
+                "as ascii writes it": "odoo_dummy_\\xc3",
+                "as the repr of its UTF-8 bytes": "odoo_dummy_\\xc3\\x83",
+                "as JSON": "odoo_dummy_\\u00c3",
+            },
+            "Â": {
+                "as it is, and as JSON without its escapes": "odoo_dummy_Â",
+                "as ascii writes it": "odoo_dummy_\\xc2",
+                "as the repr of its UTF-8 bytes": "odoo_dummy_\\xc3\\x82",
+                "as JSON": "odoo_dummy_\\u00c2",
+            },
+        }
+        for last, forms in cases.items():
+            secret = _Secret(f"odoo_dummy_{last}")
+            for case, form in forms.items():
+                with self.subTest(last=last, case=case):
+                    self.assertEqual(secret.hidden(f"left {form} right"), "left *** right")
+                    self.assertEqual(
+                        secret.hidden(f"left {form}{form} right"), "left ****** right"
+                    )
+                    self.assertEqual(
+                        secret.hidden(repr(f"left {form} right")), "'left *** right'"
+                    )
+
+    def test_an_occurrence_whose_start_another_form_takes_is_masked_whole(self):
+        # A password that starts with a backslash, then x83, and ends in «Ã»:
+        # ascii writes each occurrence as \\x83_dummy_pw_\xc3, and the repr of
+        # its UTF-8 bytes, \\x83_dummy_pw_\xc3\x83, matches each one with the
+        # \\x83 that starts the next. Tried first, in one alternation of the
+        # forms, the longer form took that start, and the rest of the next
+        # occurrence showed. Each match of the longer form overlaps the next
+        # occurrence: the occurrences show as one ***.
+        password = "\\x83_dummy_pw_Ã"
+        secret = _Secret(password)
+        masked = {1: "'***'", 2: "'***'", 3: "'***'"}
+        for times, expected in masked.items():
+            with self.subTest(times=times):
+                self.assertEqual(secret.hidden(ascii(password * times)), expected)
+
+    def test_occurrences_that_overlap_are_each_masked_whole(self):
+        # A search that went on from the end of each match missed an
+        # occurrence that starts inside it, and the rest of it showed. Each
+        # password ends as it starts, as abcab, aXa and abab do.
+        texts = {
+            "ab_dummy_ab": "ab_dummy_ab_dummy_ab",
+            "a_dummy_a": "a_dummy_a_dummy_a",
+            "dummy_dummy_": "dummy_dummy_dummy_",
+        }
+        for password, text in texts.items():
+            secret = _Secret(password)
+            with self.subTest(password=password):
+                self.assertEqual(secret.hidden(f"left {text} right"), "left *** right")
+                self.assertEqual(secret.hidden(repr(f"left {text} right")), "'left *** right'")
+
+    def test_an_occurrence_another_forms_occurrence_runs_into_is_masked_whole(self):
+        # A password of U+0083 and _dummy_, twice, written as the repr of its
+        # UTF-8 bytes, \xc2\x83_dummy_\xc2\x83_dummy_, then as its repr,
+        # \x83_dummy_\x83_dummy_: the first's last \x83_dummy_ and the
+        # second's first make an occurrence of the second's form too, which
+        # overlaps the second itself. Searched from the end of each match,
+        # that form found the first and missed the second, whose last
+        # \x83_dummy_ showed.
+        secret = _Secret("\x83_dummy_\x83_dummy_")
+        text = "left \\xc2\\x83_dummy_\\xc2\\x83_dummy_\\x83_dummy_\\x83_dummy_ right"
+        self.assertEqual(secret.hidden(text), "left *** right")
+        self.assertEqual(secret.hidden(repr(text)), "'left *** right'")
+
+    def test_reprs_of_json_without_its_escapes_are_masked(self):
+        # Such JSON writes a control character as JSON does, and leaves
+        # raw one outside ASCII that does not print, which a repr writes
+        # as an escape: only the repr of that form stands for both.
+        passwords = (
+            "dummy\x07mid\xa0word",
+            "dummy\x01mid\x7fword",
+            "dummy\x07mid\xadword",
+            "dummy\x07mid\x85word",
+            "dummy\x07 é_word",
+            "dummy\x08\xa0é_word",
+        )
+        for password in passwords:
+            secret = _Secret(password)
+            for quotes in _quote_sequences(3):
+                text = json.dumps(f"left {password} right", ensure_ascii=False)
+                for quote in quotes:
+                    text = repr(quote + text)
+                with self.subTest(password=ascii(password), quotes="".join(quotes)):
+                    self.assertMaskedOnce(secret.hidden(text))
+
+    def test_a_password_right_after_a_backslash_is_masked(self):
+        # A path before it can end with one, such as C:\. Only a form that
+        # starts with a backslash or a quote is matched from a run's start.
+        secret = _Secret("dummy'word")
+        for text in ("left C:\\dummy'word right", repr("left C:\\dummy'word right")):
+            with self.subTest(text=text):
+                self.assertMaskedOnce(secret.hidden(text))
+
+    def test_a_password_bordered_by_backslashes_is_masked_at_each_occurrence(self):
+        # A run that ends a form takes the whole run after it, with the
+        # backslashes the next occurrence starts with, before a quote too.
+        for password in ("\\dummy\\word\\", "'dummy_word\\", '"dummy_word\\'):
+            secret = _Secret(password)
+            for quotes in [()] + _quote_sequences(3):
+                text = f"left {password}{password}{password} right"
+                for quote in quotes:
+                    text = repr(quote + text)
+                with self.subTest(password=password, quotes="".join(quotes)):
+                    self.assertMaskedOnce(secret.hidden(text))
+
+    def test_right_after_an_occurrence_only_a_whole_one_is_masked(self):
+        # Right after an occurrence that ends with no run, the password's
+        # text without its leading backslash is not the password.
+        self.assertEqual(
+            _Secret("\\dummy_word").hidden("\\dummy_worddummy_word"), "***dummy_word"
+        )
+        # Occurrences that start with a letter, which no run takes, are each
+        # masked on their own, also right after a trailing run: they touch,
+        # without overlapping.
+        self.assertEqual(_Secret("dummy\\word\\").hidden("dummy\\word\\" * 2), "******")
+
+    def test_a_trailing_run_masks_the_backslash_of_an_escape_after_it(self):
+        # It cannot tell its own backslashes from the escape's, whose number
+        # each repr changes: it masks more, never less.
+        secret = _Secret("dummy_word\\")
+        self.assertEqual(secret.hidden(repr("dummy_word\\\n")), "'***n'")
+
+    def test_a_long_run_of_backslashes_is_searched_in_linear_time(self):
+        # A message of the server's can hold any text. Searched from each of
+        # its backslashes, a run of 200,000 takes about half a minute on the
+        # laptop the suite was written on; from its start only, milliseconds.
+        secret = _Secret("\\dummy")
+        text = "\\" * 200_000 + "x"
+        start = time.perf_counter()
+        self.assertEqual(secret.hidden(text), text)
+        self.assertLess(time.perf_counter() - start, 1)
+
+    def test_many_overlapping_occurrences_are_searched_in_linear_time(self):
+        # Occurrences that overlap are each found whole by a search that
+        # starts again one character after the start of each match (_spans).
+        # Searched again on a copy of the text's rest after each match,
+        # 200,000 occurrences that each overlap the next take about five
+        # seconds on the laptop the suite was written on; searched in the text
+        # itself, a tenth of a second.
+        secret = _Secret("ab_dummy_ab")
+        text = "ab_dummy_" * 200_000 + "ab"
+        start = time.perf_counter()
+        self.assertEqual(secret.hidden(text), "***")
+        self.assertLess(time.perf_counter() - start, 1)
+
+    def test_each_form_repr_and_ascii_write_the_password_in_is_masked(self):
+        secret = _Secret(self.PASSWORD)
+        texts = {
+            "repr, with a double quote": (
+                repr('he said "no" to ' + self.PASSWORD),
+                """'he said "no" to ***'""",
+            ),
+            "repr, without": (repr("he said no to " + self.PASSWORD), '"he said no to ***"'),
+            "ascii, with a double quote": (
+                ascii('he said "no" to ' + self.PASSWORD),
+                """'he said "no" to ***'""",
+            ),
+            "ascii, without": (ascii("he said no to " + self.PASSWORD), '"he said no to ***"'),
+            "bytes, with a double quote": (
+                repr(b'he said "no" to ' + self.PASSWORD.encode("utf-8")),
+                """b'he said "no" to ***'""",
+            ),
+            "bytes, without": (
+                repr(b"he said no to " + self.PASSWORD.encode("utf-8")),
+                'b"he said no to ***"',
+            ),
+        }
+        for case, (text, masked) in texts.items():
+            with self.subTest(case=case):
+                self.assertEqual(secret.hidden(text), masked)
+
+
 class ApiLineTest(StoreTestCase):
     """Every profile says which API its calls go through, with the line
     `api = xmlrpc` or `api = json2`; there is no default."""
@@ -402,6 +689,20 @@ class PublicFieldTest(StoreTestCase):
         self.assertIn("The url of profile 'erp', in ", str(error))
         self.assertIn("holds its password", str(error))
         self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_a_value_holding_the_password_escaped_is_refused(self):
+        password = 'odoo_dummy"pass\\word_test'
+        # As JSON writes it: \" and \\.
+        self.make_store_with(
+            "https://odoo.example.com",
+            'odoo_dummy\\"pass\\\\word_test',
+            "odoo_user_test",
+            password,
+            "xmlrpc",
+        )
+        error = self.raised(ConfigError, lambda: ServerProxy(profile="erp"))
+        self.assertIn("The db of profile 'erp', in ", str(error))
+        self.common.authenticate.assert_not_called()
 
     def test_a_url_holding_the_api_key_is_refused_unshown(self):
         self.make_store_with(

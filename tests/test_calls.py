@@ -153,6 +153,39 @@ class XmlRpcClientTest(StubTestCase):
         )
         self.assertNeverShows(caught.exception, PASSWORD)
 
+    def test_a_fault_quoting_the_password_escaped_hides_it_too(self):
+        # Odoo writes a value in an error as Python's repr does, and JSON as
+        # json.dumps does: such a password differs in each.
+        password = 'odoo_dummy"pass\\word_é_test'
+        self.odoo.password = password
+        self.odoo.answers[("res.partner", "write")] = xmlrpc.client.Fault(
+            2,
+            "Wrong values: "
+            + ", ".join(
+                (
+                    repr(password),
+                    ascii(password),
+                    json.dumps(password),
+                    json.dumps(password, ensure_ascii=False),
+                )
+            ),
+        )
+        client = self.make_client(self.odoo.url, "xmlrpc", password, "escaped")
+        error = self.raised(OdooError, lambda: client.call("res.partner", "write", [7], vals={}))
+        self.assertEqual(error.message, "Wrong values: '***', '***', \"***\", \"***\"")
+
+    def test_a_longer_form_of_the_password_is_masked_whole(self):
+        # The password as it is starts its repr form, one backslash longer:
+        # whichever form matches, its trailing run takes the whole run.
+        password = "odoo_dummy_pass_test\\"
+        self.odoo.password = password
+        self.odoo.answers[("res.partner", "write")] = xmlrpc.client.Fault(
+            2, f"Wrong value: {password!r}"
+        )
+        client = self.make_client(self.odoo.url, "xmlrpc", password, "backslash")
+        error = self.raised(OdooError, lambda: client.call("res.partner", "write", [7], vals={}))
+        self.assertEqual(error.message, "Wrong value: '***'")
+
     def test_a_fault_at_the_login_is_an_odoo_error_that_hides_the_password(self):
         # Odoo's answer to a login for a db it does not hold, as after a DNS
         # switch; this one also quotes the password, which must not show.
