@@ -20,6 +20,7 @@ from unittest import mock
 
 import requests
 
+import odoo_xmlrpc_auth.client
 from odoo_xmlrpc_auth import cli
 from odoo_xmlrpc_auth.client import (
     AuthError,
@@ -833,6 +834,30 @@ class CliTest(StubTestCase):
             [{"model": "res.partner", "method": "read", "args": [[7]], "kwargs": {"fields": ["id"]}}],
         )
         self.assertEqual(self.xmlrpc_odoo.logins, 1)
+
+    def test_the_args_form_goes_through_the_client_and_reads_the_profile_once(self):
+        self.xmlrpc_odoo.answers[("res.partner", "read")] = [{"id": 7}]
+        with mock.patch.object(
+            odoo_xmlrpc_auth.client, "_load_config", wraps=odoo_xmlrpc_auth.client._load_config
+        ) as load:
+            code, _, _ = self.run_cli(
+                "erp-xmlrpc", {"model": "res.partner", "method": "read", "args": [[7]]}
+            )
+        self.assertEqual((code, load.call_count), (0, 1))
+
+    def test_an_odoo_error_on_the_args_form_hides_the_password(self):
+        self.xmlrpc_odoo.answers[("res.partner", "unlink")] = xmlrpc.client.Fault(
+            4, f"Access denied for {PASSWORD} on res.partner"
+        )
+        code, out, err = self.run_cli(
+            "erp-xmlrpc", {"model": "res.partner", "method": "unlink", "args": [[7]]}
+        )
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(
+            err,
+            "Error: Odoo answered a call of profile 'erp-xmlrpc' with an error "
+            "(code 4): Access denied for *** on res.partner\n",
+        )
 
     def test_the_args_form_is_refused_on_a_json2_profile(self):
         code, out, err = self.run_cli(

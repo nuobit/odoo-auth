@@ -911,6 +911,12 @@ class _XmlRpc:
         kwargs = {
             name: value for name, value in named.items() if name not in positional
         }
+        return self.execute_kw(model, method, args, kwargs)
+
+    def execute_kw(self, model, method, args, kwargs):
+        """execute_kw on /xmlrpc/2/object with ``args`` and ``kwargs`` as
+        they are, after a login at the first call: the call of ``call``, and
+        the CLI's form before 2.0."""
         failure = None
         try:
             # The login's Fault too, such as a db the server does not hold,
