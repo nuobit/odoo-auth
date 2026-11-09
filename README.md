@@ -231,6 +231,17 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   that holds it (a `repr` of a `repr`). Another encoder over a `repr`,
   such as the JSON of a text a `repr` wrote, is not covered: such a
   message can show them.
+- `ArgumentError`: a call `Client` cannot send, refused before anything is
+  sent, the login included: a value its API cannot carry (over XML-RPC, a
+  type `xmlrpc.client` cannot marshal, such as a set or a date, or an int
+  beyond 32 bits; over JSON-2, a value JSON cannot hold, NaN among them;
+  over either, a value nested deeper than the encoder follows). It carries
+  the profile (`profile`) and the encoder's own text (`reason`), masked as
+  above, and is also an instance of the `TypeError`, `ValueError`,
+  `OverflowError` or `RecursionError` it stands for. Over XML-RPC the call's
+  own values are marshalled once without the credentials before the call:
+  marshalled with them, a value it cannot write would raise from frames
+  that hold the password.
 
 `ServerProxy` raises `ConfigError`, `AuthError` and `RequestError`, as in
 1.x; an Odoo `xmlrpc.client.Fault`, and an answer that is not XML-RPC,
