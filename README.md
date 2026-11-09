@@ -78,7 +78,8 @@ odoo-xmlrpc-auth --profile customer1 \
 
 An `api = json2` profile refuses `args`, and a payload cannot hold both
 `ids` and `args`. An error is printed on stderr after `Error:`, and the CLI
-exits with status 1.
+exits with status 1; it is one of the errors of `Client` below, in both
+forms of the payload.
 
 ## Library usage
 
