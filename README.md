@@ -180,8 +180,9 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   `except xmlrpc.client.ProtocolError`, `except requests.ConnectionError`
   and the like keep catching it; as a `ProtocolError` it keeps its
   `errcode`, while its `url` and `errmsg` are empty.
-- `OdooError`: Odoo answers the call with an error, an XML-RPC `Fault` or a
-  JSON-2 error body. It carries the profile (`profile`), Odoo's code for it
+- `OdooError`: Odoo answers the call with an error, an XML-RPC `Fault`
+  (the login's too, such as Odoo's for a `db` it does not hold) or a JSON-2
+  error body. It carries the profile (`profile`), Odoo's code for it
   (`code`: the Fault's `faultCode`, or the HTTP status over JSON-2) and
   Odoo's message (`message`), which shows `***` wherever it held the
   profile's password or API key.

@@ -149,6 +149,19 @@ class XmlRpcClientTest(StubTestCase):
         )
         self.assertNeverShows(caught.exception, PASSWORD)
 
+    def test_a_fault_at_the_login_is_an_odoo_error_that_hides_the_password(self):
+        # Odoo's answer to a login for a db it does not hold, as after a DNS
+        # switch; this one also quotes the password, which must not show.
+        self.odoo.login_fault = xmlrpc.client.Fault(
+            1, f'database "{DB}" does not exist, login with {PASSWORD}'
+        )
+        error = self.raised(OdooError, lambda: self.client.call("res.partner", "read", [7]))
+        self.assertEqual(error.code, 1)
+        self.assertEqual(error.message, f'database "{DB}" does not exist, login with ***')
+        self.assertNeverShows(error, PASSWORD)
+        self.assertNoFrameHolds(error, PASSWORD)
+        self.assertEqual(self.odoo.calls, [])
+
     def test_an_empty_password_hides_nothing_in_an_odoo_error(self):
         # Odoo refuses an empty password at the login; a server that takes it
         # must not get *** between every two characters of its message.
