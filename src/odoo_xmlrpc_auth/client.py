@@ -68,6 +68,17 @@ _TRANSPORT_ERRORS = (
     xmlrpc.client.ProtocolError,
     _InvalidAnswer,
 )
+# What xmlrpc.client's Marshaller raises for a value of a call it cannot
+# write (read in Python 3.11's xmlrpc/client.py): a type it does not know, a
+# subclass of one it knows, a dict key that is not a string, a list or a dict
+# that holds itself (TypeError); an int beyond 32 bits (OverflowError); a
+# value nested deeper than its recursion follows (RecursionError).
+_MARSHAL_ERRORS = (TypeError, OverflowError, RecursionError)
+# What json.dumps raises for a value JSON cannot hold: a type it does not
+# know, a dict key it cannot write (TypeError); NaN or an infinity, a value
+# that holds itself (ValueError); a value nested deeper than it follows
+# (RecursionError).
+_JSON_ERRORS = (TypeError, ValueError, RecursionError)
 # What _loaded returns for a body that is not JSON: None is JSON's null.
 _NOT_JSON = object()
 
@@ -152,6 +163,29 @@ class OdooError(Exception):
         )
 
 
+class ArgumentError(Exception):
+    """Raised by Client.call for a call it cannot send, before anything is
+    sent: a value its API cannot carry (over XML-RPC, a type xmlrpc.client
+    cannot marshal or an int beyond 32 bits; over JSON-2, a value JSON
+    cannot hold, NaN among them; over either, one nested deeper than the
+    encoder follows).
+
+    It carries the profile (``profile``) and the reason (``reason``), the
+    encoder's own text, which shows *** wherever it held the profile's
+    password or API key. Its class is also a subclass of the error it stands
+    for, a TypeError, a ValueError, an OverflowError or a RecursionError, so
+    ``except TypeError`` and the like keep catching it.
+    """
+
+    def __init__(self, profile, reason):
+        self.profile = profile
+        self.reason = reason
+        super().__init__(str(self))
+
+    def __str__(self):
+        return f"A call of profile {self.profile!r} cannot be sent: {self.reason}"
+
+
 class RedirectError(requests.RequestException):
     """Raised when an answer over JSON-2 redirects a call to another origin
     than the profile's url (another scheme, host or port), or to a location
@@ -190,6 +224,14 @@ def _request_error(profile, error):
         else type(error)
     )
     return _error_class(RequestError, stands_for)(profile, stands_for.__name__, code)
+
+
+def _argument_error(profile, error, causes, secret):
+    """The ArgumentError raised instead of ``error``, one of ``causes``, the
+    errors an encoder raises: it stands for the first of them that ``error``
+    is, and gives ``error``'s text with ``secret``, a _Secret, hidden."""
+    stands_for = next(cause for cause in causes if isinstance(error, cause))
+    return _error_class(ArgumentError, stands_for)(profile, secret.hidden(str(error)))
 
 
 # The pieces of a form of a secret, for _at_any_depth: each a run of
@@ -918,6 +960,7 @@ class _XmlRpc:
         """execute_kw on /xmlrpc/2/object with ``args`` and ``kwargs`` as
         they are, after a login at the first call: the call of ``call``, and
         the CLI's form before 2.0."""
+        self._check_marshallable(model, method, args, kwargs)
         failure = None
         try:
             # The login's Fault too, such as a db the server does not hold,
@@ -946,6 +989,25 @@ class _XmlRpc:
             raise failure
         return result
 
+    def _check_marshallable(self, model, method, args, kwargs):
+        """Raise ArgumentError, before anything is sent, for a value of the
+        call xmlrpc.client cannot marshal.
+
+        The call is marshalled once without the credentials. Marshalled with
+        them, a value it cannot write would raise from frames that hold the
+        password; marshalled here first, the call with them cannot fail on
+        it, and the error raised here holds no password in any frame.
+        """
+        failure = None
+        try:
+            xmlrpc.client.dumps((model, method, args, kwargs), allow_none=True)
+        except _MARSHAL_ERRORS as error:
+            failure = _argument_error(
+                self._profile, error, _MARSHAL_ERRORS, self._config["password"]
+            )
+        if failure is not None:
+            raise failure
+
     def close(self):
         self._object("close")()
 
@@ -965,10 +1027,16 @@ class _Json2:
     def call(self, model, method, ids, named):
         # The body holds named arguments only: the records as ids, then the
         # method's own parameters (Odoo 19, addons/rpc/controllers/json2.py).
-        # A value JSON cannot hold raises here, before anything is sent.
-        body = json.dumps(
-            named if ids is None else {"ids": ids, **named}, allow_nan=False
-        )
+        # A value JSON cannot hold is refused here, before anything is sent.
+        failure = None
+        try:
+            body = json.dumps(
+                named if ids is None else {"ids": ids, **named}, allow_nan=False
+            )
+        except _JSON_ERRORS as error:
+            failure = _argument_error(self._profile, error, _JSON_ERRORS, self._key)
+        if failure is not None:
+            raise failure
         path = "/".join(urllib.parse.quote(name, safe="") for name in (model, method))
         response = _send(
             self._profile,

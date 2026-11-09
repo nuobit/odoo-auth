@@ -9,6 +9,7 @@ Run from the repository root:
 """
 
 import contextlib
+import datetime
 import gzip
 import io
 import json
@@ -706,6 +707,90 @@ class Json2ClientTest(StubTestCase):
         with self.assertRaisesRegex(TypeError, "ids must be None"):
             self.client.call("res.partner", "read", 7)
         self.assertEqual(self.odoo.requests, [])
+
+
+def _nested(depth):
+    """A list nested ``depth`` deep, deeper than an encoder's recursion."""
+    value = []
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+class ArgumentTest(StubTestCase):
+    """A value the profile's API cannot carry is refused before anything is
+    sent, the login included: an ArgumentError, also an instance of the
+    error the encoder raised, with the encoder's text, and no frame of it
+    holds the password or the key."""
+
+    def assertRefusedUnsent(self, client, password, error_class, value):
+        error = self.raised(
+            error_class, lambda: client.call("res.partner", "write", [7], vals={"x": value})
+        )
+        self.assertNoFrameHolds(error, password)
+        self.assertNeverShows(error, password)
+        self.assertIsInstance(error, odoo_xmlrpc_auth.client.ArgumentError)
+        self.assertTrue(str(error).startswith("A call of profile 'erp' cannot be sent: "))
+
+    def test_a_value_xmlrpc_cannot_marshal_is_refused_unsent(self):
+        odoo = self.start(XmlRpcOdoo())
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        holds_itself = []
+        holds_itself.append(holds_itself)
+        values = {
+            "a set": (TypeError, {1, 2}),
+            "a date": (TypeError, datetime.date(2026, 1, 1)),
+            "a dict keyed by an int": (TypeError, {1: "one"}),
+            "a list that holds itself": (TypeError, holds_itself),
+            "an int beyond 32 bits": (OverflowError, 2**40),
+            "a list nested 2000 deep": (RecursionError, _nested(2000)),
+        }
+        for case, (error_class, value) in values.items():
+            with self.subTest(case=case):
+                self.assertRefusedUnsent(client, PASSWORD, error_class, value)
+        self.assertEqual((odoo.logins, odoo.calls), (0, []))
+
+    def test_the_marshallers_text_is_the_reason(self):
+        odoo = self.start(XmlRpcOdoo())
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        error = self.raised(
+            OverflowError, lambda: client.call("res.partner", "read", [2**40])
+        )
+        self.assertEqual(
+            str(error), "A call of profile 'erp' cannot be sent: int exceeds XML-RPC limits"
+        )
+        self.assertEqual(error.reason, "int exceeds XML-RPC limits")
+
+    def test_a_value_json_cannot_hold_is_refused_unsent(self):
+        odoo = self.start(Json2Odoo())
+        client = self.make_client(odoo.url, "json2", KEY)
+        holds_itself = {}
+        holds_itself["self"] = holds_itself
+        values = {
+            "a set": (TypeError, {1, 2}),
+            "NaN": (ValueError, float("nan")),
+            "an infinity": (ValueError, float("inf")),
+            "a dict that holds itself": (ValueError, holds_itself),
+            # Deeper than json's C encoder follows on every version: from
+            # Python 3.12 it counts its own recursion, not Python's.
+            "a list nested 100000 deep": (RecursionError, _nested(100_000)),
+        }
+        for case, (error_class, value) in values.items():
+            with self.subTest(case=case):
+                self.assertRefusedUnsent(client, KEY, error_class, value)
+        self.assertEqual(odoo.requests, [])
+
+    def test_the_reason_hides_the_key(self):
+        # json's text names the type of a value it cannot hold, and a type's
+        # name can be anything: here, the key.
+        odoo = self.start(Json2Odoo())
+        client = self.make_client(odoo.url, "json2", KEY)
+        value = type(KEY, (), {})()
+        error = self.raised(
+            TypeError, lambda: client.call("res.partner", "write", [7], vals={"x": value})
+        )
+        self.assertEqual(error.reason, "Object of type *** is not JSON serializable")
+        self.assertNeverShows(error, KEY)
 
 
 class FramesTest(StubTestCase):

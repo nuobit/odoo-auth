@@ -97,11 +97,11 @@ class StoreMixin:
 def _shown(local):
     """What a printer of a frame's locals shows of ``local``: its repr, or
     nothing when the repr fails, as it does for an object whose __init__
-    raised before setting what its repr reads (pytest prints a placeholder
-    instead)."""
+    raised before setting what its repr reads, or a value nested deeper than
+    repr follows (pytest prints a placeholder instead)."""
     try:
         return repr(local)
-    except AttributeError:
+    except (AttributeError, RecursionError):
         return ""
 
 
