@@ -20,6 +20,7 @@ import contextlib
 import io
 import itertools
 import json
+import os
 import sys
 import time
 import unittest
@@ -83,6 +84,25 @@ class ServerProxyTest(StoreTestCase):
             ServerProxy(profile="erp")
         self.assertIsNone(caught.exception.__cause__)
         self.assertIsNone(caught.exception.__context__)
+
+    def test_a_store_that_cannot_be_read_says_why_and_chains_no_error(self):
+        # A folder in the file's place: open() raises IsADirectoryError.
+        home = self.use_home()
+        folder = os.path.join(home, ".config", "odoo-xmlrpc-auth")
+        os.makedirs(os.path.join(folder, "erp.conf"))
+        os.chmod(folder, 0o700)
+        for open_profile in (Client, ServerProxy):
+            with self.subTest(open_profile=open_profile.__name__):
+                with self.assertRaises(ConfigError) as caught:
+                    open_profile(profile="erp")
+                self.assertTrue(
+                    str(caught.exception).endswith(
+                        "erp.conf cannot be read (Is a directory): it must be a "
+                        "file this user can read."
+                    )
+                )
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertIsNone(caught.exception.__context__)
 
     def test_a_store_without_a_section_never_shows_its_lines(self):
         self.make_store("password = odoo_dummy_password_test\n")

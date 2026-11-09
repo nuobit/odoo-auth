@@ -180,7 +180,8 @@ either, and no local of their frames shows it; but a frame that holds the
 `ServerProxy`, as each of its calls' frames does, shows it one attribute
 down, in `_password`, which stays readable as in 1.x. The errors:
 
-- `ConfigError`: the profile is missing, malformed or accessible by
+- `ConfigError`: the profile is missing, cannot be read (a folder in its
+  place, a file this user may not read), is malformed or accessible by
   others, has no valid `api` line, or holds a value its API cannot send
   (below).
 - `AuthError`: Odoo refuses the profile's credentials, at the XML-RPC login
