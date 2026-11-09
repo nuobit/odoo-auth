@@ -847,6 +847,30 @@ class _OriginSession(requests.Session):
             )
 
 
+# The ORM methods whose leading parameters go positionally over XML-RPC, with
+# their names in order: those of records, called with ids, which go first,
+# and those of the model, called without. Odoo calls the database's last
+# override of a method with the names the client sends, and overrides do not
+# all name them as the base does: on 16, res.company.write and website.write
+# take values, not vals. Positionally the name does not matter. Odoo's call_kw
+# also reads create's values back from its first positional argument (16.0's
+# odoo/api.py, _call_kw_model_create; 19.0's odoo/service/model.py, call_kw).
+# The names are the base's, the same in 16.0 to 19.0 (odoo/models.py, and
+# odoo/orm/models.py in 19.0). A call that gives ids to a method of the model,
+# or none to a method of records, goes as it is written, for Odoo to refuse.
+_LEADING_ON_RECORDS = {"write": ("vals",), "read": ("fields",)}
+_LEADING_ON_THE_MODEL = {
+    "create": ("vals_list",),
+    "search": ("domain",),
+    "search_count": ("domain",),
+    "search_read": ("domain", "fields"),
+}
+# What a leading parameter that is not given stands for, when a later one is:
+# only search_read's domain comes before another, and Odoo reads an empty one
+# as no filter.
+_LEADING_LEFT_OUT = {"domain": ()}
+
+
 class _XmlRpc:
     """Client.call over XML-RPC: execute_kw on /xmlrpc/2/object, after a
     login at the first call, as ServerProxy does it."""
@@ -865,9 +889,23 @@ class _XmlRpc:
         )
 
     def call(self, model, method, ids, named):
-        # execute_kw takes the records as its one positional argument, and
-        # none for a method of the model; everything else goes by name.
+        # execute_kw takes the records as its first positional argument, and
+        # none for a method of the model. Then come the method's leading
+        # parameters of _LEADING_ON_RECORDS or _LEADING_ON_THE_MODEL, up to
+        # the last one given; everything else goes by name.
+        leading = (
+            _LEADING_ON_THE_MODEL if ids is None else _LEADING_ON_RECORDS
+        ).get(method, ())
+        given = [index for index, name in enumerate(leading) if name in named]
+        positional = leading[: given[-1] + 1] if given else ()
         args = [] if ids is None else [ids]
+        args += [
+            named[name] if name in named else _LEADING_LEFT_OUT[name]
+            for name in positional
+        ]
+        kwargs = {
+            name: value for name, value in named.items() if name not in positional
+        }
         failure = None
         try:
             # The login's Fault too, such as a db the server does not hold,
@@ -883,7 +921,7 @@ class _XmlRpc:
                     model,
                     method,
                     args,
-                    named,
+                    kwargs,
                 ),
             )
         except xmlrpc.client.Fault as fault:
@@ -1014,9 +1052,12 @@ class Client:
         """Call ``method`` of ``model`` and return Odoo's result.
 
         ``ids`` is None for a method of the model (``search_read``,
-        ``search_count``), or the list of the ids of the records a method of
-        records works on (``read``, ``write``). ``named`` are the method's
-        own parameters, by name, ``context`` among them.
+        ``search_count``, ``create``), or the list of the ids of the records
+        a method of records works on (``read``, ``write``). ``named`` are the
+        method's own parameters, by their base names, ``context`` among them:
+        ``create`` takes ``vals_list``, a list of values, and answers the new
+        ids. Over XML-RPC the leading ones of six ORM methods go positionally
+        (_LEADING_ON_RECORDS, _LEADING_ON_THE_MODEL).
         """
         if ids is not None and not isinstance(ids, (list, tuple)):
             raise TypeError(

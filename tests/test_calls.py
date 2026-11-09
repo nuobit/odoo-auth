@@ -82,30 +82,85 @@ class XmlRpcClientTest(StubTestCase):
         self.client = self.make_client(self.odoo.url, "xmlrpc", PASSWORD)
 
     def test_a_method_of_records_gets_the_ids_as_its_one_positional_argument(self):
-        self.odoo.answers[("res.partner", "read")] = [{"id": 7, "name": "Example"}]
-        result = self.client.call("res.partner", "read", [7], fields=["name"])
-        self.assertEqual(result, [{"id": 7, "name": "Example"}])
+        # copy has no leading parameter that goes positionally.
+        self.odoo.answers[("res.partner", "copy")] = [8]
+        result = self.client.call("res.partner", "copy", [7], default={"name": "Example"})
+        self.assertEqual(result, [8])
         self.assertEqual(
             self.odoo.calls,
             [
                 {
                     "model": "res.partner",
-                    "method": "read",
+                    "method": "copy",
                     "args": [[7]],
-                    "kwargs": {"fields": ["name"]},
+                    "kwargs": {"default": {"name": "Example"}},
                 }
             ],
         )
 
     def test_a_method_of_the_model_gets_no_positional_argument(self):
-        self.odoo.answers[("res.partner", "search_read")] = [{"id": 7}]
-        self.client.call(
-            "res.partner", "search_read", domain=[["is_company", "=", True]], fields=["name"]
-        )
+        # fields_get has no leading parameter that goes positionally.
+        self.odoo.answers[("res.partner", "fields_get")] = {}
+        self.client.call("res.partner", "fields_get", attributes=["string"])
         self.assertEqual(self.odoo.calls[0]["args"], [])
+        self.assertEqual(self.odoo.calls[0]["kwargs"], {"attributes": ["string"]})
+
+    def test_the_leading_arguments_of_the_orm_methods_go_positionally(self):
+        # Odoo calls the database's last override, whose names can differ
+        # from the base's (on 16, res.company.write takes values): the ids
+        # first, for a method of records, then the leading arguments; every
+        # other one by name.
+        domain = [["is_company", "=", True]]
+        calls = {
+            "write": (([7],), {"vals": {"name": "Example"}}),
+            "read": (([7],), {"fields": ["name"], "load": "_classic_read"}),
+            "search": ((), {"domain": domain, "offset": 5, "limit": 10, "order": "name"}),
+            "search_count": ((), {"domain": domain}),
+            "search_read": (
+                (),
+                {"domain": domain, "fields": ["name"], "limit": 10, "context": {"lang": "ca_ES"}},
+            ),
+        }
+        sent = {
+            "write": ([[7], {"name": "Example"}], {}),
+            "read": ([[7], ["name"]], {"load": "_classic_read"}),
+            "search": ([domain], {"offset": 5, "limit": 10, "order": "name"}),
+            "search_count": ([domain], {}),
+            "search_read": ([domain, ["name"]], {"limit": 10, "context": {"lang": "ca_ES"}}),
+        }
+        for method, (ids, named) in calls.items():
+            with self.subTest(method=method):
+                self.odoo.answers[("res.partner", method)] = True
+                self.client.call("res.partner", method, *ids, **named)
+                call = self.odoo.calls[-1]
+                self.assertEqual((call["args"], call["kwargs"]), sent[method])
+
+    def test_fields_given_without_a_domain_come_after_an_empty_one(self):
+        self.odoo.answers[("res.partner", "search_read")] = []
+        self.client.call("res.partner", "search_read", fields=["name"], limit=5)
         self.assertEqual(
-            self.odoo.calls[0]["kwargs"],
-            {"domain": [["is_company", "=", True]], "fields": ["name"]},
+            (self.odoo.calls[0]["args"], self.odoo.calls[0]["kwargs"]),
+            ([[], ["name"]], {"limit": 5}),
+        )
+
+    def test_a_domain_given_without_fields_goes_alone(self):
+        self.odoo.answers[("res.partner", "search_read")] = []
+        self.client.call("res.partner", "search_read", domain=[["id", "=", 7]])
+        self.assertEqual(
+            (self.odoo.calls[0]["args"], self.odoo.calls[0]["kwargs"]),
+            ([[["id", "=", 7]]], {}),
+        )
+
+    def test_an_orm_method_called_against_its_kind_goes_as_it_is_written(self):
+        # write without ids, search with ids: Odoo refuses either, and the
+        # client does not guess which argument is which.
+        self.odoo.answers[("res.partner", "write")] = True
+        self.odoo.answers[("res.partner", "search")] = []
+        self.client.call("res.partner", "write", vals={"name": "Example"})
+        self.client.call("res.partner", "search", [7], domain=[])
+        self.assertEqual(
+            [(call["args"], call["kwargs"]) for call in self.odoo.calls],
+            [([], {"vals": {"name": "Example"}}), ([[7]], {"domain": []})],
         )
 
     def test_ids_as_a_tuple_or_empty_go_as_a_list(self):
@@ -130,6 +185,37 @@ class XmlRpcClientTest(StubTestCase):
         self.odoo.answers[("res.partner", "read")] = []
         self.client.call("res.partner", "read", [7], context={"lang": "ca_ES"})
         self.assertEqual(self.odoo.calls[0]["kwargs"], {"context": {"lang": "ca_ES"}})
+
+    def test_create_gets_its_vals_list_as_the_positional_argument(self):
+        # Odoo's call_kw reads create's values back from its first
+        # positional argument: given by name, the call fails once the
+        # records are made, and rolls back.
+        self.odoo.answers[("res.partner", "create")] = [9]
+        result = self.client.call(
+            "res.partner", "create", vals_list=[{"name": "Example"}], context={"lang": "ca_ES"}
+        )
+        self.assertEqual(result, [9])
+        self.assertEqual(
+            self.odoo.calls,
+            [
+                {
+                    "model": "res.partner",
+                    "method": "create",
+                    "args": [[{"name": "Example"}]],
+                    "kwargs": {"context": {"lang": "ca_ES"}},
+                }
+            ],
+        )
+
+    def test_create_with_ids_goes_as_it_is_written(self):
+        # create takes no ids: the call goes as written, for Odoo to refuse,
+        # as JSON-2 answers 422 for ids on a method of the model.
+        self.odoo.answers[("res.partner", "create")] = [9]
+        self.client.call("res.partner", "create", [7], vals_list=[{"name": "Example"}])
+        self.assertEqual(
+            (self.odoo.calls[0]["args"], self.odoo.calls[0]["kwargs"]),
+            ([[7]], {"vals_list": [{"name": "Example"}]}),
+        )
 
     def test_the_client_logs_in_at_its_first_call_only(self):
         self.odoo.answers[("res.partner", "read")] = []
@@ -349,6 +435,26 @@ class Json2ClientTest(StubTestCase):
         self.assertEqual(headers["authorization"], f"Bearer {KEY}")
         self.assertEqual(headers["x-odoo-database"], DB)
         self.assertEqual(headers["content-type"], "application/json")
+
+    def test_the_leading_arguments_of_the_orm_methods_go_by_name(self):
+        # Odoo 19 binds the body to the names of the method's signature
+        # (addons/rpc/controllers/json2.py, signature.bind): no client can
+        # send them otherwise.
+        self.odoo.answers[("res.partner", "write")] = True
+        self.odoo.answers[("res.partner", "search_read")] = []
+        self.client.call("res.partner", "write", [7], vals={"name": "Example"})
+        self.client.call("res.partner", "search_read", fields=["name"], limit=5)
+        self.assertEqual(
+            [self.sent_body(0), self.sent_body(1)],
+            [{"ids": [7], "vals": {"name": "Example"}}, {"fields": ["name"], "limit": 5}],
+        )
+
+    def test_create_gets_its_vals_list_by_name(self):
+        # The same call as over XML-RPC, where vals_list goes positionally.
+        self.odoo.answers[("res.partner", "create")] = [9]
+        result = self.client.call("res.partner", "create", vals_list=[{"name": "Example"}])
+        self.assertEqual(result, [9])
+        self.assertEqual(self.sent_body(), {"vals_list": [{"name": "Example"}]})
 
     def test_a_null_the_server_sends_comes_back_as_none(self):
         # Odoo's JSON-2 controller sends None as null: this checks only that
@@ -711,8 +817,9 @@ class CliTest(StubTestCase):
             {"model": "res.partner", "method": "search_count", "kwargs": {"domain": []}},
         )
         self.assertEqual((code, out, err), (0, "3\n", ""))
-        self.assertEqual(self.xmlrpc_odoo.calls[0]["args"], [])
-        self.assertEqual(self.xmlrpc_odoo.calls[0]["kwargs"], {"domain": []})
+        # search_count's domain goes positionally over XML-RPC.
+        self.assertEqual(self.xmlrpc_odoo.calls[0]["args"], [[]])
+        self.assertEqual(self.xmlrpc_odoo.calls[0]["kwargs"], {})
 
     def test_the_args_form_calls_execute_kw_on_an_xmlrpc_profile(self):
         self.xmlrpc_odoo.answers[("res.partner", "read")] = [{"id": 7}]

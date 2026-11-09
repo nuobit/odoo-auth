@@ -62,11 +62,14 @@ odoo-xmlrpc-auth --profile customer1 \
 # Rename a task
 odoo-xmlrpc-auth --profile customer1 \
   '{"model":"project.task","method":"write","ids":[42],"kwargs":{"vals":{"name":"Fixed"}}}'
+
+# Create a task, on either API
+odoo-xmlrpc-auth --profile customer1 \
+  '{"model":"project.task","method":"create","kwargs":{"vals_list":[{"name":"Bug: login broken","project_id":42}]}}'
 ```
 
 On an `api = xmlrpc` profile the payload may instead give `execute_kw`'s
-positional arguments as `args`, the form before 2.0, which `create` needs
-there (see `Client` below):
+positional arguments as `args`, the form before 2.0:
 
 ```bash
 odoo-xmlrpc-auth --profile customer1 \
@@ -98,10 +101,12 @@ with Client(profile="customer1") as odoo:
 `call(model, method, ids=None, **named)`:
 
 - `ids` is `None` for a method of the model (`search_read`,
-  `search_count`), or the list of the ids of the records a method of
-  records works on (`read`, `write`, `unlink`).
+  `search_count`, `create`), or the list of the ids of the records a method
+  of records works on (`read`, `write`, `unlink`).
 - Every other argument goes by its name in the method's signature,
-  `context` among them.
+  `context` among them. `create` takes its values as `vals_list`, on both
+  APIs: `call(model, "create", vals_list=[{...}, ...])` answers the list of
+  the new ids.
 - The result is Odoo's. Over JSON-2, records come back as their ids and
   `None` as `None`. Over XML-RPC, a method that returns `None` makes Odoo
   fail the reply after the work is done, an `OdooError` that says
@@ -112,19 +117,32 @@ call above goes out as:
 
 | | `api = xmlrpc` | `api = json2` |
 |---|---|---|
-| Request | `execute_kw(db, uid, password, model, method, [ids], named)` on `/xmlrpc/2/object` (`[]` when `ids` is `None`), after a login at the first call | `POST /json/2/<model>/<method>`, body `{"ids": ids, ...named}`, without `ids` when it is `None` |
+| Request | `execute_kw(db, uid, password, model, method, [ids], named)` on `/xmlrpc/2/object` (`[]` when `ids` is `None`; the leading arguments of six ORM methods after the ids, below), after a login at the first call | `POST /json/2/<model>/<method>`, body `{"ids": ids, ...named}`, without `ids` when it is `None` |
 | Credential | the profile's `password`: a password or an API key | the profile's `password`, which must be an API key, as `Authorization: Bearer` |
 | Database | the profile's `db`, in each call | the profile's `db`, in the `X-Odoo-Database` header |
 
 `Client(profile)` reads the profile and sends nothing; its `api` attribute
 says which API it uses. Close it when done, or use it in a `with` block.
 
-On an `api = xmlrpc` profile, `create` cannot be called by name: Odoo's
-`call_kw` reads the values of `create` back from its first positional
-argument to shape the result, so `call(model, "create", vals_list=[...])`
-fails there with an `OdooError` (an `IndexError` on the server, which
-creates nothing). Create through `ServerProxy.execute_kw(model, "create",
-[vals_list])` on such a profile. Over JSON-2 it works.
+Over XML-RPC, six ORM methods get their leading arguments positionally,
+after the ids, however the call names them: `write(vals)` and
+`read(fields)`, called with ids, and `create(vals_list)`, `search(domain)`,
+`search_count(domain)` and `search_read(domain, fields)`, called without.
+Odoo calls the database's last override of a method with the names the
+client sends, and overrides do not all use the base's names (on Odoo 16,
+`res.company.write` and `website.write` take `values`, not `vals`); and
+Odoo's `call_kw` reads `create`'s values back from its first positional
+argument to shape the result, so by name it would fail once the records
+are made, and roll back. The arguments go up to the last one given:
+`search_read(fields=[...])` sends an empty domain, which Odoo reads as no
+filter, before the fields. Every other argument goes by name, as `offset`,
+`limit`, `order`, `load` and `context` do. A call that gives ids to one of
+the methods of the model, or none to `write` or `read`, goes as it is
+written, for Odoo to refuse. Over JSON-2 everything goes by name: Odoo binds
+the body to the names of the method's signature.
+
+Give `create` a list: with a single dict, XML-RPC answers the new id and
+JSON-2 the list of its id.
 
 ### ServerProxy: the XML-RPC drop-in
 
