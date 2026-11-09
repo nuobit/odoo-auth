@@ -13,6 +13,7 @@ import gzip
 import io
 import json
 import os
+import ssl
 import sys
 import unittest
 import xmlrpc.client
@@ -217,6 +218,17 @@ class XmlRpcClientTest(StubTestCase):
             (self.odoo.calls[0]["args"], self.odoo.calls[0]["kwargs"]),
             ([[7]], {"vals_list": [{"name": "Example"}]}),
         )
+
+    def test_an_https_url_goes_over_tls(self):
+        # The stub speaks plain HTTP: over TLS its answer is no handshake.
+        client = self.make_client(
+            self.odoo.url.replace("http://", "https://"), "xmlrpc", PASSWORD, "https"
+        )
+        error = self.raised(
+            RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+        )
+        self.assertIsInstance(error, ssl.SSLError)
+        self.assertEqual(self.odoo.logins, 0)
 
     def test_the_client_logs_in_at_its_first_call_only(self):
         self.odoo.answers[("res.partner", "read")] = []
