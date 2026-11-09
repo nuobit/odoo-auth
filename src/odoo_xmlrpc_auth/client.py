@@ -12,6 +12,9 @@ import requests
 
 _SECTION = "odoo"
 _REQUIRED_KEYS = ("url", "db", "user", "password")
+# The values of a profile a caller may print (Client's repr shows the api):
+# none of them may hold the password.
+_PUBLIC_KEYS = ("url", "db", "user", "api")
 # The values of the line `api = ...` every profile carries, with no default:
 # the API each call of a Client goes through, Odoo's XML-RPC (/xmlrpc/2) or
 # its External JSON-2 API (/json/2, from Odoo 19).
@@ -164,6 +167,10 @@ class _Secret:
         """``text`` with the value shown as ***."""
         return text.replace(self._value, "***") if self._value != "" else text
 
+    def occurs_in(self, text):
+        """Whether ``text`` holds the value."""
+        return self._value != "" and self._value in text
+
     def __repr__(self):
         return f"<{len(self._value)} chars>"
 
@@ -198,6 +205,28 @@ def _check_api(profile, section, config_path):
             f"The api line of profile {profile!r} must be "
             f"{_ACCEPTED_API_LINES}, in {config_path}. Its value is not shown."
         )
+
+
+def _check_public_fields(profile, section, password, config_path):
+    """Raise ConfigError when a value of _PUBLIC_KEYS in ``section``, the
+    profile's, holds ``password``, a _Secret.
+
+    A caller may print those values: a password written on the wrong line
+    would show through them. The check fails closed: a password short or
+    common enough to occur in one by chance is refused too. No message
+    quotes a value, and no frame here holds one in a local.
+    """
+    for key in _PUBLIC_KEYS:
+        # _check_api has refused a profile without the api line.
+        if password.occurs_in(section[key]):
+            raise ConfigError(
+                f"The {key} of profile {profile!r}, in {config_path}, holds "
+                "its password. Either the password was written on the wrong "
+                "line: keep it on the password line only. Or the password is "
+                f"so short or so common that it occurs in the {key}: the "
+                f"password must change, as the {key} may be printed. Neither "
+                "is shown."
+            )
 
 
 def _check_url(url, config_path):
@@ -346,12 +375,15 @@ def _checked_config(profile, section, config_path):
     password as a _Secret: no frame of a ConfigError holds the password.
     """
     _check_api(profile, section, config_path)
+    password = _Secret(section["password"])
+    # Before the checks whose frames hold a public value in a local.
+    _check_public_fields(profile, section, password, config_path)
     _check_url(section["url"], config_path)
     config = {
         "url": section["url"].rstrip("/"),
         "db": section["db"],
         "user": section["user"],
-        "password": _Secret(section["password"]),
+        "password": password,
         "api": section["api"],
     }
     # Only JSON-2 sends values of the store in headers.

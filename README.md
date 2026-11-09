@@ -236,6 +236,12 @@ is refused too if its `password` is not an Odoo API key (40 lowercase
 hexadecimal digits) or its `db` is not one line of printable ASCII without
 spaces: JSON-2 sends both in headers. Neither is shown.
 
+A profile whose `url`, `db`, `user` or `api` holds its `password` is
+refused as well, with a message that names the field and shows neither:
+a caller may print those values (`Client`'s repr shows the `api`). The
+check fails closed, so a password short or common enough to occur in one
+of them by chance is refused too, and has to change.
+
 ## Security model
 
 | Data | Leaves your machine? |
