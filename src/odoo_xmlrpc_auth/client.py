@@ -164,10 +164,11 @@ class RedirectError(requests.RequestException):
 
 
 @functools.lru_cache(maxsize=None)
-def _request_error_class(error_class):
-    """The class of the RequestError raised instead of an ``error_class``: a
-    subclass of both, so that ``except error_class`` keeps catching it."""
-    return type(RequestError.__name__, (RequestError, error_class), {})
+def _error_class(base, error_class):
+    """The class of the error of the library, ``base``, raised instead of an
+    ``error_class``: a subclass of both, so that ``except error_class`` keeps
+    catching it."""
+    return type(base.__name__, (base, error_class), {})
 
 
 def _request_error(profile, error):
@@ -188,7 +189,7 @@ def _request_error(profile, error):
         if isinstance(error, _InvalidAnswer)
         else type(error)
     )
-    return _request_error_class(stands_for)(profile, stands_for.__name__, code)
+    return _error_class(RequestError, stands_for)(profile, stands_for.__name__, code)
 
 
 # The pieces of a form of a secret, for _at_any_depth: each a run of
@@ -992,7 +993,7 @@ class _Json2:
         answer = _loaded(response.content)
         if status == 200:
             if answer is _NOT_JSON:
-                raise _request_error_class(requests.JSONDecodeError)(
+                raise _error_class(RequestError, requests.JSONDecodeError)(
                     self._profile, "JSONDecodeError", status
                 )
             return answer
@@ -1009,7 +1010,7 @@ class _Json2:
                     self._profile, status, self._key.hidden(answer["message"])
                 )
             else:
-                raise _request_error_class(requests.HTTPError)(
+                raise _error_class(RequestError, requests.HTTPError)(
                     self._profile, "HTTPError", status
                 )
 
