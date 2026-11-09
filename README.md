@@ -29,6 +29,21 @@ Version 2.0 reads a line every profile must have, `api = xmlrpc` or
 value, is refused before any call. Add the line to every profile **before**
 installing 2.0. `api = xmlrpc` keeps a profile working as before.
 
+What else a 1.x caller meets:
+
+- `requests` must be importable, whatever the profile's API: the client
+  imports it when it is imported. `pip install` brings it; a script that
+  puts the source checkout on `sys.path` or `PYTHONPATH` needs it in its
+  own environment.
+- A profile is refused too when its `url` holds a backslash or port 0, or
+  when its `url`, `db`, `user` or `api` holds its `password` (§ Configure a
+  profile).
+- The CLI refuses a payload key other than `model`, `method`, `ids`,
+  `kwargs` and `args`, where 1.x ignored it, and prints an error of Odoo as
+  `Error: Odoo answered a call of profile 'x' with an error (code N):
+  <message>`, the password shown as `***`, where 1.x printed the Fault's
+  text alone.
+
 ## CLI usage
 
 ```
@@ -301,10 +316,20 @@ What the transports take from the environment, and what they do not:
   Whoever reads that file can decrypt the traffic, the password or the key
   included.
 
+JSON-2 goes through `requests` and not the standard library's `urllib`
+because of the key: `urllib`'s redirect handler copies a request's headers,
+an `Authorization` header among them, to whatever host a redirect names
+(`urllib/request.py`, `HTTPRedirectHandler.redirect_request`), and gives no
+hook to check where a request goes. `requests` drops `Authorization` when a
+redirect changes host, and its session gives the two hooks the client uses:
+the auth, called with each request as prepared, which sets the key only for
+the profile's origin, and `rebuild_auth`, called on each redirect before
+anything is sent, which refuses any other origin.
+
 ## Prerequisites
 
 - **python3 >= 3.8**
-- **requests >= 2.27**, for JSON-2
+- **requests >= 2.27**, imported by the client whatever the profile's API
 
 ## License
 
