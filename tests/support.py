@@ -62,6 +62,48 @@ class StoreMixin:
         self.assertIsNone(error.__cause__)
         self.assertIsNone(error.__context__)
 
+    def raised(self, error_class, call):
+        """The ``error_class`` that ``call()`` raises, with its traceback,
+        which assertRaises drops."""
+        try:
+            call()
+        except error_class as error:
+            return error
+        self.fail(f"{error_class.__name__} not raised")
+
+    def assertNoFrameHolds(self, error, value):
+        """No frame of ``error``'s traceback but the tests' own holds
+        ``value`` in a local: a test runner or a debugger prints the repr of
+        each (``pytest -l``). Fails naming each frame and local that does.
+
+        ``error`` comes from ``raised``: the one assertRaises keeps has no
+        traceback left to check."""
+        self.assertIsNotNone(error.__traceback__)
+        tests_folder = os.path.dirname(os.path.abspath(__file__))
+        holding = []
+        traceback = error.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if os.path.dirname(os.path.abspath(frame.f_code.co_filename)) != tests_folder:
+                holding += [
+                    f"{frame.f_code.co_name}:{name}"
+                    for name, local in frame.f_locals.items()
+                    if value in _shown(local)
+                ]
+            traceback = traceback.tb_next
+        self.assertEqual(holding, [])
+
+
+def _shown(local):
+    """What a printer of a frame's locals shows of ``local``: its repr, or
+    nothing when the repr fails, as it does for an object whose __init__
+    raised before setting what its repr reads (pytest prints a placeholder
+    instead)."""
+    try:
+        return repr(local)
+    except AttributeError:
+        return ""
+
 
 def free_port():
     """A port of 127.0.0.1 on which nothing listens."""

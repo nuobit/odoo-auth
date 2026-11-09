@@ -30,6 +30,7 @@ from odoo_xmlrpc_auth.client import (
     ConfigError,
     RequestError,
     ServerProxy,
+    _read_config,
 )
 from support import KEY, PASSWORD, StoreMixin
 
@@ -411,6 +412,79 @@ class CallTest(StoreTestCase):
             proxy.execute_kw("res.partner", "read", [[1]])
         self.assertNotIsInstance(caught.exception, RequestError)
         self.assertEqual(caught.exception.faultString, "Record does not exist")
+
+
+class ScriptsTest(StoreTestCase):
+    """Scripts that log in to Odoo's web themselves, to download a report,
+    read a profile's values through _read_config, or the password a
+    ServerProxy keeps: both stay in clear for them."""
+
+    def setUp(self):
+        super().setUp()
+        self.make_store(
+            "[odoo]\n"
+            "url = https://odoo.example.com/\n"
+            "db = odoo_db_test\n"
+            "user = odoo_user_test\n"
+            "password = odoo_dummy_password_test\n"
+            "api = xmlrpc\n"
+        )
+
+    def test_read_config_gives_the_values_with_the_password_in_clear(self):
+        self.assertEqual(
+            _read_config("erp"),
+            {
+                "url": "https://odoo.example.com",
+                "db": "odoo_db_test",
+                "user": "odoo_user_test",
+                "password": "odoo_dummy_password_test",
+                "api": "xmlrpc",
+            },
+        )
+
+    def test_read_config_gives_every_key_of_the_section_as_1_2_0_did(self):
+        # A script reads a key of its own the section holds.
+        self.make_store(
+            "[odoo]\n"
+            "url = https://odoo.example.com//\n"
+            "db = odoo_db_test\n"
+            "user = odoo_user_test\n"
+            "password = odoo_dummy_password_test\n"
+            "api = xmlrpc\n"
+            "report_folder = invoices\n",
+            profile="with-more",
+        )
+        self.assertEqual(
+            _read_config("with-more"),
+            {
+                "url": "https://odoo.example.com",
+                "db": "odoo_db_test",
+                "user": "odoo_user_test",
+                "password": "odoo_dummy_password_test",
+                "api": "xmlrpc",
+                "report_folder": "invoices",
+            },
+        )
+
+    def test_read_config_refuses_a_profile_the_library_refuses(self):
+        self.make_store(
+            "[odoo]\n"
+            "url = https://odoo.example.com\n"
+            "db = odoo_db_test\n"
+            "user = odoo_user_test\n"
+            "password = odoo_dummy_password_test\n",
+            profile="no-api",
+        )
+        with self.assertRaisesRegex(ConfigError, "^Profile 'no-api' has no api line"):
+            _read_config("no-api")
+
+    def test_the_proxy_keeps_the_password_in_clear(self):
+        self.common.authenticate.return_value = 7
+        proxy = ServerProxy(profile="erp")
+        self.assertEqual(
+            (proxy._db, proxy._uid, proxy._password),
+            ("odoo_db_test", 7, "odoo_dummy_password_test"),
+        )
 
 
 class CliTest(StoreTestCase):
