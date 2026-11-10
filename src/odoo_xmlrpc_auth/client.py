@@ -1371,6 +1371,44 @@ class _Json2:
         self._session.close()
 
 
+def _check_names(profile, model, method):
+    """Raise ArgumentError, for a call of ``profile``, unless ``model`` and
+    ``method`` are names: strings that UTF-8 can encode, neither empty, "."
+    nor "..".
+
+    Both APIs send them encoded as UTF-8. Over JSON-2 both are segments of
+    the call's url, and such a segment would send the call to another path
+    of the server (requests drops "." and ".."); over XML-RPC Odoo takes
+    nothing but a name. Neither is quoted: it can be anything.
+    """
+    names = (model, method)
+    if not all(isinstance(name, str) for name in names):
+        raise _error_class(ArgumentError, TypeError)(
+            profile, "A model and a method are names: both must be strings"
+        )
+    elif any(name in ("", ".", "..") for name in names):
+        raise _error_class(ArgumentError, ValueError)(
+            profile,
+            "A model and a method are names: neither can be empty, '.' or '..'",
+        )
+    elif not all(_utf8_encodes(name) for name in names):
+        raise _error_class(ArgumentError, ValueError)(
+            profile,
+            "A model and a method are names: neither can hold a character "
+            "UTF-8 cannot encode, such as a lone surrogate",
+        )
+
+
+def _utf8_encodes(text):
+    """Whether UTF-8 encodes ``text``: whether it holds no lone surrogate."""
+    encodes = True
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        encodes = False
+    return encodes
+
+
 def _check_timeout(profile, timeout):
     """Raise ArgumentError unless ``timeout``, Client's, is a (connect, read)
     tuple of two numbers of seconds above 0 and at most the largest timeout
@@ -1467,14 +1505,7 @@ class Client:
                 "ids must be None, for a method of the model, or a list of the "
                 "records' ids",
             )
-        if model in ("", ".", "..") or method in ("", ".", ".."):
-            # Over JSON-2 both are segments of the call's url, and such a
-            # segment would send the call to another path of the server
-            # (requests drops "." and "..").
-            raise _error_class(ArgumentError, ValueError)(
-                self.profile,
-                "A model and a method are names: neither can be empty, '.' or '..'",
-            )
+        _check_names(self.profile, model, method)
         return self._transport.call(
             model, method, None if ids is None else list(ids), named
         )
@@ -1506,6 +1537,7 @@ class Client:
                 self.profile,
                 "kwargs must be None or the dict of execute_kw's named arguments",
             )
+        _check_names(self.profile, model, method)
         return self._transport.execute_kw(
             model, method, list(args), {} if kwargs is None else kwargs
         )
