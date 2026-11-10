@@ -274,7 +274,11 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   and the like keep catching it; as a `ProtocolError` it keeps its
   `errcode`, while its `url` and `errmsg` are empty. For an answer that is
   not XML-RPC it stands for `xmlrpc.client.ResponseError`, whatever the
-  parser raised (an `ExpatError`, a `ValueError`…). When one of `Client`'s
+  parser raised (an `ExpatError`, a `ValueError`…). Such an answer, and one
+  that is not JSON (`JSONDecodeError`, `code` 200), came from a server that
+  answered: answering a call, it may have run it, and only its answer was
+  not read, so a retry would run it again. Read back what it did before
+  repeating it. When one of `Client`'s
   timeouts fires, `timeout_fired` says which, `"connect"` or `"read"`
   (`None` otherwise), and so does the message. After the connect timeout
   nothing was sent. After the read timeout the server may still complete
@@ -339,7 +343,11 @@ request, as those of `ServerProxy`'s raw errors do. A library does not
 intercept an interrupt or the exhaustion of a resource, and their
 tracebacks are how they are diagnosed. (Raised while `Client` encodes a
 call's values, a `RecursionError` is an `ArgumentError`, above, even when
-the caller's deep stack caused it.) The CLI lets them through too:
+the caller's deep stack caused it. Raised while it reads an answer's JSON,
+it is an answer that is not JSON, a `RequestError` with `code` 200, even
+when the caller's deep stack caused it and the answer was good: the server
+ran the call. Their class cannot tell the two causes apart.) The CLI lets
+them through too:
 Python prints their traceback, which shows no frame's locals.
 
 ## Configure a profile
