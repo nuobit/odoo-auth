@@ -1089,6 +1089,29 @@ class FramesTest(StubTestCase):
                 error = self.raised(ConfigError, lambda: Client(profile=profile))
                 self.assertNoFrameHolds(error, password)
 
+    def test_no_frame_of_an_answer_refused_over_json2_holds_the_key(self):
+        # The answer's request carries the key in its headers, and Odoo's
+        # error body can echo it, unmasked.
+        answers = {
+            "an error of Odoo echoing the key": (
+                OdooError,
+                Answer(422, odoo_error("odoo.exceptions.UserError", f"Not {KEY}")),
+            ),
+            "a 401": (AuthError, Answer(401, b"")),
+            "an error that is not Odoo's": (RequestError, Answer(502, b"Bad gateway")),
+            "a 200 that is not JSON": (RequestError, Answer(200, b"<html>Log in</html>")),
+        }
+        odoo = self.start(Json2Odoo())
+        client = self.make_client(odoo.url, "json2", KEY)
+        for case, (error_class, answer) in answers.items():
+            with self.subTest(case=case):
+                odoo.answers[("res.partner", "search_count")] = answer
+                error = self.raised(
+                    error_class,
+                    lambda: client.call("res.partner", "search_count", domain=[]),
+                )
+                self.assertNoFrameHolds(error, KEY)
+
 
 # How long, in seconds, a stub holds a request at most before it lets the
 # connection go: far above the timeouts the tests give Client (0.2 s), far

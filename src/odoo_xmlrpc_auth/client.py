@@ -1299,50 +1299,73 @@ class _Json2:
         if failure is not None:
             raise failure
         path = "/".join(urllib.parse.quote(name, safe="") for name in (model, method))
-        response = _send(
+        failure, result = _send(
             self._profile,
-            lambda: self._session.post(
-                f"{self._url}/json/2/{path}",
-                data=body.encode("ascii"),
-                headers={
-                    "Content-Type": "application/json",
-                    # Without a session, Odoo takes the database from this
-                    # header when the server holds several (odoo/http.py,
-                    # Request._get_session_and_dbname).
-                    "X-Odoo-Database": self._db,
-                },
-                timeout=self._timeout,
+            lambda: self._outcome(
+                self._session.post(
+                    f"{self._url}/json/2/{path}",
+                    data=body.encode("ascii"),
+                    headers={
+                        "Content-Type": "application/json",
+                        # Without a session, Odoo takes the database from
+                        # this header when the server holds several
+                        # (odoo/http.py, Request._get_session_and_dbname).
+                        "X-Odoo-Database": self._db,
+                    },
+                    timeout=self._timeout,
+                )
             ),
         )
-        return self._result(response)
+        if failure is not None:
+            raise failure
+        return result
 
-    def _result(self, response):
-        """The result ``response``, the answer to a call, carries, or the
-        error it stands for."""
+    def _outcome(self, response):
+        """The outcome of ``response``, the answer to a call: (None, the
+        result it carries), or (the error it stands for, None).
+
+        Returned, not raised: the frame that raises the error holds neither
+        the answer, whose request carries the key in its headers, nor its
+        body, which can echo the key, unmasked.
+        """
         status = response.status_code
         answer = _loaded(response.content)
         if status == 200:
             if answer is _NOT_JSON:
-                raise _error_class(RequestError, requests.JSONDecodeError)(
-                    self._profile, "JSONDecodeError", status
+                outcome = (
+                    _error_class(RequestError, requests.JSONDecodeError)(
+                        self._profile, "JSONDecodeError", status
+                    ),
+                    None,
                 )
-            return answer
+            else:
+                outcome = (None, answer)
         elif status == 401:
             # Odoo's answer to a key it does not take (Odoo 19,
             # odoo/addons/base/models/ir_http.py, _auth_method_bearer).
-            raise AuthError(f"Authentication failed for profile {self._profile!r}")
+            outcome = (
+                AuthError(f"Authentication failed for profile {self._profile!r}"),
+                None,
+            )
         else:
             # The error body of Odoo's JSON-2 dispatcher is an object with
             # the message among its keys (odoo/http.py, serialize_exception);
             # any other answer is the transport's.
             if isinstance(answer, dict) and isinstance(answer.get("message"), str):
-                raise OdooError(
-                    self._profile, status, self._key.hidden(answer["message"])
+                outcome = (
+                    OdooError(
+                        self._profile, status, self._key.hidden(answer["message"])
+                    ),
+                    None,
                 )
             else:
-                raise _error_class(RequestError, requests.HTTPError)(
-                    self._profile, "HTTPError", status
+                outcome = (
+                    _error_class(RequestError, requests.HTTPError)(
+                        self._profile, "HTTPError", status
+                    ),
+                    None,
                 )
+        return outcome
 
     def close(self):
         self._session.close()
