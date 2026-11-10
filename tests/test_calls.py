@@ -1920,6 +1920,27 @@ class CliTest(StubTestCase):
         self.assertEqual(err.count("\n"), 1)
         self.assertEqual(self.xmlrpc_odoo.logins, 0)
 
+    def test_an_answer_json_cannot_write_ends_as_one_message(self):
+        # Over XML-RPC an answer can hold a dateTime or a base64 value, here
+        # echoing the password; Odoo ran the call.
+        answers = {
+            "a dateTime": xmlrpc.client.DateTime(f"echo {PASSWORD}"),
+            "a base64": xmlrpc.client.Binary(f"echo {PASSWORD}".encode()),
+        }
+        for case, answer in answers.items():
+            with self.subTest(case=case):
+                self.xmlrpc_odoo.answers[("res.partner", "read")] = [answer]
+                code, out, err = self.run_cli(
+                    "erp-xmlrpc", {"model": "res.partner", "method": "read", "ids": [7]}
+                )
+                self.assertEqual((code, out), (1, ""))
+                self.assertEqual(
+                    err,
+                    "Error: Odoo ran the call, and its answer holds a value JSON "
+                    "cannot write, such as a dateTime or base64 of XML-RPC: read "
+                    "back what the call did before repeating it\n",
+                )
+
     def test_a_value_json2_cannot_send_ends_as_one_message(self):
         # NaN is no JSON, but Python's json reads it; JSON-2 cannot send it.
         # From Python 3.13 json's text names the value too.
