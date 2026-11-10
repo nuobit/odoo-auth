@@ -31,10 +31,14 @@ installing 2.0. `api = xmlrpc` keeps a profile working as before.
 
 What else a 1.x caller meets:
 
-- `requests` must be importable, whatever the profile's API: the client
-  imports it when it is imported. `pip install` brings it; a script that
-  puts the source checkout on `sys.path` or `PYTHONPATH` needs it in its
-  own environment.
+- Python 3.10 or later, and `requests` 2.32.3 and `urllib3` 2.3.0 or
+  later, which must be importable whatever the profile's API: the client
+  imports them when it is imported. `pip install` brings them; a script
+  that puts the source checkout on `sys.path` or `PYTHONPATH` needs them in
+  its own environment. The suite runs on Python 3.11 with requests 2.34.2
+  and urllib3 2.8.0, and on Python 3.13 with requests 2.32.3 and urllib3
+  2.3.0; from 3.10, Python names a socket's timeout `TimeoutError`, the
+  class a `RequestError` names for a timeout.
 - A profile is refused too when its `url` holds a backslash or port 0, or
   when its `url`, `db`, `user` or `api` holds its `password` (§ Configure a
   profile).
@@ -392,8 +396,9 @@ anything is sent, which refuses any other origin.
 
 ## Prerequisites
 
-- **python3 >= 3.8**
-- **requests >= 2.27**, imported by the client whatever the profile's API
+- **python3 >= 3.10**
+- **requests >= 2.32.3** and **urllib3 >= 2.3.0**, which the client imports
+  whatever the profile's API
 
 ## License
 
