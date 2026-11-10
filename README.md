@@ -100,13 +100,15 @@ odoo-xmlrpc-auth --profile customer1 \
 
 An `api = json2` profile refuses `args`, a payload cannot hold both `ids`
 and `args`, and without `args` it cannot hold `ids` inside `kwargs`: the
-records go in `ids`. An error is printed on stderr after `Error:`, on one
-line, and the CLI exits with status 1, never with a traceback: one of the
-errors of `Client` below, in both forms of the payload, a call `Client`
-refuses (`ArgumentError`, such as an empty model, or NaN over JSON-2)
-among them, or a payload Python's json cannot read (`invalid JSON: …`,
-also for an int longer than it converts or nesting deeper than it
-follows).
+records go in `ids`. An error is printed on stderr after `Error:`, and
+the CLI exits with status 1, never with a traceback: one of the errors of
+`Client` below, in both forms of the payload, a call `Client` refuses
+(`ArgumentError`, such as an empty model, or NaN over JSON-2) among them,
+or a payload Python's json cannot read (`invalid JSON: …`, also for an int
+longer than it converts or nesting deeper than it follows). The library's
+own messages are one line each; an `OdooError` ends with Odoo's message,
+printed as it came, which can span lines (a traceback of the server's,
+for one).
 
 ## Library usage
 
@@ -312,9 +314,9 @@ down, in `_password`, which stays readable as in 1.x. The errors:
 
 `ServerProxy` raises `ConfigError`, `AuthError` and `RequestError`, as in
 1.x; an Odoo `xmlrpc.client.Fault`, and an answer that is not XML-RPC,
-come through it as xmlrpc.client raises them. The CLI prints
-`ConfigError`, `AuthError` and `RequestError` on one line, and an
-`OdooError` with Odoo's message.
+come through it as xmlrpc.client raises them. The CLI, which goes through
+`Client`, prints each of its errors on one line but an `OdooError`, whose
+message ends with Odoo's, as it came (§ CLI usage).
 
 ## Configure a profile
 

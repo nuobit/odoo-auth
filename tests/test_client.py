@@ -69,13 +69,14 @@ class ServerProxyTest(StoreTestCase):
             "odoo_db_test", "odoo_user_test", "odoo_dummy_password_test", {}
         )
 
-    def test_a_missing_store_says_how_to_create_it(self):
+    def test_a_missing_store_says_how_to_create_it_on_one_line(self):
+        # The CLI prints the message after "Error:", on one line.
         self.use_home()
         with self.assertRaisesRegex(
             ConfigError,
-            r"Config file not found: .*/\.config/odoo-xmlrpc-auth/erp\.conf\n"
+            r"\AConfig file not found: [^\n]*/\.config/odoo-xmlrpc-auth/erp\.conf\. "
             r"Create it with a \[odoo\] section, the keys url, db, user, "
-            r"password, and the line `api = xmlrpc` or `api = json2`$",
+            r"password, and the line `api = xmlrpc` or `api = json2`\Z",
         ):
             ServerProxy(profile="erp")
 
@@ -977,6 +978,22 @@ class CliTest(StoreTestCase):
             stderr.getvalue(),
             "Error: A request of profile 'erp' failed: ProtocolError, code 502. "
             "Its message is not shown, as it can quote the profile's values.\n",
+        )
+
+    def test_a_missing_profile_prints_one_line(self):
+        self.use_home()
+        argv = ["odoo-xmlrpc-auth", "--profile", "erp", '{"model": "res.partner", "method": "search"}']
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", argv):
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    cli.main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertRegex(
+            stderr.getvalue(),
+            r"\AError: Config file not found: [^\n]*/erp\.conf\. Create it with a "
+            r"\[odoo\] section, the keys url, db, user, password, and the line "
+            r"`api = xmlrpc` or `api = json2`\n\Z",
         )
 
 
