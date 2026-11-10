@@ -321,6 +321,17 @@ or a debugger that prints each frame's locals (`pytest -l`) shows it.
 `Client`, prints each of its errors on one line but an `OdooError`, whose
 message ends with Odoo's, as it came (§ CLI usage).
 
+The library catches no `KeyboardInterrupt`, no `MemoryError`, and no
+`RecursionError` raised because the caller's own stack is already close
+to Python's recursion limit: they pass through as they are, and frames
+of their traceback hold the password or the API key, alone or in the
+request, as those of `ServerProxy`'s raw errors do. A library does not
+intercept an interrupt or the exhaustion of a resource, and their
+tracebacks are how they are diagnosed. (Raised while `Client` encodes a
+call's values, a `RecursionError` is an `ArgumentError`, above, even when
+the caller's deep stack caused it.) The CLI lets them through too:
+Python prints their traceback, which shows no frame's locals.
+
 ## Configure a profile
 
 One file per Odoo instance, `chmod 600`:
