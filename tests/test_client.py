@@ -612,6 +612,16 @@ class SecretTest(unittest.TestCase):
                 self.assertEqual(secret.hidden(text), masked)
 
 
+class ClientSurfaceTest(unittest.TestCase):
+    def test_call_is_the_one_public_method_that_sends_a_call(self):
+        # execute_kw's positional form is the CLI's, for its payloads of 1.x:
+        # a function of the module, not a second way to write a call.
+        self.assertEqual(
+            sorted(name for name in vars(Client) if not name.startswith("_")),
+            ["call", "close"],
+        )
+
+
 class ApiLineTest(StoreTestCase):
     """Every profile says which API its calls go through, with the line
     `api = xmlrpc` or `api = json2`; there is no default."""

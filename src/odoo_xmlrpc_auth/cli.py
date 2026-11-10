@@ -10,6 +10,7 @@ from .client import (
     ConfigError,
     OdooError,
     RequestError,
+    _execute_kw,
 )
 
 # What a payload holds: model and method, then ids and kwargs for
@@ -58,18 +59,18 @@ def _payload(text):
     return call
 
 
-def _execute_kw(odoo, call):
+def _call_with_args(odoo, call):
     """The payload's call with its positional args, the CLI's form before
     2.0, for an `api = xmlrpc` profile only, through the open Client: its
     login, its errors."""
     if odoo.api != "xmlrpc":
-        # Client.execute_kw refuses it too, in the words of the library.
+        # _execute_kw refuses it too, in the words of the library.
         die(
             f"'args' is for `api = xmlrpc` profiles, and profile {odoo.profile!r} "
             "has `api = json2`: give 'ids' and 'kwargs' instead"
         )
-    return odoo.execute_kw(
-        call["model"], call["method"], call["args"], call.get("kwargs")
+    return _execute_kw(
+        odoo, call["model"], call["method"], call["args"], call.get("kwargs")
     )
 
 
@@ -93,7 +94,7 @@ def main():
     try:
         with Client(profile=args.profile) as odoo:
             if "args" in call:
-                result = _execute_kw(odoo, call)
+                result = _call_with_args(odoo, call)
             else:
                 result = odoo.call(
                     call["model"],
