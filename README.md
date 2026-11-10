@@ -293,7 +293,9 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   message can show them.
 - `ArgumentError`: a call `Client` cannot send, refused before anything is
   sent, the login included: `ids` that are not a list, a model or a method
-  that is not a name (empty, `.` or `..`), or a value its API cannot carry
+  that is not a name (not a string, empty, `.` or `..`, or holding a
+  character UTF-8 cannot encode, a lone surrogate), or a value its API
+  cannot carry
   (over XML-RPC, a type `xmlrpc.client` cannot marshal, such as a set or a
   date, or an int beyond 32 bits; over JSON-2, a value JSON cannot hold,
   NaN among them; over either, a value nested deeper than the encoder

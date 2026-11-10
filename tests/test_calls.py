@@ -1016,6 +1016,40 @@ class ArgumentTest(StubTestCase):
         self.assertEqual((len(calls), len(carried)), (1, 1))
         self.assertIn(carried[0], calls[0])
 
+    def test_a_model_or_a_method_that_is_no_string_utf8_encodes_is_refused_unsent(self):
+        # JSON-2 quoted it into the url, raising a TypeError or a
+        # UnicodeEncodeError, and XML-RPC sent it to the server.
+        xmlrpc_odoo = self.start(XmlRpcOdoo())
+        json2_odoo = self.start(Json2Odoo())
+        clients = {
+            "xmlrpc": self.make_client(xmlrpc_odoo.url, "xmlrpc", PASSWORD, "erp-xmlrpc"),
+            "json2": self.make_client(json2_odoo.url, "json2", KEY, "erp-json2"),
+        }
+        names = {
+            "None": (TypeError, None),
+            "an int": (TypeError, 5),
+            "a lone surrogate": (ValueError, "res.partner\ud800"),
+        }
+        for api, client in clients.items():
+            for case, (error_class, name) in names.items():
+                for model, method in ((name, "read"), ("res.partner", name)):
+                    with self.subTest(api=api, case=case, model=model):
+                        error = self.raised(
+                            error_class, lambda: client.call(model, method, [7])
+                        )
+                        self.assertIsInstance(error, ArgumentError)
+                        self.assertNeverShows(error, "\ud800")
+        for case, (error_class, name) in names.items():
+            with self.subTest(case=case, form="execute_kw"):
+                error = self.raised(
+                    error_class,
+                    lambda: clients["xmlrpc"].execute_kw(name, "read", [[7]]),
+                )
+                self.assertIsInstance(error, ArgumentError)
+        self.assertEqual(
+            (xmlrpc_odoo.logins, xmlrpc_odoo.calls, json2_odoo.requests), (0, [], [])
+        )
+
     def test_the_marshallers_text_is_the_reason(self):
         odoo = self.start(XmlRpcOdoo())
         client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
@@ -1699,6 +1733,18 @@ class CliTest(StubTestCase):
                 "erp-json2",
                 {"model": "res.partner", "method": "..", "ids": [7]},
                 "A model and a method are names: neither can be empty, '.' or '..'",
+            ),
+            (
+                "erp-json2",
+                {"model": "res.partner", "method": "read\ud800", "ids": [7]},
+                "A model and a method are names: neither can hold a character "
+                "UTF-8 cannot encode, such as a lone surrogate",
+            ),
+            (
+                "erp-xmlrpc",
+                {"model": "res.partner\ud800", "method": "read", "args": [[7]]},
+                "A model and a method are names: neither can hold a character "
+                "UTF-8 cannot encode, such as a lone surrogate",
             ),
             (
                 "erp-xmlrpc",
