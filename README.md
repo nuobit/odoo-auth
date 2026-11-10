@@ -314,7 +314,12 @@ down, in `_password`, which stays readable as in 1.x. The errors:
 
 `ServerProxy` raises `ConfigError`, `AuthError` and `RequestError`, as in
 1.x; an Odoo `xmlrpc.client.Fault`, and an answer that is not XML-RPC,
-come through it as xmlrpc.client raises them. The CLI, which goes through
+come through it as xmlrpc.client raises them. So does an error of
+xmlrpc.client's marshal, for a value it cannot write (a set, an int beyond
+32 bits). Raw, as in 1.x, these keep the traceback of xmlrpc.client, whose
+frames hold the call's arguments, the password among them: a test runner
+or a debugger that prints each frame's locals (`pytest -l`) shows it.
+`Client` raises none of them raw. The CLI, which goes through
 `Client`, prints each of its errors on one line but an `OdooError`, whose
 message ends with Odoo's, as it came (§ CLI usage).
 
