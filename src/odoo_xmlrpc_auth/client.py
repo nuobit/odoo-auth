@@ -86,7 +86,10 @@ class _ReadTimeout(socket.timeout):
 # What a call raises in its transport: the socket's and TLS's errors, a
 # malformed HTTP answer, an HTTP status other than 200, every error of
 # requests, which are OSErrors, and an answer that is not XML-RPC. An Odoo
-# Fault is the server's answer, not one of them.
+# Fault is the server's answer, not one of them. IDNA's refusal of the host
+# (a UnicodeError over XML-RPC, urllib3's LocationParseError over JSON-2)
+# is not either: the load refuses such a host with the same codec
+# (_idna_refuses).
 _TRANSPORT_ERRORS = (
     OSError,
     http.client.HTTPException,
@@ -555,7 +558,7 @@ def _url_fault(url):
     """The fault of ``url``, as the end of a sentence about it, or None
     when it names a host after one of _URL_SCHEMES, with a port from 1 to
     65535 if it has one, no user or password and no backslash, on one line
-    of printable ASCII without spaces.
+    of printable ASCII without spaces, and a host IDNA takes.
 
     The transport quotes a url it refuses: the fault quotes no part of the
     url, not even its scheme, and is returned, never raised, so that the
@@ -584,6 +587,11 @@ def _url_fault(url):
             + " or ".join(f"{scheme}://" for scheme in _URL_SCHEMES)
             + " and name a host"
         )
+    elif _idna_refuses(parts.hostname):
+        fault = (
+            "must name a host with no empty label between its dots, and none "
+            "longer than 63 characters"
+        )
     elif "@" in parts.netloc:
         fault = "must have no user or password before its host"
     elif "\\" in url:
@@ -596,6 +604,24 @@ def _url_fault(url):
     else:
         fault = None
     return fault
+
+
+def _idna_refuses(hostname):
+    """Whether IDNA refuses ``hostname``, the host of a url of printable
+    ASCII: for a label empty, or longer than 63 characters.
+
+    Both transports encode the host with Python's IDNA codec before they
+    look it up (socket.getaddrinfo over XML-RPC, urllib3's
+    create_connection over JSON-2), and its refusal is a UnicodeError, or
+    urllib3's LocationParseError, that quotes the host: the load refuses
+    such a host, so that no call meets either.
+    """
+    refused = False
+    try:
+        hostname.encode("idna")
+    except UnicodeError:
+        refused = True
+    return refused
 
 
 def _check_json2(profile, config, config_path):

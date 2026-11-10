@@ -440,6 +440,18 @@ class NotXmlRpcTest(StubTestCase):
             ["/xmlrpc/2/common"] * len(self.ANSWERS),
         )
 
+    def test_server_proxy_raises_an_answer_that_is_not_xml_rpc_as_xmlrpc_client(self):
+        # As in 1.x (README): here, the UnicodeEncodeError of base64 outside
+        # ASCII, which Client's parser turns into a ResponseError.
+        odoo = self.start(RawXmlRpc())
+        odoo.call_answer = self.ANSWERS["UnicodeEncodeError: base64 outside ASCII"]
+        self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+        with ServerProxy(profile="erp") as proxy:
+            error = self.raised(
+                UnicodeEncodeError, lambda: proxy.execute_kw("res.partner", "search", [[]])
+            )
+        self.assertNotIsInstance(error, RequestError)
+
 
 class Json2ClientTest(StubTestCase):
     def setUp(self):

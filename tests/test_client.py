@@ -36,6 +36,7 @@ from odoo_xmlrpc_auth.client import (
     ServerProxy,
     _read_config,
     _Secret,
+    _send,
 )
 from support import KEY, PASSWORD, StoreMixin
 
@@ -269,6 +270,34 @@ class UrlTest(StoreTestCase):
         ):
             ServerProxy(profile="erp")
         self.common.authenticate.assert_not_called()
+
+    def test_a_host_that_idna_refuses_is_refused_unshown(self):
+        # Both transports encode the host with IDNA before its lookup, and
+        # its refusal quotes the host: an empty label, a label of 64.
+        hosts = {
+            "an empty label": "odoo..example.invalid",
+            "a leading dot": ".odoo.example.invalid",
+            "a label of 64": "a" * 64 + ".example.invalid",
+        }
+        for case, host in hosts.items():
+            with self.subTest(case=case):
+                self.make_store_with_url(f"http://{host}:8069")
+                error = self.raised(ConfigError, lambda: ServerProxy(profile="erp"))
+                self.assertIn(
+                    "must name a host with no empty label between its dots, and "
+                    "none longer than 63 characters",
+                    str(error),
+                )
+                self.assertNeverShows(error, "example.invalid")
+                self.assertNoFrameHolds(error, "example.invalid")
+        self.common.authenticate.assert_not_called()
+
+    def test_a_host_ending_in_a_dot_passes(self):
+        # The root's empty label, which IDNA takes.
+        self.make_store_with_url("https://odoo.example.com.")
+        self.common.authenticate.return_value = 7
+        ServerProxy(profile="erp")
+        self.common.authenticate.assert_called_once()
 
     def test_no_frame_of_a_refused_url_holds_its_secret(self):
         # A debugger or `pytest -l` prints each frame's locals: the check's
