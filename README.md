@@ -284,14 +284,21 @@ down, in `_password`, which stays readable as in 1.x. The errors:
 - `OdooError`: Odoo answers the call with an error, an XML-RPC `Fault`
   (the login's too, such as Odoo's for a `db` it does not hold) or a JSON-2
   error body. It carries the profile (`profile`), Odoo's code for it
-  (`code`: the Fault's `faultCode`, or the HTTP status over JSON-2) and
+  (`code`: the Fault's `faultCode`, an int as Odoo's are, or else its text,
+  masked as the message, a base64 value read as UTF-8 as Odoo writes its
+  texts, the message's too, and a value `str()` cannot write, nested deeper
+  than it follows, as `<a list str() could not write: RecursionError>`, the
+  message's too; the HTTP status over JSON-2) and
   Odoo's message (`message`), which shows `***` wherever it held the
   profile's password or API key: as it is, or escaped as Python's `repr`
   or `ascii` writes it, between either quotes, or its UTF-8 bytes, or as
   JSON writes it, and each of these inside any number of reprs of a text
   that holds it (a `repr` of a `repr`). Another encoder over a `repr`,
   such as the JSON of a text a `repr` wrote, is not covered: such a
-  message can show them.
+  message can show them. Nor is a base64 value that holds the password
+  or the API key in another encoding than UTF-8: it is read as UTF-8, as
+  Odoo writes its texts, and can show it as another text, such as `pw_é`
+  for the Latin-1 bytes of `pw_Ã©`.
 - `ArgumentError`: a call `Client` cannot send, refused before anything is
   sent, the login included: `ids` that are not a list, a model or a method
   that is not a name (not a string, empty, `.` or `..`, or holding a
