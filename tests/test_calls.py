@@ -120,6 +120,60 @@ class XmlRpcClientTest(StubTestCase):
             ],
         )
 
+    def test_execute_kw_sends_its_args_and_kwargs_as_they_are(self):
+        self.odoo.answers[("res.partner", "search")] = [7]
+        result = self.client.execute_kw(
+            "res.partner", "search", [[["name", "=", "Example"]]], {"limit": 1}
+        )
+        self.assertEqual(result, [7])
+        self.assertEqual(
+            self.odoo.calls,
+            [
+                {
+                    "model": "res.partner",
+                    "method": "search",
+                    "args": [[["name", "=", "Example"]]],
+                    "kwargs": {"limit": 1},
+                }
+            ],
+        )
+
+    def test_execute_kw_without_kwargs_sends_none(self):
+        self.odoo.answers[("res.partner", "search_count")] = 3
+        self.assertEqual(self.client.execute_kw("res.partner", "search_count", [[]]), 3)
+        self.assertEqual(self.odoo.calls[0]["kwargs"], {})
+
+    def test_execute_kw_refuses_args_or_kwargs_of_another_type_unsent(self):
+        refusals = {
+            "args not a list": (
+                ("res.partner", "search", {"domain": []}),
+                "args must be the list of execute_kw's positional arguments",
+            ),
+            "kwargs not a dict": (
+                ("res.partner", "search", [[]], [("limit", 1)]),
+                "kwargs must be None or the dict of execute_kw's named arguments",
+            ),
+        }
+        for case, (arguments, reason) in refusals.items():
+            with self.subTest(case=case):
+                error = self.raised(
+                    TypeError, lambda: self.client.execute_kw(*arguments)
+                )
+                self.assertIsInstance(error, ArgumentError)
+                self.assertEqual(error.reason, reason)
+        self.assertEqual((self.odoo.logins, self.odoo.calls), (0, []))
+
+    def test_execute_kw_refuses_a_json2_profile_unsent(self):
+        odoo = self.start(Json2Odoo())
+        client = self.make_client(odoo.url, "json2", KEY, "erp-json2")
+        with self.assertRaisesRegex(
+            ConfigError,
+            r"^Profile 'erp-json2' has `api = json2`, and execute_kw sends "
+            r"XML-RPC's positional arguments: give them by name to Client\.call$",
+        ):
+            client.execute_kw("res.partner", "search", [[]])
+        self.assertEqual(odoo.requests, [])
+
     def test_a_method_of_the_model_gets_no_positional_argument(self):
         # fields_get has no leading parameter that goes positionally.
         self.odoo.answers[("res.partner", "fields_get")] = {}
