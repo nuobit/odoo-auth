@@ -190,11 +190,14 @@ class OdooError(Exception):
     XML-RPC Fault, or an error body over JSON-2.
 
     It carries the profile (``profile``), Odoo's code for the error
-    (``code``: the Fault's faultCode over XML-RPC, the HTTP status over
-    JSON-2) and Odoo's message (``message``), the text a caller debugs with,
-    which shows *** wherever it held the profile's password or API key.
-    Nothing of the request is kept: not its url, its headers or its
-    arguments.
+    (``code``: over XML-RPC the Fault's faultCode, an int as Odoo's are, or
+    else its text, masked as the message; over JSON-2 the HTTP status) and
+    Odoo's message (``message``), the text a caller debugs with, which shows
+    *** wherever it held the profile's password or API key. A Fault's code
+    or text that is a base64 value is read as UTF-8, as Odoo writes its
+    texts, and one str() cannot write, nested deeper than it follows, is
+    written as that (_fault_text). Nothing of the request is kept: not its
+    url, its headers or its arguments.
     """
 
     def __init__(self, profile, code, message):
@@ -1240,10 +1243,17 @@ class _XmlRpc:
                 ),
             )
         except xmlrpc.client.Fault as fault:
+            password = self._config["password"]
             failure = OdooError(
                 self._profile,
-                fault.faultCode,
-                self._config["password"].hidden(str(fault.faultString)),
+                # Odoo's codes are ints. The decoder takes any value, a text
+                # among them, which can quote the password like the message.
+                (
+                    fault.faultCode
+                    if isinstance(fault.faultCode, int)
+                    else password.hidden(_fault_text(fault.faultCode))
+                ),
+                password.hidden(_fault_text(fault.faultString)),
             )
         if failure is not None:
             raise failure
@@ -1292,6 +1302,34 @@ class _XmlRpc:
 
     def close(self):
         self._transport.close()
+
+
+def _fault_text(value):
+    """``value``, a Fault's code that is no int or its text, as the text the
+    mask reads: a base64 value's bytes read as UTF-8, in which Odoo writes
+    its texts, each byte UTF-8 does not take as a backslash escape, as ascii
+    writes it; any other value as str() writes it. str() reads a base64
+    value's bytes as Latin-1 (xmlrpc.client's Binary.__str__), a form the
+    mask does not take, through which a password outside ASCII would show.
+    A password a base64 value holds in another encoding than UTF-8 can
+    show as another text, which the mask does not take either: pw_é for
+    the Latin-1 bytes of pw_Ã© (the README says so).
+
+    It raises nothing: it runs in the block that handles the Fault, whose
+    traceback's frames hold the password, and an error raised there would
+    hold the Fault as its context. A value str() cannot write, nested deeper
+    than it follows, such as an array of arrays the decoder reads at any
+    depth (or written from a stack already close to the recursion limit:
+    one class, RecursionError, for both causes), is written as that, with
+    its type: <a list str() could not write: RecursionError>."""
+    if isinstance(value, xmlrpc.client.Binary):
+        text = value.data.decode("utf-8", "backslashreplace")
+    else:
+        try:
+            text = str(value)
+        except RecursionError:
+            text = f"<a {type(value).__name__} str() could not write: RecursionError>"
+    return text
 
 
 class _Json2:

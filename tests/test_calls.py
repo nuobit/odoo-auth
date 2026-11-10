@@ -437,6 +437,85 @@ class XmlRpcClientTest(StubTestCase):
         )
         self.assertNeverShows(caught.exception, PASSWORD)
 
+    def test_a_fault_code_that_is_no_int_is_its_text_masked(self):
+        # Odoo's codes are ints, which stay ints (above). The decoder takes
+        # any value, which can quote the password like the message.
+        codes = {
+            "a text": (f"denied for {PASSWORD}", "denied for ***"),
+            "a list": ([f"denied for {PASSWORD}"], "['denied for ***']"),
+        }
+        for case, (code, masked) in codes.items():
+            with self.subTest(case=case):
+                self.odoo.answers[("res.partner", "unlink")] = xmlrpc.client.Fault(
+                    code, "Access denied"
+                )
+                error = self.raised(
+                    OdooError, lambda: self.client.call("res.partner", "unlink", [7])
+                )
+                self.assertEqual(error.code, masked)
+                self.assertNeverShows(error, PASSWORD)
+                self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_a_fault_whose_code_or_text_is_base64_hides_the_password(self):
+        # Odoo writes texts, in UTF-8; a base64 value is bytes, which
+        # xmlrpc.client gives as a Binary, whose str() reads them as Latin-1.
+        password = "odoo_dummy_pàss_test"
+        self.odoo.password = password
+        cases = {
+            "UTF-8": (password.encode("utf-8"), "denied for ***"),
+            "Latin-1": (password.encode("latin-1"), "denied for ***"),
+        }
+        client = self.make_client(self.odoo.url, "xmlrpc", password, "binary")
+        for case, (written, masked) in cases.items():
+            with self.subTest(case=case):
+                text = xmlrpc.client.Binary(b"denied for " + written)
+                self.odoo.answers[("res.partner", "unlink")] = xmlrpc.client.Fault(text, text)
+                error = self.raised(
+                    OdooError, lambda: client.call("res.partner", "unlink", [7])
+                )
+                self.assertEqual((error.code, error.message), (masked, masked))
+                self.assertNeverShows(error, password)
+                self.assertNotIn(password.encode("utf-8").decode("latin-1"), str(error))
+
+    def test_a_fault_nested_deeper_than_str_follows_raises_nothing_over_it(self):
+        # The decoder reads an array of arrays at any depth, as a Fault's
+        # code or text too, and str() of one nested deeper than it follows
+        # raised RecursionError in the block that handles the Fault, the
+        # Fault as its context, whose frames hold the password. How deep
+        # str() follows differs from one Python to the next: under 1,000
+        # deep on 3.11, past 64,000 on 3.14.2. The value is nested deeper
+        # than str() follows on the Python that runs the test.
+        depth = _deeper_than_str_follows()
+        nested = (
+            "<value><array><data>" * depth
+            + "<value><int>1</int></value>"
+            + "</data></array></value>" * depth
+        )
+        # The code and the message each case's error carries.
+        written = "<a list str() could not write: RecursionError>"
+        cases = {
+            "its text": ("<value><int>1</int></value>", nested, (1, written)),
+            "its code": (nested, "<value><string>denied</string></value>", (written, "denied")),
+        }
+        for case, (code, text, carried) in cases.items():
+            with self.subTest(case=case):
+                stub = self.start(RawXmlRpc())
+                stub.call_answer = Answer(
+                    200,
+                    (
+                        "<?xml version='1.0'?><methodResponse><fault><value><struct>"
+                        f"<member><name>faultCode</name>{code}</member>"
+                        f"<member><name>faultString</name>{text}</member>"
+                        "</struct></value></fault></methodResponse>"
+                    ).encode(),
+                    {"Content-Type": "text/xml"},
+                )
+                client = self.make_client(stub.url, "xmlrpc", PASSWORD, "nested")
+                error = self.raised(OdooError, lambda: client.call("res.partner", "read", [7]))
+                self.assertEqual((error.code, error.message), carried)
+                self.assertNeverShows(error, PASSWORD)
+                self.assertNoFrameHolds(error, PASSWORD)
+
     def test_a_fault_quoting_the_password_escaped_hides_it_too(self):
         # Odoo writes a value in an error as Python's repr does, and JSON as
         # json.dumps does: such a password differs in each.
@@ -993,6 +1072,17 @@ def _encodes(encode, depth):
     except RecursionError:
         return False
     return True
+
+
+def _deeper_than_str_follows():
+    """A depth of lists nested in lists that str() cannot write on the
+    running Python: the first of 1,000, 2,000, 4,000 and so on at which it
+    raises RecursionError, called from here. A call writes from a few
+    frames deeper, where str() follows no deeper."""
+    depth = 1_000
+    while _encodes(str, depth):
+        depth *= 2
+    return depth
 
 
 class ArgumentTest(StubTestCase):
