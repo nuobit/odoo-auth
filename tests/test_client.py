@@ -270,6 +270,26 @@ class UrlTest(StoreTestCase):
             ServerProxy(profile="erp")
         self.common.authenticate.assert_not_called()
 
+    def test_no_frame_of_a_refused_url_holds_its_secret(self):
+        # A debugger or `pytest -l` prints each frame's locals: the check's
+        # frames held the url and its parts.
+        urls = {
+            "user info": (
+                "https://odoo_user_test:odoo_other_secret_test@odoo.example.com"
+            ),
+            "port that is not a number": (
+                "https://odoo_user_test:odoo_other_secret_test"
+            ),
+            "unsplittable": (
+                "https://odoo_user_test:odoo_other_secret_test／@odoo.example.com"
+            ),
+        }
+        for case, url in urls.items():
+            with self.subTest(case=case):
+                self.make_store_with_url(url)
+                error = self.raised(ConfigError, lambda: ServerProxy(profile="erp"))
+                self.assertNoFrameHolds(error, SECRET)
+
     def test_a_url_with_a_port_passes(self):
         self.make_store_with_url("https://odoo.example.com:8069")
         self.common.authenticate.return_value = 7
@@ -700,8 +720,8 @@ class PublicFieldTest(StoreTestCase):
         self.common.authenticate.assert_not_called()
 
     def test_a_url_line_holding_the_password_is_refused_for_holding_it(self):
-        # The url checks would refuse this url too, in a frame that holds it:
-        # the check for the password comes first.
+        # The url checks would refuse this url too: the check for the
+        # password comes first, and its message says why.
         self.make_store_with(
             "odoo_dummy_password_test", "odoo_db_test", "odoo_user_test", PASSWORD, "xmlrpc"
         )

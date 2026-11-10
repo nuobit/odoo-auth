@@ -538,60 +538,64 @@ def _check_public_fields(profile, section, password, config_path):
             )
 
 
-def _check_url(url, config_path):
-    """Raise ConfigError unless ``url`` names a host after one of
-    _URL_SCHEMES, with a port from 1 to 65535 if it has one, no user or
-    password and no backslash, on one line of printable ASCII without
-    spaces.
+def _check_url(section, config_path):
+    """Raise ConfigError when the url of ``section``, the profile's, has a
+    fault (_url_fault).
 
-    The transport quotes a url it refuses, and a url line that is wrong can
-    hold a secret: no message here quotes any part of the url, not even its
-    scheme. A backslash and port 0 are read one way by urllib.parse, which
-    gives the profile's origin, and another by urllib3, which connects: the
-    host ends at a backslash for urllib3, and it drops port 0 for the
-    scheme's default.
+    A url line that is wrong can hold a secret, such as another account's
+    password before its host: no frame of the error holds the url, and its
+    message quotes no part of it.
     """
-    failure = None
+    fault = _url_fault(section["url"])
+    if fault is not None:
+        raise ConfigError(f"The url in {config_path} {fault}")
+
+
+def _url_fault(url):
+    """The fault of ``url``, as the end of a sentence about it, or None
+    when it names a host after one of _URL_SCHEMES, with a port from 1 to
+    65535 if it has one, no user or password and no backslash, on one line
+    of printable ASCII without spaces.
+
+    The transport quotes a url it refuses: the fault quotes no part of the
+    url, not even its scheme, and is returned, never raised, so that the
+    frame that raises holds no url. A backslash and port 0 are read one way
+    by urllib.parse, which gives the profile's origin, and another by
+    urllib3, which connects: the host ends at a backslash for urllib3, and
+    it drops port 0 for the scheme's default.
+    """
     try:
         parts = urllib.parse.urlsplit(url)
         # urlsplit leaves the port unchecked: reading it raises ValueError
-        # for a port that is not a number.
-        _ = parts.port
+        # for a port that is not a number. Its message can quote the url.
+        port = parts.port
     except ValueError:
-        # Its message can quote the url: ConfigError is raised after this block.
-        failure = ConfigError(f"The url in {config_path} cannot be parsed as a URL")
-    if failure is not None:
-        raise failure
+        parts = None
+    if parts is None:
+        fault = "cannot be parsed as a URL"
     # urlsplit drops line breaks and tabs, and keeps spaces and characters
     # outside ASCII, which the transport refuses with an error that quotes
     # the url.
-    if not _is_one_ascii_line(url):
-        raise ConfigError(
-            f"The url in {config_path} must be one line of printable ASCII "
-            "without spaces"
-        )
+    elif not _is_one_ascii_line(url):
+        fault = "must be one line of printable ASCII without spaces"
     elif parts.scheme not in _URL_SCHEMES or not parts.hostname:
-        raise ConfigError(
-            f"The url in {config_path} must start with "
+        fault = (
+            "must start with "
             + " or ".join(f"{scheme}://" for scheme in _URL_SCHEMES)
             + " and name a host"
         )
     elif "@" in parts.netloc:
-        raise ConfigError(
-            f"The url in {config_path} must have no user or password before "
-            "its host"
-        )
+        fault = "must have no user or password before its host"
     elif "\\" in url:
-        raise ConfigError(
-            f"The url in {config_path} must hold no backslash: the JSON-2 "
-            "transport ends the host at one, and would send the calls to "
-            "another host"
+        fault = (
+            "must hold no backslash: the JSON-2 transport ends the host at "
+            "one, and would send the calls to another host"
         )
-    elif parts.port == 0:
-        raise ConfigError(
-            f"The url in {config_path} must name a port from 1 to 65535, if "
-            "it names one"
-        )
+    elif port == 0:
+        fault = "must name a port from 1 to 65535, if it names one"
+    else:
+        fault = None
+    return fault
 
 
 def _check_json2(profile, config, config_path):
@@ -692,7 +696,7 @@ def _checked_config(profile, section, config_path):
     password = _Secret(section["password"])
     # Before the checks whose frames hold a public value in a local.
     _check_public_fields(profile, section, password, config_path)
-    _check_url(section["url"], config_path)
+    _check_url(section, config_path)
     config = {
         "url": section["url"].rstrip("/"),
         "db": section["db"],
