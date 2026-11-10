@@ -1637,10 +1637,29 @@ class CliTest(StubTestCase):
         self.assertEqual((code, out), (1, ""))
         self.assertEqual(
             err,
-            "Error: 'args' is for `api = xmlrpc` profiles, and profile 'erp-json2' has "
-            "`api = json2`: give 'ids' and 'kwargs' instead\n",
+            "Error: Profile 'erp-json2' has `api = json2`, and execute_kw sends "
+            "XML-RPC's positional arguments: give them by name to Client.call\n",
         )
         self.assertEqual(self.json2_odoo.requests, [])
+
+    def test_kwargs_left_out_or_null_are_no_named_argument_in_either_form(self):
+        self.xmlrpc_odoo.answers[("res.partner", "search_count")] = 3
+        self.json2_odoo.answers[("res.partner", "search_count")] = 3
+        call = {"model": "res.partner", "method": "search_count"}
+        payloads = [
+            ("erp-xmlrpc", {**call, "kwargs": None}),
+            ("erp-json2", {**call, "kwargs": None}),
+            ("erp-xmlrpc", {**call, "args": [[]], "kwargs": None}),
+            ("erp-xmlrpc", {**call, "args": [[]]}),
+        ]
+        for profile, payload in payloads:
+            with self.subTest(profile=profile, payload=payload):
+                self.assertEqual(self.run_cli(profile, payload), (0, "3\n", ""))
+        self.assertEqual(
+            [(sent["args"], sent["kwargs"]) for sent in self.xmlrpc_odoo.calls],
+            [([], {}), ([[]], {}), ([[]], {})],
+        )
+        self.assertEqual(json.loads(self.json2_odoo.requests[0]["body"]), {})
 
     def test_an_odoo_error_is_printed_on_stderr(self):
         self.json2_odoo.answers[("res.partner", "write")] = Answer(
@@ -1657,23 +1676,24 @@ class CliTest(StubTestCase):
             "(code 422): Wrong value\n",
         )
 
-    def test_a_payload_that_is_not_a_call_is_refused_before_any_call(self):
+    def test_a_payload_that_is_not_a_call_is_refused_before_its_profile_is_read(self):
+        # The payload's message, also for a profile that does not exist.
         call = {"model": "res.partner", "method": "read"}
         refused = {
             "[]": "the JSON payload must be an object",
             json.dumps({"model": "res.partner"}): "missing 'method' in JSON payload",
-            json.dumps({**call, "model": 5}): "'model' in the JSON payload must be a string",
             json.dumps({**call, "kwarg": {}}): "unknown keys in the JSON payload: kwarg",
             json.dumps({**call, "ids": [7], "args": [[7]]}): (
                 "give 'ids' or 'args' in the JSON payload, not both"
             ),
-            json.dumps({**call, "ids": 7}): "'ids' in the JSON payload must be a list",
-            json.dumps({**call, "args": {}}): "'args' in the JSON payload must be a list",
             json.dumps({**call, "kwargs": []}): "'kwargs' in the JSON payload must be an object",
+            json.dumps({**call, "kwargs": {"ids": [7]}}): (
+                "'ids' goes at the top of the JSON payload, not in 'kwargs'"
+            ),
         }
         for payload, message in refused.items():
             with self.subTest(payload=payload):
-                for profile in ("erp-xmlrpc", "erp-json2"):
+                for profile in ("erp-xmlrpc", "erp-json2", "no-such-profile"):
                     code, out, err = self.run_cli(profile, payload)
                     self.assertEqual((code, out, err), (1, "", f"Error: {message}\n"))
         self.assertEqual((self.xmlrpc_odoo.logins, self.json2_odoo.requests), (0, []))
@@ -1756,6 +1776,43 @@ class CliTest(StubTestCase):
                 "erp-xmlrpc",
                 {"model": "res.partner", "method": "read", "args": [[2**40]]},
                 "int exceeds XML-RPC limits",
+            ),
+            (
+                "erp-xmlrpc",
+                {"model": 5, "method": "read", "ids": [7]},
+                "A model and a method are names: both must be strings",
+            ),
+            (
+                "erp-json2",
+                {"model": "res.partner", "method": ["read"]},
+                "A model and a method are names: both must be strings",
+            ),
+            (
+                "erp-xmlrpc",
+                {"model": "res.partner", "method": None, "args": [[7]]},
+                "A model and a method are names: both must be strings",
+            ),
+            (
+                "erp-xmlrpc",
+                {"model": "res.partner", "method": "read", "ids": 7},
+                "ids must be None, for a method of the model, or a list of the "
+                "records' ids",
+            ),
+            (
+                "erp-json2",
+                {"model": "res.partner", "method": "read", "ids": {"id": 7}},
+                "ids must be None, for a method of the model, or a list of the "
+                "records' ids",
+            ),
+            (
+                "erp-xmlrpc",
+                {"model": "res.partner", "method": "read", "args": {"ids": [7]}},
+                "args must be the list of execute_kw's positional arguments",
+            ),
+            (
+                "erp-xmlrpc",
+                {"model": "res.partner", "method": "read", "args": [[7]], "kwargs": []},
+                "kwargs must be None or the dict of execute_kw's named arguments",
             ),
         ]
         for profile, payload, reason in refusals:
