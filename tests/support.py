@@ -16,6 +16,8 @@ import xmlrpc.client
 import xmlrpc.server
 from unittest import mock
 
+import requests
+
 # Dummy values of the stores; never a real credential. KEY has the shape of
 # an Odoo API key, 40 lowercase hexadecimal digits.
 KEY = "feedface" * 5
@@ -98,11 +100,21 @@ def _shown(local):
     """What a printer of a frame's locals shows of ``local``: its repr, or
     nothing when the repr fails, as it does for an object whose __init__
     raised before setting what its repr reads, or a value nested deeper than
-    repr follows (pytest prints a placeholder instead)."""
+    repr follows (pytest prints a placeholder instead).
+
+    For an answer or a request of requests, whose repr shows only a status
+    or a method, also what a debugger shows one attribute down: the
+    answer's body, and the request's headers and body, which carry the
+    key (``response.request.headers``)."""
     try:
-        return repr(local)
+        shown = repr(local)
     except (AttributeError, RecursionError):
-        return ""
+        shown = ""
+    if isinstance(local, requests.Response):
+        shown += repr(local.content) + _shown(local.request)
+    elif isinstance(local, requests.PreparedRequest):
+        shown += repr(local.headers) + repr(local.body)
+    return shown
 
 
 def free_port():
