@@ -894,6 +894,25 @@ def _log_in(profile, config, transport=None):
     return uid
 
 
+def _sendable_uid(profile, uid):
+    """(None, ``uid``) when ``uid``, the one Client's login of ``profile``
+    got, is one every call can send back: an int from 1 to
+    xmlrpc.client.MAXINT. Else (the RequestError the login raises, None).
+
+    Odoo answers the id of a row of its users, an int of 32 bits; for any
+    other answer the login raises RequestError, standing for an answer that
+    is not XML-RPC's, as xmlrpc.client would refuse to marshal an int beyond
+    32 bits in each call, from frames that hold the password. Returned, not
+    raised: the frame that raises it holds no answer of the login's, which
+    can echo the password. ServerProxy keeps the uid it gets, as in 1.x.
+    """
+    if type(uid) is int and 0 < uid <= xmlrpc.client.MAXINT:
+        outcome = (None, uid)
+    else:
+        outcome = (_request_error(profile, _InvalidAnswer()), None)
+    return outcome
+
+
 def _send(profile, call):
     """Return ``call()``, a call of ``profile``, raising RequestError instead
     of an error of its transport.
@@ -1164,8 +1183,7 @@ class _XmlRpc:
         try:
             # The login's Fault too, such as a db the server does not hold,
             # is an error Odoo answers.
-            if self._uid is None:
-                self._uid = _log_in(self._profile, self._config, self._transport)
+            self._log_in_once()
             result = _send(
                 self._profile,
                 lambda: self._object.execute_kw(
@@ -1187,6 +1205,17 @@ class _XmlRpc:
         if failure is not None:
             raise failure
         return result
+
+    def _log_in_once(self):
+        """Log in at the first call, for the uid every call sends. Raises
+        the RequestError of a uid no call can send (_sendable_uid) from
+        this frame, which holds no answer of the login's."""
+        if self._uid is None:
+            failure, self._uid = _sendable_uid(
+                self._profile, _log_in(self._profile, self._config, self._transport)
+            )
+            if failure is not None:
+                raise failure
 
     def _check_marshallable(self, model, method, args, kwargs):
         """Raise ArgumentError, before anything is sent, for a value of the
