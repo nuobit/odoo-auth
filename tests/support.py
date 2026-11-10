@@ -30,8 +30,10 @@ UID = 7
 class StoreMixin:
     """A store under a temporary HOME, for a unittest.TestCase."""
 
-    def use_home(self):
-        home = tempfile.TemporaryDirectory()
+    def use_home(self, prefix=None):
+        """A temporary HOME for the test, whose folder's name starts with
+        ``prefix`` when one is given."""
+        home = tempfile.TemporaryDirectory(prefix=prefix)
         self.addCleanup(home.cleanup)
         patcher = mock.patch.dict(os.environ, {"HOME": home.name})
         patcher.start()

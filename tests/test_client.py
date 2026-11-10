@@ -29,9 +29,11 @@ from unittest import mock
 
 from odoo_xmlrpc_auth import cli
 from odoo_xmlrpc_auth.client import (
+    ArgumentError,
     AuthError,
     Client,
     ConfigError,
+    OdooError,
     RequestError,
     ServerProxy,
     _read_config,
@@ -891,6 +893,188 @@ class CallTest(StoreTestCase):
         self.assertEqual(caught.exception.faultString, "Record does not exist")
 
 
+class OneLineTest(StoreTestCase):
+    """Each message the library writes itself is one line. A path, the name
+    of a type, a code or an encoder's text that holds a line break or
+    another control character shows quoted and escaped as repr writes it,
+    as a profile's name always does; Odoo's message ends an OdooError as it
+    came."""
+
+    XMLRPC_STORE = (
+        "[odoo]\n"
+        "url = https://odoo.example.com\n"
+        "db = odoo_db_test\n"
+        "user = odoo_user_test\n"
+        "password = odoo_dummy_password_test\n"
+        "api = xmlrpc\n"
+    )
+
+    def test_a_profile_name_holding_a_newline_is_quoted_escaped(self):
+        self.use_home()
+        error = self.raised(ConfigError, lambda: Client(profile="erp/\nnext"))
+        self.assertEqual(str(error), "Invalid profile name: 'erp/\\nnext'")
+        error = self.raised(ConfigError, lambda: Client(profile="erp\nnext"))
+        self.assertRegex(
+            str(error),
+            r"\AConfig file not found: '[^\n]*/erp\\nnext\.conf'\. Create it with "
+            r"a \[odoo\] section, the keys url, db, user, password, and the line "
+            r"`api = xmlrpc` or `api = json2`\Z",
+        )
+
+    def test_each_message_naming_a_profiles_file_quotes_its_path_escaped(self):
+        # Every check of the store after its file is found, for a profile
+        # whose name holds a newline: the path of its file holds it too.
+        path = r"'[^\n]*/erp\\nnext\.conf'"
+        store = self.XMLRPC_STORE
+        stores = {
+            "not INI": ("odoo_dummy_password_test\n", rf"\A{path} is not a valid INI file\. "),
+            "no section": ("[other]\nkey = value\n", rf"\AMissing \[odoo\] section in {path}\Z"),
+            "a key missing": (
+                "[odoo]\nurl = https://odoo.example.com\n",
+                rf"\AMissing keys in {path}: db, user, password\Z",
+            ),
+            "no api line": (
+                store.replace("api = xmlrpc\n", ""),
+                rf"\AProfile 'erp\\nnext' has no api line: add [^\n]* section of {path}\Z",
+            ),
+            "another api": (
+                store.replace("api = xmlrpc", "api = soap"),
+                rf"\AThe api line of profile 'erp\\nnext' must be [^\n]*, in {path}\. ",
+            ),
+            "a user holding the password": (
+                store.replace("user = odoo_user_test", "user = odoo_dummy_password_test"),
+                rf"\AThe user of profile 'erp\\nnext', in {path}, holds its password\. ",
+            ),
+            "a url with another scheme": (
+                store.replace("https://", "ftp://"),
+                rf"\AThe url in {path} must start with ",
+            ),
+            "a json2 password that is no API key": (
+                store.replace("api = xmlrpc", "api = json2"),
+                rf"\AThe password of profile 'erp\\nnext', in {path}, must be an Odoo ",
+            ),
+            "a json2 db with a space": (
+                store.replace("api = xmlrpc", "api = json2")
+                .replace("odoo_dummy_password_test", KEY)
+                .replace("db = odoo_db_test", "db = odoo db test"),
+                rf"\AThe db of profile 'erp\\nnext', in {path}, must be one line ",
+            ),
+        }
+        for case, (text, message) in stores.items():
+            with self.subTest(case=case):
+                self.make_store(text, profile="erp\nnext")
+                error = self.raised(ConfigError, lambda: Client(profile="erp\nnext"))
+                self.assertRegex(str(error), message)
+                self.assertNotIn("\n", str(error))
+        with self.subTest(case="open to others"):
+            self.make_store(store, profile="erp\nnext")
+            os.chmod(os.path.join(self._store_folder, "erp\nnext.conf"), 0o644)
+            error = self.raised(ConfigError, lambda: Client(profile="erp\nnext"))
+            self.assertRegex(
+                str(error),
+                rf"\A{path} is accessible by others\. Fix with: chmod 600 {path}\Z",
+            )
+        with self.subTest(case="a folder in the file's place"):
+            os.remove(os.path.join(self._store_folder, "erp\nnext.conf"))
+            os.makedirs(os.path.join(self._store_folder, "erp\nnext.conf"))
+            error = self.raised(ConfigError, lambda: Client(profile="erp\nnext"))
+            self.assertRegex(
+                str(error),
+                rf"\A{path} cannot be read \(Is a directory\): it must be a file this "
+                r"user can read\.\Z",
+            )
+
+    def test_a_path_holding_a_newline_is_quoted_escaped(self):
+        # The store's folder is under HOME, whose path holds the newline.
+        home = self.use_home(prefix="home\nnext")
+        error = self.raised(ConfigError, lambda: Client(profile="erp"))
+        self.assertRegex(
+            str(error), r"\AConfig file not found: '[^\n]*home\\nnext[^\n]*/erp\.conf'\. "
+        )
+        folder = os.path.join(home, ".config", "odoo-xmlrpc-auth")
+        os.makedirs(folder)
+        os.chmod(folder, 0o755)
+        error = self.raised(ConfigError, lambda: Client(profile="erp"))
+        self.assertRegex(
+            str(error),
+            r"\A'[^\n]*home\\nnext[^\n]*/odoo-xmlrpc-auth' is accessible by others\. "
+            r"Fix with: chmod 700 '[^\n]*home\\nnext[^\n]*/odoo-xmlrpc-auth'\Z",
+        )
+
+    def test_a_type_name_or_a_code_holding_a_newline_is_quoted_escaped(self):
+        weird = type("Weird\nError", (OSError,), {})
+
+        def fail():
+            # An OSError of two arguments takes the first as its errno.
+            raise weird("5\nsix", "Weird failure")
+
+        error = self.raised(RequestError, lambda: _send("erp", fail))
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: 'Weird\\nError', code '5\\nsix'. "
+            "Its message is not shown, as it can quote the profile's values.",
+        )
+
+    def test_a_reason_naming_a_type_with_a_newline_is_quoted_escaped(self):
+        # xmlrpc.client refuses a subclass of a type it knows, and json any
+        # type it does not, each naming the type in its text.
+        self.make_store(self.XMLRPC_STORE)
+        self.make_store(
+            "[odoo]\n"
+            "url = https://odoo.example.com\n"
+            "db = odoo_db_test\n"
+            "user = odoo_user_test\n"
+            f"password = {KEY}\n"
+            "api = json2\n",
+            profile="erp-json2",
+        )
+        refusals = {
+            "erp": (
+                type("Weird\nValue", (int,), {"__module__": "values"})(5),
+                "A call of profile 'erp' cannot be sent: "
+                "\"cannot marshal <class 'values.Weird\\nValue'> objects\"",
+            ),
+            "erp-json2": (
+                type("Weird\nValue", (), {})(),
+                "A call of profile 'erp-json2' cannot be sent: "
+                "'Object of type Weird\\nValue is not JSON serializable'",
+            ),
+        }
+        for profile, (value, message) in refusals.items():
+            with self.subTest(profile=profile):
+                with Client(profile=profile) as odoo:
+                    error = self.raised(
+                        ArgumentError,
+                        lambda: odoo.call("res.partner", "write", [7], vals=value),
+                    )
+                self.assertEqual(str(error), message)
+
+    def test_a_store_that_cannot_be_read_for_an_error_with_no_reason_names_its_type(self):
+        # An OSError with no errno has no strerror: its type's name says why.
+        self.make_store(self.XMLRPC_STORE)
+        weird = type("Weird\nError", (OSError,), {})
+        with mock.patch("odoo_xmlrpc_auth.client.open", side_effect=weird(), create=True):
+            error = self.raised(ConfigError, lambda: Client(profile="erp"))
+        self.assertRegex(
+            str(error),
+            r"\A[^\n]*/erp\.conf cannot be read \('Weird\\nError'\): it must be a "
+            r"file this user can read\.\Z",
+        )
+
+    def test_odoos_code_holding_a_newline_is_quoted_escaped_and_its_message_kept(self):
+        self.make_store(self.XMLRPC_STORE)
+        self.common.authenticate.return_value = 7
+        fault = xmlrpc.client.Fault("4\nfour", "Access denied\non res.partner")
+        with mock.patch.object(xmlrpc.client.Transport, "request", side_effect=fault):
+            with Client(profile="erp") as odoo:
+                error = self.raised(OdooError, lambda: odoo.call("res.partner", "read", [7]))
+        self.assertEqual(
+            str(error),
+            "Odoo answered a call of profile 'erp' with an error (code '4\\nfour'): "
+            "Access denied\non res.partner",
+        )
+
+
 class ScriptsTest(StoreTestCase):
     """Scripts that log in to Odoo's web themselves, to download a report,
     read a profile's values through _read_config, or the password a
@@ -1004,6 +1188,46 @@ class CliTest(StoreTestCase):
             r"\AError: Config file not found: [^\n]*/erp\.conf\. Create it with a "
             r"\[odoo\] section, the keys url, db, user, password, and the line "
             r"`api = xmlrpc` or `api = json2`\n\Z",
+        )
+
+    def run_cli(self, profile, payload='{"model": "res.partner", "method": "search"}'):
+        """Run the CLI on ``payload`` for ``profile``, a call it refuses;
+        return its exit code and its stderr."""
+        argv = ["odoo-xmlrpc-auth", "--profile", profile, payload]
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", argv):
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    cli.main()
+        return caught.exception.code, stderr.getvalue()
+
+    def test_a_profile_name_holding_a_newline_prints_one_line(self):
+        self.use_home()
+        code, err = self.run_cli("erp\nnext")
+        self.assertEqual(code, 1)
+        self.assertRegex(
+            err,
+            r"\AError: Config file not found: '[^\n]*/erp\\nnext\.conf'\. Create it "
+            r"[^\n]*\n\Z",
+        )
+
+    def test_a_path_holding_a_newline_prints_one_line(self):
+        self.use_home(prefix="home\nnext")
+        code, err = self.run_cli("erp")
+        self.assertEqual(code, 1)
+        self.assertRegex(
+            err,
+            r"\AError: Config file not found: '[^\n]*home\\nnext[^\n]*/erp\.conf'\. "
+            r"Create it [^\n]*\n\Z",
+        )
+
+    def test_a_payload_key_holding_a_newline_prints_one_line(self):
+        self.use_home()
+        code, err = self.run_cli(
+            "erp", '{"model": "res.partner", "method": "search", "kw\\narg": 1}'
+        )
+        self.assertEqual(
+            (code, err), (1, "Error: unknown keys in the JSON payload: 'kw\\narg'\n")
         )
 
 

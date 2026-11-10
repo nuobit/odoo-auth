@@ -111,6 +111,17 @@ _JSON_ERRORS = (TypeError, ValueError, RecursionError)
 _NOT_JSON = object()
 
 
+def _one_line(value):
+    """``value``, which a message of the library quotes (a path, the name
+    of a type, a code, the text of an encoder), as the message writes it:
+    as it is when each of its characters prints, else quoted and escaped as
+    repr writes it, so that a line break or another control character in
+    it never spreads the message over lines. A profile's name is always
+    quoted so, with !r."""
+    text = str(value)
+    return text if text.isprintable() else repr(text)
+
+
 class ConfigError(Exception):
     """Raised when a config file is missing, malformed, or insecure, or names
     an API the class that reads it does not speak."""
@@ -163,14 +174,14 @@ class RequestError(Exception):
             super().__init__(str(self))
 
     def __str__(self):
-        code = f", code {self.code}" if self.code is not None else ""
+        code = f", code {_one_line(self.code)}" if self.code is not None else ""
         note = (
             _TIMEOUT_NOTES[self.timeout_fired] if self.timeout_fired is not None else ""
         )
         return (
-            f"A request of profile {self.profile!r} failed: {self.error_class}"
-            f"{code}. {note}Its message is not shown, as it can quote the "
-            "profile's values."
+            f"A request of profile {self.profile!r} failed: "
+            f"{_one_line(self.error_class)}{code}. {note}Its message is not "
+            "shown, as it can quote the profile's values."
         )
 
 
@@ -193,9 +204,10 @@ class OdooError(Exception):
         super().__init__(str(self))
 
     def __str__(self):
+        # Odoo's message ends it as it came, over lines if it has several.
         return (
             f"Odoo answered a call of profile {self.profile!r} with an error "
-            f"(code {self.code}): {self.message}"
+            f"(code {_one_line(self.code)}): {self.message}"
         )
 
 
@@ -221,7 +233,10 @@ class ArgumentError(Exception):
         super().__init__(str(self))
 
     def __str__(self):
-        return f"A call of profile {self.profile!r} cannot be sent: {self.reason}"
+        return (
+            f"A call of profile {self.profile!r} cannot be sent: "
+            f"{_one_line(self.reason)}"
+        )
 
 
 class RedirectError(requests.RequestException):
@@ -496,7 +511,8 @@ def _check_permissions(path, fd=None):
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
         fix = "700" if stat.S_ISDIR(mode) else "600"
         raise ConfigError(
-            f"{path} is accessible by others. Fix with: chmod {fix} {path}"
+            f"{_one_line(path)} is accessible by others. Fix with: chmod {fix} "
+            f"{_one_line(path)}"
         )
 
 
@@ -509,12 +525,13 @@ def _check_api(profile, section, config_path):
     if "api" not in section:
         raise ConfigError(
             f"Profile {profile!r} has no api line: add {_ACCEPTED_API_LINES} "
-            f"to the [{_SECTION}] section of {config_path}"
+            f"to the [{_SECTION}] section of {_one_line(config_path)}"
         )
     elif section["api"] not in _APIS:
         raise ConfigError(
             f"The api line of profile {profile!r} must be "
-            f"{_ACCEPTED_API_LINES}, in {config_path}. Its value is not shown."
+            f"{_ACCEPTED_API_LINES}, in {_one_line(config_path)}. Its value is "
+            "not shown."
         )
 
 
@@ -532,7 +549,7 @@ def _check_public_fields(profile, section, password, config_path):
         # _check_api has refused a profile without the api line.
         if password.occurs_in(section[key]):
             raise ConfigError(
-                f"The {key} of profile {profile!r}, in {config_path}, holds "
+                f"The {key} of profile {profile!r}, in {_one_line(config_path)}, holds "
                 "its password. Either the password was written on the wrong "
                 "line: keep it on the password line only. Or the password is "
                 f"so short or so common that it occurs in the {key}: the "
@@ -551,7 +568,7 @@ def _check_url(section, config_path):
     """
     fault = _url_fault(section["url"])
     if fault is not None:
-        raise ConfigError(f"The url in {config_path} {fault}")
+        raise ConfigError(f"The url in {_one_line(config_path)} {fault}")
 
 
 def _url_fault(url):
@@ -634,15 +651,15 @@ def _check_json2(profile, config, config_path):
     """
     if not _API_KEY.fullmatch(config["password"].reveal()):
         raise ConfigError(
-            f"The password of profile {profile!r}, in {config_path}, must be "
-            "an Odoo API key, 40 lowercase hexadecimal digits: `api = json2` "
-            "takes no other. It is not shown."
+            f"The password of profile {profile!r}, in {_one_line(config_path)}, "
+            "must be an Odoo API key, 40 lowercase hexadecimal digits: "
+            "`api = json2` takes no other. It is not shown."
         )
     if not _is_one_ascii_line(config["db"]):
         raise ConfigError(
-            f"The db of profile {profile!r}, in {config_path}, must be one "
-            "line of printable ASCII without spaces, as JSON-2 sends it in a "
-            "header. It is not shown."
+            f"The db of profile {profile!r}, in {_one_line(config_path)}, must "
+            "be one line of printable ASCII without spaces, as JSON-2 sends it "
+            "in a header. It is not shown."
         )
 
 
@@ -661,7 +678,7 @@ def _read_section(profile):
     The section, not a dict of it: its repr shows no value.
     """
     if os.sep in profile or profile.startswith("."):
-        raise ConfigError(f"Invalid profile name: {profile}")
+        raise ConfigError(f"Invalid profile name: {profile!r}")
     config_dir = os.path.expanduser("~/.config/odoo-xmlrpc-auth")
     config_path = os.path.join(config_dir, f"{profile}.conf")
 
@@ -675,7 +692,7 @@ def _read_section(profile):
     except FileNotFoundError:
         # The folder or the file: the file cannot exist without its folder.
         failure = ConfigError(
-            f"Config file not found: {config_path}. "
+            f"Config file not found: {_one_line(config_path)}. "
             f"Create it with a [{_SECTION}] section, the keys "
             + ", ".join(_REQUIRED_KEYS)
             + f", and the line {_ACCEPTED_API_LINES}"
@@ -685,27 +702,29 @@ def _read_section(profile):
         # the system gives, which quotes nothing of the store.
         reason = error.strerror if error.strerror is not None else type(error).__name__
         failure = ConfigError(
-            f"{config_path} cannot be read ({reason}): it must be a file this "
-            "user can read."
+            f"{_one_line(config_path)} cannot be read ({_one_line(reason)}): it "
+            "must be a file this user can read."
         )
     except (configparser.Error, UnicodeDecodeError):
         # Their text or repr can quote the store, which holds the password.
         failure = ConfigError(
-            f"{config_path} is not a valid INI file. Its lines are not "
-            "shown, as they can hold the password."
+            f"{_one_line(config_path)} is not a valid INI file. Its lines are "
+            "not shown, as they can hold the password."
         )
     # Raised in a handler, even `from None`, ConfigError would keep the
     # caught error as its __context__: it is raised after them.
     if failure is not None:
         raise failure
     if not parser.has_section(_SECTION):
-        raise ConfigError(f"Missing [{_SECTION}] section in {config_path}")
+        raise ConfigError(
+            f"Missing [{_SECTION}] section in {_one_line(config_path)}"
+        )
 
     section = parser[_SECTION]
     missing = [k for k in _REQUIRED_KEYS if k not in section]
     if missing:
         raise ConfigError(
-            f"Missing keys in {config_path}: {', '.join(missing)}"
+            f"Missing keys in {_one_line(config_path)}: {', '.join(missing)}"
         )
     return section, config_path
 

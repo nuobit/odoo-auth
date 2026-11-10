@@ -11,6 +11,7 @@ from .client import (
     OdooError,
     RequestError,
     _execute_kw,
+    _one_line,
 )
 
 # What a payload holds: model and method, then ids and kwargs for
@@ -37,7 +38,7 @@ def _payload(text):
         die("the JSON payload must be an object")
     unknown = sorted(set(call) - set(_PAYLOAD_KEYS))
     if unknown:
-        die(f"unknown keys in the JSON payload: {', '.join(unknown)}")
+        die(f"unknown keys in the JSON payload: {', '.join(map(_one_line, unknown))}")
     for key in ("model", "method"):
         if key not in call:
             die(f"missing '{key}' in JSON payload")
