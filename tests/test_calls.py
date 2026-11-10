@@ -252,6 +252,32 @@ class XmlRpcClientTest(StubTestCase):
             ([[7]], {"vals_list": [{"name": "Example"}]}),
         )
 
+    def test_a_call_sends_the_bytes_xmlrpc_client_writes_for_it(self):
+        # The call's values are marshalled once, and sent after the
+        # credentials: the request is the one xmlrpc.client writes for the
+        # whole call, characters outside UTF-8 written as references.
+        odoo = self.start(RawXmlRpc())
+        odoo.call_answer = Answer(200, xmlrpc_answer("<boolean>1</boolean>"))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        vals = {"name": "Café <&> \ud800", "parent_id": None, "tag_ids": [[6, 0, [1]]]}
+        client.call("res.partner", "write", [7], vals=vals, context={"lang": "ca_ES"})
+        self.assertEqual(
+            odoo.requests[1]["body"],
+            xmlrpc.client.dumps(
+                (
+                    DB,
+                    UID,
+                    PASSWORD,
+                    "res.partner",
+                    "write",
+                    [[7], vals],
+                    {"context": {"lang": "ca_ES"}},
+                ),
+                "execute_kw",
+                allow_none=True,
+            ).encode("utf-8", "xmlcharrefreplace"),
+        )
+
     def test_an_https_url_goes_over_tls(self):
         # The stub speaks plain HTTP: over TLS its answer is no handshake.
         client = self.make_client(
@@ -816,6 +842,31 @@ def _nested(depth):
     return value
 
 
+def _deepest(encode):
+    """The deepest nesting of a list that ``encode`` writes, called from
+    here: a call encodes from a few frames deeper, so its own limit is
+    within a few levels of it, on any version of Python."""
+    deepest, refused = 1, 2
+    while _encodes(encode, refused):
+        deepest, refused = refused, refused * 2
+    while refused - deepest > 1:
+        middle = (deepest + refused) // 2
+        if _encodes(encode, middle):
+            deepest = middle
+        else:
+            refused = middle
+    return deepest
+
+
+def _encodes(encode, depth):
+    """Whether ``encode`` writes a list nested ``depth`` deep."""
+    try:
+        encode(_nested(depth))
+    except RecursionError:
+        return False
+    return True
+
+
 class ArgumentTest(StubTestCase):
     """A value the profile's API cannot carry is refused before anything is
     sent, the login included: an ArgumentError, also an instance of the
@@ -849,6 +900,68 @@ class ArgumentTest(StubTestCase):
                 self.assertRefusedUnsent(client, PASSWORD, error_class, value)
         self.assertEqual((odoo.logins, odoo.calls), (0, []))
 
+    def assertSentOrRefused(self, client, around, sent):
+        """Each call of ``client`` with a value nested from 40 levels under
+        ``around`` to 40 over it is sent, which ``sent()`` counts, or
+        refused with ArgumentError, and never raises another error; both
+        happen."""
+        outcomes = set()
+        for depth in range(around - 40, around + 40):
+            with self.subTest(depth=depth):
+                try:
+                    client.call("res.partner", "write", [7], vals={"x": _nested(depth)})
+                    outcomes.add("sent")
+                except ArgumentError:
+                    outcomes.add("refused")
+        self.assertEqual(outcomes, {"sent", "refused"})
+        self.assertGreater(sent(), 0)
+
+    def test_a_value_nested_near_the_marshallers_limit_is_sent_or_refused(self):
+        # The call is marshalled once: what the check lets through is what
+        # is sent, never marshalled again from a deeper stack, where it
+        # would raise a RecursionError from frames that hold the password.
+        odoo = self.start(RawXmlRpc())
+        odoo.call_answer = Answer(200, xmlrpc_answer("<boolean>1</boolean>"))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        around = _deepest(lambda value: xmlrpc.client.dumps((value,), allow_none=True))
+        self.assertSentOrRefused(
+            client,
+            around,
+            lambda: [r["path"] for r in odoo.requests].count("/xmlrpc/2/object"),
+        )
+
+    def test_the_request_carries_the_text_of_the_one_marshal_of_the_call(self):
+        # The very text the check's marshal wrote, not one written again:
+        # a second marshal of the call's values, from frames that hold the
+        # password, fails near the limit at some depths of the caller's
+        # stack only, which the test above cannot pin at every depth. Every
+        # marshal goes through Marshaller.dumps, xmlrpc.client.dumps's too:
+        # the call's values go through it once, wherever a second one would
+        # be, and the request carries what that one wrote.
+        odoo = self.start(XmlRpcOdoo())
+        odoo.answers[("res.partner", "write")] = True
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        module = odoo_xmlrpc_auth.client
+        written, carried = [], []
+        dumps, request = xmlrpc.client.Marshaller.dumps, module._execute_kw_request
+
+        def recording_dumps(marshaller, values):
+            written.append(dumps(marshaller, values))
+            return written[-1]
+
+        def recording_request(db, uid, password, params):
+            carried.append(params)
+            return request(db, uid, password, params)
+
+        with mock.patch.object(xmlrpc.client.Marshaller, "dumps", recording_dumps):
+            with mock.patch.object(module, "_execute_kw_request", recording_request):
+                client.call("res.partner", "write", [7], vals={"name": "marshalled_once"})
+        # The stub's answers, the login and the credentials are marshalled
+        # too: only the call's values hold its name.
+        calls = [text for text in written if "marshalled_once" in text]
+        self.assertEqual((len(calls), len(carried)), (1, 1))
+        self.assertIn(carried[0], calls[0])
+
     def test_the_marshallers_text_is_the_reason(self):
         odoo = self.start(XmlRpcOdoo())
         client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
@@ -878,6 +991,14 @@ class ArgumentTest(StubTestCase):
             with self.subTest(case=case):
                 self.assertRefusedUnsent(client, KEY, error_class, value)
         self.assertEqual(odoo.requests, [])
+
+    def test_a_value_nested_near_jsons_limit_is_sent_or_refused(self):
+        # The body is encoded once, and sent as it is.
+        odoo = self.start(Json2Odoo())
+        odoo.answers[("res.partner", "write")] = True
+        client = self.make_client(odoo.url, "json2", KEY)
+        around = _deepest(lambda value: json.dumps(value, allow_nan=False))
+        self.assertSentOrRefused(client, around, lambda: len(odoo.requests))
 
     def test_the_reason_hides_the_key(self):
         # json's text names the type of a value it cannot hold, and a type's

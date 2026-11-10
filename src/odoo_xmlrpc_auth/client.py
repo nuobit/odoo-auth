@@ -871,6 +871,27 @@ def _xmlrpc_transport(url, timeout):
     return _SafeTransport(timeout) if https else _Transport(timeout)
 
 
+def _xmlrpc_params(values):
+    """The <param> elements of ``values``, a tuple, as xmlrpc.client's
+    ServerProxy writes them in a request, with allow_none as Client's
+    calls: the <params> block of its Marshaller, without its tags. Raises
+    one of _MARSHAL_ERRORS for a value the Marshaller cannot write."""
+    block = xmlrpc.client.Marshaller("utf-8", allow_none=True).dumps(values)
+    return block.removeprefix("<params>\n").removesuffix("</params>\n")
+
+
+def _execute_kw_request(db, uid, password, params):
+    """The body of the request of execute_kw with ``db``, ``uid`` and
+    ``password``, then ``params``, the call's own values as _xmlrpc_params
+    wrote them: the bytes ServerProxy sends for the same values (Python
+    3.11, xmlrpc.client.dumps and ServerProxy.__request)."""
+    request = xmlrpc.client.dumps((db, uid, password), "execute_kw", allow_none=True)
+    end = "</params>\n</methodCall>\n"
+    return (request.removesuffix(end) + params + end).encode(
+        "utf-8", "xmlcharrefreplace"
+    )
+
+
 def _log_in(profile, config, transport=None):
     """Log in over XML-RPC with the values of ``config``, the store of
     ``profile`` as _load_config gives it, and return the uid Odoo gives.
@@ -1148,11 +1169,11 @@ class _XmlRpc:
         # _InvalidAnswer, one of _TRANSPORT_ERRORS, and each connection takes
         # the timeouts.
         self._transport = _xmlrpc_transport(config["url"], timeout)
-        self._object = xmlrpc.client.ServerProxy(
-            f"{config['url']}/xmlrpc/2/object",
-            allow_none=True,
-            transport=self._transport,
-        )
+        # Where the calls go, as xmlrpc.client's ServerProxy reads them in
+        # its url (Python 3.11, ServerProxy.__init__): the host, and the path.
+        url = urllib.parse.urlsplit(f"{config['url']}/xmlrpc/2/object")
+        self._host = url.netloc
+        self._handler = urllib.parse.urlunsplit(("", "", *url[2:]))
 
     def call(self, model, method, ids, named):
         # execute_kw takes the records as its first positional argument, and
@@ -1178,7 +1199,7 @@ class _XmlRpc:
         """execute_kw on /xmlrpc/2/object with ``args`` and ``kwargs`` as
         they are, after a login at the first call: the call of ``call``, and
         the CLI's form before 2.0."""
-        self._check_marshallable(model, method, args, kwargs)
+        params = self._marshalled(model, method, args, kwargs)
         failure = None
         try:
             # The login's Fault too, such as a db the server does not hold,
@@ -1186,14 +1207,13 @@ class _XmlRpc:
             self._log_in_once()
             result = _send(
                 self._profile,
-                lambda: self._object.execute_kw(
-                    self._config["db"],
-                    self._uid,
-                    self._config["password"].reveal(),
-                    model,
-                    method,
-                    args,
-                    kwargs,
+                lambda: self._request(
+                    _execute_kw_request(
+                        self._config["db"],
+                        self._uid,
+                        self._config["password"].reveal(),
+                        params,
+                    )
                 ),
             )
         except xmlrpc.client.Fault as fault:
@@ -1217,27 +1237,38 @@ class _XmlRpc:
             if failure is not None:
                 raise failure
 
-    def _check_marshallable(self, model, method, args, kwargs):
-        """Raise ArgumentError, before anything is sent, for a value of the
-        call xmlrpc.client cannot marshal.
+    def _marshalled(self, model, method, args, kwargs):
+        """The call's own values, marshalled once, before anything is sent:
+        _xmlrpc_params of ``model``, ``method``, ``args`` and ``kwargs``.
+        Raises ArgumentError for a value xmlrpc.client cannot marshal.
 
-        The call is marshalled once without the credentials. Marshalled with
-        them, a value it cannot write would raise from frames that hold the
-        password; marshalled here first, the call with them cannot fail on
-        it, and the error raised here holds no password in any frame.
+        The request carries these params as they are, after the
+        credentials, whose marshal cannot fail: no value of the call is
+        marshalled again, with the password in the frames, to fail there,
+        such as one nested close to the limit of the recursion, which a
+        deeper stack would cross. The error raised here holds no password
+        in any frame.
         """
         failure = None
         try:
-            xmlrpc.client.dumps((model, method, args, kwargs), allow_none=True)
+            params = _xmlrpc_params((model, method, args, kwargs))
         except _MARSHAL_ERRORS as error:
             failure = _argument_error(
                 self._profile, error, _MARSHAL_ERRORS, self._config["password"]
             )
         if failure is not None:
             raise failure
+        return params
+
+    def _request(self, body):
+        """The answer to ``body``, a request of execute_kw, as ServerProxy
+        gives it (Python 3.11, ServerProxy.__request): its one value, or
+        the tuple of them when it holds another number."""
+        answer = self._transport.request(self._host, self._handler, body)
+        return answer[0] if len(answer) == 1 else answer
 
     def close(self):
-        self._object("close")()
+        self._transport.close()
 
 
 class _Json2:
