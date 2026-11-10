@@ -42,6 +42,9 @@ What else a 1.x caller meets:
 - A profile is refused too when its `url` holds a backslash or port 0, or
   when its `url`, `db`, `user` or `api` holds its `password` (§ Configure a
   profile).
+- `ServerProxy` with a profile refuses `verbose=True`, and the library's
+  connections print nothing at `http.client`'s debug level, where 1.x
+  printed the password with each request (§ Security model).
 - The CLI refuses a payload key other than `model`, `method`, `ids`,
   `kwargs` and `args`, where 1.x ignored it, and prints an error of Odoo as
   `Error: Odoo answered a call of profile 'x' with an error (code N):
@@ -241,6 +244,13 @@ An `api = json2` profile is refused with a `ConfigError` that names `Client`:
 the profile decides the API. It sets no timeout, as in 1.x: a request waits
 as long as the server takes, unless the script sets one for every socket
 (`socket.setdefaulttimeout`), whose error then names no timeout of `Client`.
+With a profile it refuses `verbose=True`, which asks `xmlrpc.client` to
+print each request, the password among them, with an `ArgumentError`
+before the profile is read. A `transport` given to it is the caller's, and
+it keeps it: its connections are not the library's, so at `http.client`'s
+debug level 1 they print each request, the password among them. It is the
+one exception to the library's connections printing nothing (§ Security
+model), and it holds only for a transport the caller gives.
 
 ## Errors
 
@@ -322,7 +332,8 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   that hold the password. `Client(...)` raises it too, before the profile
   is read, for a `timeout` that is not a `(connect, read)` tuple of two
   numbers (a `TypeError`) or whose values are not above 0 and at most
-  `threading.TIMEOUT_MAX` (a `ValueError`).
+  `threading.TIMEOUT_MAX` (a `ValueError`); `ServerProxy(profile=...)`, for
+  `verbose=True` (a `ValueError`).
 
 `ServerProxy` raises `ConfigError`, `AuthError` and `RequestError`, as in
 1.x; an Odoo `xmlrpc.client.Fault`, and an answer that is not XML-RPC,
@@ -417,6 +428,14 @@ only the queries go over the wire. Over JSON-2, each request is checked as
 origin gets no key and is not sent, and a redirect to another origin is
 refused before anything is sent there. The client takes no proxy and no
 `~/.netrc` from the environment, as xmlrpc.client does not either.
+
+The library's own connections, `Client`'s over both APIs and `ServerProxy`'s
+with a profile, print nothing, whatever debug level the process sets:
+`http.client.HTTPConnection.debuglevel = 1`, the recipe of `requests`' docs
+to see the wire, would print each request's headers and body, the API key
+or the password among them. A `transport` the caller gives `ServerProxy`
+is not the library's, and prints them at that level (§ ServerProxy: the
+XML-RPC drop-in). To see what a call sends, use a local stub.
 
 What the transports take from the environment, and what they do not:
 

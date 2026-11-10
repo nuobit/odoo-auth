@@ -2,6 +2,7 @@ import configparser
 import decimal
 import functools
 import http.client
+import inspect
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import xmlrpc.client
 import zlib
 
 import requests
+import urllib3
 
 # A Client's timeouts by default, in seconds, as (connect, read): to open
 # the connection, then to wait for the answer once connected. A Client
@@ -223,7 +225,9 @@ class ArgumentError(Exception):
     cannot marshal or an int beyond 32 bits; over JSON-2, a value JSON
     cannot hold, NaN among them; over either, one nested deeper than the
     encoder follows). Raised by Client too, before the profile is read, for
-    a timeout that is not a (connect, read) tuple of positive numbers.
+    a timeout that is not a (connect, read) tuple of positive numbers, and
+    by ServerProxy with a profile for verbose, which would print each
+    request, the password among them.
 
     It carries the profile (``profile``) and the reason (``reason``), for a
     value the encoder's own text, which shows *** wherever it held the
@@ -842,12 +846,46 @@ class _TimedConnection:
         self.sock.settimeout(self._read_timeout)
 
 
-class _HTTPConnection(_TimedConnection, http.client.HTTPConnection):
+class _Quiet:
+    """For every connection of http.client the library makes, Client's
+    over both APIs and ServerProxy's with a profile: it prints nothing,
+    whatever the process's debug level. At http.client.HTTPConnection's
+    debuglevel 1, as requests' docs set it to see the wire, a connection
+    prints each request's headers and body, the API key or the password
+    among them."""
+
+    debuglevel = 0
+
+
+class _HTTPConnection(_Quiet, _TimedConnection, http.client.HTTPConnection):
     """http.client's connection for http, with _TimedConnection."""
 
 
-class _HTTPSConnection(_TimedConnection, http.client.HTTPSConnection):
+class _HTTPSConnection(_Quiet, _TimedConnection, http.client.HTTPSConnection):
     """http.client's connection for https, with _TimedConnection."""
+
+
+class _ProxyHTTPConnection(_Quiet, http.client.HTTPConnection):
+    """http.client's connection for http, for ServerProxy, untimed."""
+
+
+class _ProxyHTTPSConnection(_Quiet, http.client.HTTPSConnection):
+    """http.client's connection for https, for ServerProxy, untimed."""
+
+
+class _OwnConnections:
+    """For the library's xmlrpc.client transports: xmlrpc.client's own
+    make_connection (Python 3.11, Transport.make_connection and
+    SafeTransport.make_connection), which keeps one connection per host for
+    keep-alive, with the connection of its scheme the transport opens in
+    _connect_to, one of the library's (_Quiet)."""
+
+    def make_connection(self, host):
+        if self._connection and host == self._connection[0]:
+            return self._connection[1]
+        chost, self._extra_headers, x509 = self.get_host_info(host)
+        self._connection = host, self._connect_to(chost, x509)
+        return self._connection[1]
 
 
 class _Timeouts:
@@ -855,26 +893,11 @@ class _Timeouts:
     _TimedConnections under ``timeout``, a (connect, read) pair of seconds:
     the socket's timeout raised once connected, the read timeout's, raises
     _ReadTimeout. xmlrpc.client sends a timed out request only once
-    (Transport.request retries a reset connection, not a timeout).
-
-    Each transport opens the connection of its scheme in _connect_to."""
+    (Transport.request retries a reset connection, not a timeout)."""
 
     def __init__(self, timeout):
         super().__init__()
         self._timeout = timeout
-
-    def make_connection(self, host):
-        # xmlrpc.client's own (Python 3.11, Transport.make_connection and
-        # SafeTransport.make_connection), which keeps one connection per host
-        # for keep-alive, with the timeouts.
-        if self._connection and host == self._connection[0]:
-            return self._connection[1]
-        chost, self._extra_headers, x509 = self.get_host_info(host)
-        connect, read = self._timeout
-        self._connection = host, self._connect_to(
-            chost, x509, timeout=connect, read_timeout=read
-        )
-        return self._connection[1]
 
     def single_request(self, host, handler, request_body, verbose=False):
         failure = None
@@ -892,23 +915,32 @@ class _Timeouts:
         return answer
 
 
-class _Transport(_Timeouts, _AnswerParsing, xmlrpc.client.Transport):
+class _Transport(_OwnConnections, _Timeouts, _AnswerParsing, xmlrpc.client.Transport):
     """xmlrpc.client's transport for http, with _Timeouts and
     _AnswerParsing."""
 
-    def _connect_to(self, chost, x509, **timeouts):
+    def _connect_to(self, chost, x509):
         # As xmlrpc.client's Transport.make_connection, which leaves x509 out.
-        return _HTTPConnection(chost, **timeouts)
+        connect, read = self._timeout
+        return _HTTPConnection(chost, timeout=connect, read_timeout=read)
 
 
-class _SafeTransport(_Timeouts, _AnswerParsing, xmlrpc.client.SafeTransport):
+class _SafeTransport(
+    _OwnConnections, _Timeouts, _AnswerParsing, xmlrpc.client.SafeTransport
+):
     """xmlrpc.client's transport for https, with _Timeouts and
     _AnswerParsing."""
 
-    def _connect_to(self, chost, x509, **timeouts):
+    def _connect_to(self, chost, x509):
         # As xmlrpc.client's SafeTransport.make_connection.
+        connect, read = self._timeout
         return _HTTPSConnection(
-            chost, None, context=self.context, **timeouts, **(x509 or {})
+            chost,
+            None,
+            context=self.context,
+            timeout=connect,
+            read_timeout=read,
+            **(x509 or {}),
         )
 
 
@@ -918,6 +950,41 @@ def _xmlrpc_transport(url, timeout):
     scheme, https or http, as xmlrpc.client picks it."""
     https = urllib.parse.urlsplit(url).scheme == "https"
     return _SafeTransport(timeout) if https else _Transport(timeout)
+
+
+class _ProxyTransport(_OwnConnections, xmlrpc.client.Transport):
+    """xmlrpc.client's transport for http, for ServerProxy with a profile:
+    its own in all but its connections, the library's."""
+
+    def _connect_to(self, chost, x509):
+        # As xmlrpc.client's Transport.make_connection, which leaves x509 out.
+        return _ProxyHTTPConnection(chost)
+
+
+class _ProxySafeTransport(_OwnConnections, xmlrpc.client.SafeTransport):
+    """xmlrpc.client's transport for https, for ServerProxy with a profile:
+    its own in all but its connections, the library's."""
+
+    def _connect_to(self, chost, x509):
+        # As xmlrpc.client's SafeTransport.make_connection.
+        return _ProxyHTTPSConnection(chost, None, context=self.context, **(x509 or {}))
+
+
+def _proxy_transport(url, arguments):
+    """The transport xmlrpc.client's ServerProxy gives itself for ``url``
+    and ``arguments``, ServerProxy's by name, each one not given at its
+    default (Python 3.11, ServerProxy.__init__), but whose connections are
+    the library's (_Quiet): for ServerProxy with a profile."""
+    options = {
+        "use_datetime": arguments.get("use_datetime", False),
+        "use_builtin_types": arguments.get("use_builtin_types", False),
+        "headers": arguments.get("headers", ()),
+    }
+    if urllib.parse.urlsplit(url).scheme == "https":
+        transport = _ProxySafeTransport(**options, context=arguments.get("context"))
+    else:
+        transport = _ProxyTransport(**options)
+    return transport
 
 
 def _xmlrpc_params(values):
@@ -941,13 +1008,13 @@ def _execute_kw_request(db, uid, password, params):
     )
 
 
-def _log_in(profile, config, transport=None):
+def _log_in(profile, config, transport):
     """Log in over XML-RPC with the values of ``config``, the store of
     ``profile`` as _load_config gives it, and return the uid Odoo gives.
 
-    It goes through ``transport``, xmlrpc.client's own when None, as for
-    ServerProxy. Raises RequestError instead of an error of the transport,
-    and AuthError when Odoo refuses the login.
+    It goes through ``transport``, Client's or ServerProxy's. Raises
+    RequestError instead of an error of the transport, and AuthError when
+    Odoo refuses the login.
     """
     with xmlrpc.client.ServerProxy(
         f"{config['url']}/xmlrpc/2/common", allow_none=True, transport=transport
@@ -1017,6 +1084,12 @@ class ServerProxy(xmlrpc.client.ServerProxy):
     transport; an Odoo Fault comes through as it is. A profile with
     ``api = json2`` is refused with ConfigError: Client calls it.
 
+    With a profile, its connections, the login's too, are the library's,
+    which print nothing (_Quiet), unless it is given a transport, whose
+    connections are the caller's; and it refuses ``verbose``, which asks
+    xmlrpc.client to print each request, the password among them, with
+    ArgumentError, before the profile is read.
+
     When ``profile`` is not given, behaves exactly like the original.
 
     Usage::
@@ -1031,6 +1104,15 @@ class ServerProxy(xmlrpc.client.ServerProxy):
 
     def __init__(self, uri=None, /, *args, profile=None, **kwargs):
         if profile is not None:
+            # xmlrpc.client.ServerProxy's arguments by their names, whether
+            # given by name or in their places.
+            given = inspect.signature(super().__init__).bind(uri, *args, **kwargs)
+            if given.arguments.get("verbose"):
+                raise _error_class(ArgumentError, ValueError)(
+                    profile,
+                    "verbose would print each request, the password among them: "
+                    "ServerProxy takes no verbose with a profile",
+                )
             config = _load_config(profile)
             if config["api"] != "xmlrpc":
                 # The profile decides the API. Odoo 19 logs a deprecation
@@ -1043,14 +1125,21 @@ class ServerProxy(xmlrpc.client.ServerProxy):
                 )
             self._profile = profile
             self._db = config["db"]
-            self._uid = _log_in(profile, config)
+            # The login's, with every argument at its default, as in 1.x.
+            self._uid = _log_in(profile, config, _proxy_transport(config["url"], {}))
             # Readable as in 1.x: scripts that log in to Odoo's web
             # themselves read it. An attribute, not a local, so no local
             # shows it; but a frame that holds the proxy, as each of its
             # calls' frames does, shows it one attribute down to a debugger.
             self._password = config["password"].reveal()
-            kwargs.setdefault("allow_none", True)
-            uri = f"{config['url']}/xmlrpc/2/object"
+            given.arguments["uri"] = f"{config['url']}/xmlrpc/2/object"
+            given.arguments.setdefault("allow_none", True)
+            if given.arguments.get("transport") is None:
+                given.arguments["transport"] = _proxy_transport(
+                    config["url"], given.arguments
+                )
+            uri, *args = given.args
+            kwargs = given.kwargs
         else:
             self._profile = None
             self._db = None
@@ -1129,6 +1218,38 @@ class _BearerKey(requests.auth.AuthBase):
         return repr(self._key)
 
 
+class _Json2HTTPConnection(_Quiet, urllib3.connection.HTTPConnection):
+    """urllib3's connection for http, for JSON-2."""
+
+
+class _Json2HTTPSConnection(_Quiet, urllib3.connection.HTTPSConnection):
+    """urllib3's connection for https, for JSON-2."""
+
+
+class _Json2HTTPConnectionPool(urllib3.HTTPConnectionPool):
+    """urllib3's pool for http, whose connections are the library's."""
+
+    ConnectionCls = _Json2HTTPConnection
+
+
+class _Json2HTTPSConnectionPool(urllib3.HTTPSConnectionPool):
+    """urllib3's pool for https, whose connections are the library's."""
+
+    ConnectionCls = _Json2HTTPSConnection
+
+
+class _Json2Adapter(requests.adapters.HTTPAdapter):
+    """requests' adapter, whose pool manager opens the library's pools, so
+    that its connections are the library's (_Quiet)."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": _Json2HTTPConnectionPool,
+            "https": _Json2HTTPSConnectionPool,
+        }
+
+
 class _OriginSession(requests.Session):
     """A requests session whose auth sends the API key only to the origin
     of ``url``, and which follows a redirect only within that origin: a
@@ -1147,6 +1268,8 @@ class _OriginSession(requests.Session):
         super().__init__()
         self.trust_env = False
         self.auth = _BearerKey(key, url)
+        for prefix in ("http://", "https://"):
+            self.mount(prefix, _Json2Adapter())
 
     def get_redirect_target(self, resp):
         # requests decodes a redirect's Location as UTF-8, then parses it
