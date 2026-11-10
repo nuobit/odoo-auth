@@ -35,6 +35,7 @@ from odoo_xmlrpc_auth.client import (
     RedirectError,
     RequestError,
     ServerProxy,
+    _execute_kw,
     _origin,
     _SafeTransport,
 )
@@ -122,8 +123,8 @@ class XmlRpcClientTest(StubTestCase):
 
     def test_execute_kw_sends_its_args_and_kwargs_as_they_are(self):
         self.odoo.answers[("res.partner", "search")] = [7]
-        result = self.client.execute_kw(
-            "res.partner", "search", [[["name", "=", "Example"]]], {"limit": 1}
+        result = _execute_kw(
+            self.client, "res.partner", "search", [[["name", "=", "Example"]]], {"limit": 1}
         )
         self.assertEqual(result, [7])
         self.assertEqual(
@@ -140,7 +141,7 @@ class XmlRpcClientTest(StubTestCase):
 
     def test_execute_kw_without_kwargs_sends_none(self):
         self.odoo.answers[("res.partner", "search_count")] = 3
-        self.assertEqual(self.client.execute_kw("res.partner", "search_count", [[]]), 3)
+        self.assertEqual(_execute_kw(self.client, "res.partner", "search_count", [[]]), 3)
         self.assertEqual(self.odoo.calls[0]["kwargs"], {})
 
     def test_execute_kw_refuses_args_or_kwargs_of_another_type_unsent(self):
@@ -157,7 +158,7 @@ class XmlRpcClientTest(StubTestCase):
         for case, (arguments, reason) in refusals.items():
             with self.subTest(case=case):
                 error = self.raised(
-                    TypeError, lambda: self.client.execute_kw(*arguments)
+                    TypeError, lambda: _execute_kw(self.client, *arguments)
                 )
                 self.assertIsInstance(error, ArgumentError)
                 self.assertEqual(error.reason, reason)
@@ -171,7 +172,7 @@ class XmlRpcClientTest(StubTestCase):
             r"^Profile 'erp-json2' has `api = json2`, and execute_kw sends "
             r"XML-RPC's positional arguments: give them by name to Client\.call$",
         ):
-            client.execute_kw("res.partner", "search", [[]])
+            _execute_kw(client, "res.partner", "search", [[]])
         self.assertEqual(odoo.requests, [])
 
     def test_a_method_of_the_model_gets_no_positional_argument(self):
@@ -1043,7 +1044,7 @@ class ArgumentTest(StubTestCase):
             with self.subTest(case=case, form="execute_kw"):
                 error = self.raised(
                     error_class,
-                    lambda: clients["xmlrpc"].execute_kw(name, "read", [[7]]),
+                    lambda: _execute_kw(clients["xmlrpc"], name, "read", [[7]]),
                 )
                 self.assertIsInstance(error, ArgumentError)
         self.assertEqual(

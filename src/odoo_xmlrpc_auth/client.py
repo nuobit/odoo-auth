@@ -1198,7 +1198,7 @@ class _XmlRpc:
     def execute_kw(self, model, method, args, kwargs):
         """execute_kw on /xmlrpc/2/object with ``args`` and ``kwargs`` as
         they are, after a login at the first call: the call of ``call``, and
-        of Client.execute_kw."""
+        of _execute_kw."""
         params = self._marshalled(model, method, args, kwargs)
         failure = None
         try:
@@ -1510,34 +1510,38 @@ class Client:
             model, method, None if ids is None else list(ids), named
         )
 
-    def execute_kw(self, model, method, /, args, kwargs=None):
-        """Call ``method`` of ``model`` over XML-RPC with ``args``, the list
-        of execute_kw's positional arguments, and ``kwargs``, the dict of its
-        named ones (None for none), as they are, and return Odoo's result:
-        XML-RPC's own form, ServerProxy's, which the CLI's ``args`` payloads
-        take, for an `api = xmlrpc` profile only.
 
-        An `api = json2` profile raises ConfigError, as JSON-2 takes named
-        arguments only: call takes them. A call it cannot send raises
-        ArgumentError before anything is sent; its other errors are call's.
-        """
-        if self.api != "xmlrpc":
-            raise ConfigError(
-                f"Profile {self.profile!r} has `api = json2`, and execute_kw "
-                "sends XML-RPC's positional arguments: give them by name to "
-                "Client.call"
-            )
-        elif not isinstance(args, (list, tuple)):
-            raise _error_class(ArgumentError, TypeError)(
-                self.profile,
-                "args must be the list of execute_kw's positional arguments",
-            )
-        elif kwargs is not None and not isinstance(kwargs, dict):
-            raise _error_class(ArgumentError, TypeError)(
-                self.profile,
-                "kwargs must be None or the dict of execute_kw's named arguments",
-            )
-        _check_names(self.profile, model, method)
-        return self._transport.execute_kw(
-            model, method, list(args), {} if kwargs is None else kwargs
+def _execute_kw(client, model, method, args, kwargs=None):
+    """Call ``method`` of ``model`` through ``client``, a Client, with
+    ``args``, the list of execute_kw's positional arguments, and ``kwargs``,
+    the dict of its named ones (None for none), as they are, and return
+    Odoo's result: XML-RPC's own form, ServerProxy's, which the CLI's
+    ``args`` payloads take, for an `api = xmlrpc` profile only.
+
+    Not a method of Client, whose one way to write a call is Client.call:
+    it serves the CLI's ``args`` payloads only.
+
+    An `api = json2` profile raises ConfigError, as JSON-2 takes named
+    arguments only. A call it cannot send raises ArgumentError before
+    anything is sent; its other errors are Client.call's.
+    """
+    if client.api != "xmlrpc":
+        raise ConfigError(
+            f"Profile {client.profile!r} has `api = json2`, and execute_kw "
+            "sends XML-RPC's positional arguments: give them by name to "
+            "Client.call"
         )
+    elif not isinstance(args, (list, tuple)):
+        raise _error_class(ArgumentError, TypeError)(
+            client.profile,
+            "args must be the list of execute_kw's positional arguments",
+        )
+    elif kwargs is not None and not isinstance(kwargs, dict):
+        raise _error_class(ArgumentError, TypeError)(
+            client.profile,
+            "kwargs must be None or the dict of execute_kw's named arguments",
+        )
+    _check_names(client.profile, model, method)
+    return client._transport.execute_kw(
+        model, method, list(args), {} if kwargs is None else kwargs
+    )

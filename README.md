@@ -90,8 +90,10 @@ odoo-xmlrpc-auth --profile customer1 \
 ```
 
 On an `api = xmlrpc` profile the payload may instead give `execute_kw`'s
-positional arguments as `args`, the form before 2.0, which goes through
-`Client.execute_kw` (§ Client):
+positional arguments as `args`, the form before 2.0. They go as they are,
+as `ServerProxy` sends them, with `kwargs` as `execute_kw`'s named
+arguments, through the same login and with the same errors as a call by
+name:
 
 ```bash
 odoo-xmlrpc-auth --profile customer1 \
@@ -182,13 +184,6 @@ body to the names of the method's signature.
 version, and a list of them, `vals_list=[{...}, ...]`, from Odoo 12: up to
 Odoo 11 the base's `create` takes one dict. With a single dict, XML-RPC
 answers the new id and JSON-2 the list of its id.
-
-`odoo.execute_kw(model, method, args, kwargs=None)` sends XML-RPC's own
-form, `execute_kw`'s positional `args` and named `kwargs` as they are, as
-`ServerProxy` does, through the `Client`'s login and with its errors: the
-form of the CLI's `args` payloads. It is for `api = xmlrpc` profiles only;
-an `api = json2` profile raises `ConfigError`, as JSON-2 takes named
-arguments only.
 
 Each request of a `Client`, the XML-RPC login included, has 30 seconds to
 connect and then 600 to get its answer. `timeout`, given when the `Client`
