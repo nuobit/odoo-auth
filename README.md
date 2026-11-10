@@ -65,7 +65,8 @@ The payload is a `Client.call` (below) written as JSON:
 ```
 
 `ids` is left out, or null, for a method of the model; `kwargs` holds the
-method's own arguments, by name. Any other key is refused. The CLI calls
+method's own arguments, by name, and is left out, or null, for none. Any
+other key is refused. The CLI calls
 under `Client`'s default timeouts (below), and has no option to change
 them.
 

@@ -26,7 +26,12 @@ def die(msg):
 
 
 def _payload(text):
-    """The call ``text`` describes, as a dict, once checked."""
+    """The call ``text`` describes, as a dict, once checked as a payload,
+    before the profile is read: a JSON object of the keys above, with a
+    model and a method, not both ids and args, and without args, kwargs
+    that are an object, or null, and hold no ids: the records go in ids,
+    Client.call's own parameter. What the call holds, the library checks
+    as it sends it."""
     try:
         call = json.loads(text)
     except (ValueError, RecursionError) as e:
@@ -42,37 +47,22 @@ def _payload(text):
     for key in ("model", "method"):
         if key not in call:
             die(f"missing '{key}' in JSON payload")
-        elif not isinstance(call[key], str):
-            die(f"'{key}' in the JSON payload must be a string")
     if "ids" in call and "args" in call:
         die("give 'ids' or 'args' in the JSON payload, not both")
-    # No ids, or a null one, is a method of the model.
-    if call.get("ids") is not None and not isinstance(call["ids"], list):
-        die("'ids' in the JSON payload must be a list")
-    if "args" in call and not isinstance(call["args"], list):
-        die("'args' in the JSON payload must be a list")
-    if "kwargs" in call and not isinstance(call["kwargs"], dict):
-        die("'kwargs' in the JSON payload must be an object")
-    # In the named form, the records are the payload's ids: Client.call
-    # takes no second ids by name.
-    if "args" not in call and "ids" in call.get("kwargs", {}):
-        die("'ids' goes at the top of the JSON payload, not in 'kwargs'")
+    # With args, kwargs are execute_kw's named arguments, as they are.
+    if "args" not in call and call.get("kwargs") is not None:
+        if not isinstance(call["kwargs"], dict):
+            die("'kwargs' in the JSON payload must be an object")
+        elif "ids" in call["kwargs"]:
+            die("'ids' goes at the top of the JSON payload, not in 'kwargs'")
     return call
 
 
-def _call_with_args(odoo, call):
-    """The payload's call with its positional args, the CLI's form before
-    2.0, for an `api = xmlrpc` profile only, through the open Client: its
-    login, its errors."""
-    if odoo.api != "xmlrpc":
-        # _execute_kw refuses it too, in the words of the library.
-        die(
-            f"'args' is for `api = xmlrpc` profiles, and profile {odoo.profile!r} "
-            "has `api = json2`: give 'ids' and 'kwargs' instead"
-        )
-    return _execute_kw(
-        odoo, call["model"], call["method"], call["args"], call.get("kwargs")
-    )
+def _named(call):
+    """The named arguments the payload, without args, gives Client.call:
+    its kwargs; none when kwargs are left out or null, as the library reads
+    them with args."""
+    return call["kwargs"] if call.get("kwargs") is not None else {}
 
 
 def main():
@@ -95,13 +85,18 @@ def main():
     try:
         with Client(profile=args.profile) as odoo:
             if "args" in call:
-                result = _call_with_args(odoo, call)
-            else:
-                result = odoo.call(
+                # The form before 2.0, for an `api = xmlrpc` profile only:
+                # the library checks it and sends it as it is.
+                result = _execute_kw(
+                    odoo,
                     call["model"],
                     call["method"],
-                    call.get("ids"),
-                    **call.get("kwargs", {}),
+                    call["args"],
+                    call.get("kwargs"),
+                )
+            else:
+                result = odoo.call(
+                    call["model"], call["method"], call.get("ids"), **_named(call)
                 )
     except (ConfigError, AuthError, RequestError, OdooError, ArgumentError) as e:
         die(e)
