@@ -383,7 +383,10 @@ port 0 to the scheme's default port, where the profile's origin is read
 otherwise. An `api = json2` profile
 is refused too if its `password` is not an Odoo API key (40 lowercase
 hexadecimal digits) or its `db` is not one line of printable ASCII without
-spaces: JSON-2 sends both in headers. Neither is shown.
+spaces: JSON-2 sends both in headers. Neither is shown. It is refused as
+well if `requests`, which JSON-2 sends through, refuses its `url` as it
+prepares a request, as for a host that starts with `*`; XML-RPC sends
+through `http.client`, which takes such a host and looks it up.
 
 A profile whose `url`, `db`, `user` or `api` holds its `password`, in any
 of the forms an error is masked in (§ Errors, above), is refused as well,

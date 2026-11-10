@@ -563,13 +563,22 @@ def _check_public_fields(profile, section, password, config_path):
 
 def _check_url(section, config_path):
     """Raise ConfigError when the url of ``section``, the profile's, has a
-    fault (_url_fault).
+    fault (_url_fault), or, with `api = json2`, when requests refuses it
+    (_requests_refuses): each API's url must be one its transport sends,
+    http.client's for XML-RPC, requests' for JSON-2.
 
     A url line that is wrong can hold a secret, such as another account's
     password before its host: no frame of the error holds the url, and its
     message quotes no part of it.
     """
     fault = _url_fault(section["url"])
+    if fault is None and section["api"] == "json2" and _requests_refuses(
+        section["url"]
+    ):
+        fault = (
+            "must be one requests can send, as `api = json2` goes through it: "
+            "requests refuses a host that starts with *, for one"
+        )
     if fault is not None:
         raise ConfigError(f"The url in {_one_line(config_path)} {fault}")
 
@@ -624,6 +633,22 @@ def _url_fault(url):
     else:
         fault = None
     return fault
+
+
+def _requests_refuses(url):
+    """Whether requests refuses ``url``, which _url_fault let through, as
+    it prepares a request for it before anything is sent: as it does for
+    a host that starts with * (requests' PreparedRequest.prepare_url).
+
+    requests owns what it sends: it is asked, not copied. Its error quotes
+    the url, and is not raised over. It looks no name up and sends
+    nothing."""
+    refused = False
+    try:
+        requests.PreparedRequest().prepare_url(url, None)
+    except requests.RequestException:
+        refused = True
+    return refused
 
 
 def _idna_refuses(hostname):
