@@ -12,6 +12,7 @@ import contextlib
 import datetime
 import gc
 import gzip
+import http.client
 import io
 import json
 import os
@@ -1392,6 +1393,182 @@ class FramesTest(StubTestCase):
                     lambda: client.call("res.partner", "search_count", domain=[]),
                 )
                 self.assertNoFrameHolds(error, KEY)
+
+
+class WireDebugTest(StubTestCase):
+    """The library's own connections print nothing whatever the process's
+    debug level: http.client.HTTPConnection.debuglevel = 1, as requests'
+    docs set it to see the wire, would print each request's headers and
+    body, the API key or the password among them."""
+
+    def setUp(self):
+        super().setUp()
+        self.xmlrpc_odoo = self.start(XmlRpcOdoo())
+        self.json2_odoo = self.start(Json2Odoo())
+        self.xmlrpc_odoo.answers[("res.partner", "search_count")] = 3
+        self.json2_odoo.answers[("res.partner", "search_count")] = 3
+        patcher = mock.patch.object(http.client.HTTPConnection, "debuglevel", 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def printed(self, call):
+        """What ``call()`` prints on stdout, once it returned 3."""
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(call(), 3)
+        return printed.getvalue()
+
+    def test_a_call_of_client_over_each_api_prints_nothing(self):
+        clients = {
+            "xmlrpc": self.make_client(self.xmlrpc_odoo.url, "xmlrpc", PASSWORD, "erp-x"),
+            "json2": self.make_client(self.json2_odoo.url, "json2", KEY, "erp-j"),
+        }
+        for api, client in clients.items():
+            with self.subTest(api=api):
+                self.assertEqual(
+                    self.printed(
+                        lambda: client.call("res.partner", "search_count", domain=[])
+                    ),
+                    "",
+                )
+
+    def test_the_connections_of_an_https_profile_print_nothing(self):
+        # Real profiles are https. http.client prints what a connection
+        # sends and gets when the connection's debug level is above 0. Each
+        # connection is built as a call builds it, Client's over each API
+        # and ServerProxy's for its login and its calls, and read before it
+        # connects, which only sending does: no TLS server is needed.
+        url = "https://127.0.0.1"
+        xmlrpc_client = self.make_client(url, "xmlrpc", PASSWORD, "https-xmlrpc")
+        json2_client = self.make_client(url, "json2", KEY, "https-json2")
+        logins = []
+
+        def log_in(profile, config, transport):
+            logins.append(transport)
+            self.addCleanup(transport.close)
+            return UID
+
+        with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", log_in):
+            proxy = ServerProxy(profile="https-xmlrpc")
+        self.addCleanup(proxy("close"))
+        adapter = json2_client._transport._session.get_adapter(url)
+        connections = {
+            "Client over XML-RPC": xmlrpc_client._transport._transport.make_connection(
+                "127.0.0.1"
+            ),
+            "Client over JSON-2": adapter.poolmanager.connection_from_url(url)._new_conn(),
+            "ServerProxy's login": logins[0].make_connection("127.0.0.1"),
+            "ServerProxy's calls": proxy("transport").make_connection("127.0.0.1"),
+        }
+        for case, connection in connections.items():
+            with self.subTest(case=case):
+                self.assertEqual(connection.debuglevel, 0)
+
+    def test_a_call_of_server_proxy_with_a_profile_prints_nothing(self):
+        self.make_profile(self.xmlrpc_odoo.url, "xmlrpc", PASSWORD)
+
+        def call():
+            with ServerProxy(profile="erp") as proxy:
+                return proxy.execute_kw("res.partner", "search_count", [[]], {})
+
+        self.assertEqual(self.printed(call), "")
+
+    def test_server_proxy_with_a_profile_takes_xmlrpc_clients_options(self):
+        # Its transport is the library's, made with the options given, as
+        # xmlrpc.client makes its own.
+        odoo = self.start(RawXmlRpc())
+        cases = {
+            "use_datetime": (
+                {"use_datetime": True},
+                "<dateTime.iso8601>20260101T00:00:00</dateTime.iso8601>",
+                datetime.datetime(2026, 1, 1),
+            ),
+            "use_builtin_types": (
+                {"use_builtin_types": True},
+                "<base64>ZHVtbXk=</base64>",
+                b"dummy",
+            ),
+            "headers": ({"headers": [("X-Test", "yes")]}, "<int>3</int>", 3),
+        }
+        self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+        for case, (options, value, expected) in cases.items():
+            with self.subTest(case=case):
+                odoo.call_answer = Answer(200, xmlrpc_answer(value))
+                with ServerProxy(profile="erp", **options) as proxy:
+                    answer = proxy.execute_kw("res.partner", "search", [[]])
+                # Its type too: xmlrpc.client's DateTime and Binary, read
+                # without the option, compare equal to a datetime or bytes.
+                self.assertEqual((type(answer), answer), (type(expected), expected))
+        self.assertEqual(odoo.requests[-1]["headers"].get("x-test"), "yes")
+
+    def test_server_proxy_refuses_verbose_with_a_profile_before_reading_it(self):
+        # verbose asks xmlrpc.client to print the wire, the password among
+        # it; nothing of the library is printed. Refused before the store
+        # is read, given by name or in its place.
+        for args, kwargs in (((), {"verbose": True}), ((None, None, 1), {})):
+            with self.subTest(args=args, kwargs=kwargs):
+                error = self.raised(
+                    ArgumentError,
+                    lambda: ServerProxy(None, *args, profile="no-such-profile", **kwargs),
+                )
+                self.assertIsInstance(error, ValueError)
+                self.assertEqual(
+                    str(error),
+                    "A call of profile 'no-such-profile' cannot be sent: verbose "
+                    "would print each request, the password among them: "
+                    "ServerProxy takes no verbose with a profile",
+                )
+
+
+class ServerProxyTransportTest(StubTestCase):
+    """ServerProxy with a profile builds the transport xmlrpc.client's
+    ServerProxy builds for itself, from the same arguments, but with the
+    library's connections, as in 1.x but for those: a transport it is given
+    carries its calls, its https transport takes the context, and allow_none
+    is True unless it is given."""
+
+    def setUp(self):
+        super().setUp()
+        self.odoo = self.start(XmlRpcOdoo())
+        self.make_profile(self.odoo.url, "xmlrpc", PASSWORD)
+
+    def test_a_transport_it_is_given_carries_its_calls(self):
+        handlers = []
+
+        class Recording(xmlrpc.client.Transport):
+            def request(self, host, handler, request_body, verbose=False):
+                handlers.append(handler)
+                return super().request(host, handler, request_body, verbose)
+
+        transport = Recording()
+        self.odoo.answers[("res.partner", "search_count")] = 3
+        with ServerProxy(profile="erp", transport=transport) as proxy:
+            self.assertIs(proxy("transport"), transport)
+            self.assertEqual(proxy.execute_kw("res.partner", "search_count", [[]], {}), 3)
+        self.assertEqual(handlers, ["/xmlrpc/2/object"])
+
+    def test_its_https_transport_connects_with_the_context_it_is_given(self):
+        # The login is replaced: no TLS server is needed, and nothing is
+        # sent, as a connection connects only when it sends.
+        self.make_profile("https://127.0.0.1", "xmlrpc", PASSWORD, "https")
+        context = ssl.create_default_context()
+        with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", return_value=UID):
+            proxy = ServerProxy(profile="https", context=context)
+        self.addCleanup(proxy("close"))
+        transport = proxy("transport")
+        self.assertIs(transport.context, context)
+        self.assertIs(transport.make_connection("127.0.0.1")._context, context)
+
+    def test_it_allows_none_unless_it_is_told_otherwise(self):
+        self.odoo.answers[("res.partner", "write")] = True
+        with ServerProxy(profile="erp") as proxy:
+            self.assertIs(
+                proxy.execute_kw("res.partner", "write", [[7], {"name": None}], {}), True
+            )
+        self.assertEqual(self.odoo.calls[0]["args"], [[7], {"name": None}])
+        with ServerProxy(profile="erp", allow_none=False) as proxy:
+            with self.assertRaisesRegex(TypeError, "cannot marshal None"):
+                proxy.execute_kw("res.partner", "write", [[7], {"name": None}], {})
 
 
 # How long, in seconds, a stub holds a request at most before it lets the

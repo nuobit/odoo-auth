@@ -326,8 +326,9 @@ class UrlTest(StoreTestCase):
         self.make_store_with_url("https://odoo.example.com:8069")
         self.common.authenticate.return_value = 7
         ServerProxy(profile="erp")
+        # The transport is the library's (test_calls.WireDebugTest).
         xmlrpc.client.ServerProxy.assert_called_once_with(
-            "https://odoo.example.com:8069/xmlrpc/2/common", allow_none=True, transport=None
+            "https://odoo.example.com:8069/xmlrpc/2/common", allow_none=True, transport=mock.ANY
         )
 
 
