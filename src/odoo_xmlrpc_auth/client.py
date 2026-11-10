@@ -148,7 +148,9 @@ class RequestError(Exception):
     like keep catching it; standing for an error of requests, its
     ``request`` and ``response`` are None. For an answer that is not XML-RPC,
     Client's stands for xmlrpc.client's ResponseError, whatever the parser
-    raised.
+    raised. Such an answer, and one that is not JSON (JSONDecodeError, code
+    200), came from a server that answered: answering a call, it may have
+    run it, so a retry would run it again.
 
     When one of Client's timeouts fired, ``timeout_fired`` says which,
     "connect" or "read" (None otherwise), and so does the message: after a
@@ -1090,7 +1092,9 @@ def _loaded(content):
     except (ValueError, RecursionError):
         # Its doc holds the body, which can echo the request: nothing is
         # raised over it. A body nested deeper than the parser can follow
-        # is no JSON it reads either.
+        # is no JSON it reads either, nor is any body read from a stack
+        # already close to the recursion limit: one class, RecursionError,
+        # for both causes (README, § Errors).
         return _NOT_JSON
 
 
