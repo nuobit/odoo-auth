@@ -63,13 +63,13 @@ def _execute_kw(odoo, call):
     2.0, for an `api = xmlrpc` profile only, through the open Client: its
     login, its errors."""
     if odoo.api != "xmlrpc":
+        # Client.execute_kw refuses it too, in the words of the library.
         die(
             f"'args' is for `api = xmlrpc` profiles, and profile {odoo.profile!r} "
             "has `api = json2`: give 'ids' and 'kwargs' instead"
         )
-    # The package's own transport over XML-RPC, which Client.call uses too.
-    return odoo._transport.execute_kw(
-        call["model"], call["method"], call["args"], call.get("kwargs", {})
+    return odoo.execute_kw(
+        call["model"], call["method"], call["args"], call.get("kwargs")
     )
 
 
