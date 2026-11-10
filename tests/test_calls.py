@@ -440,6 +440,33 @@ class NotXmlRpcTest(StubTestCase):
             ["/xmlrpc/2/common"] * len(self.ANSWERS),
         )
 
+    def test_a_login_answering_no_uid_a_call_can_send_is_a_request_error(self):
+        # Each call sends the uid back: xmlrpc.client refuses to marshal an
+        # int beyond 32 bits, from frames that hold the password.
+        uids = {
+            "an int beyond 32 bits": "<int>2147483648</int>",
+            "a negative int": "<int>-7</int>",
+            "a boolean": "<boolean>1</boolean>",
+            "a string": "<string>7</string>",
+            # No frame of the error holds the answer (assertIsAnswerError).
+            "a string echoing the password": f"<string>echo {PASSWORD}</string>",
+        }
+        odoo = self.start(RawXmlRpc())
+        for number, (case, uid) in enumerate(uids.items()):
+            with self.subTest(case=case):
+                odoo.login_answer = Answer(200, xmlrpc_answer(uid))
+                client = self.make_client(odoo.url, "xmlrpc", PASSWORD, f"uid-{number}")
+                self.assertIsAnswerError(
+                    self.raised(
+                        RequestError,
+                        lambda: client.call("res.partner", "search_count", domain=[]),
+                    )
+                )
+        self.assertEqual(
+            [request["path"] for request in odoo.requests],
+            ["/xmlrpc/2/common"] * len(uids),
+        )
+
     def test_server_proxy_raises_an_answer_that_is_not_xml_rpc_as_xmlrpc_client(self):
         # As in 1.x (README): here, the UnicodeEncodeError of base64 outside
         # ASCII, which Client's parser turns into a ResponseError.
@@ -451,6 +478,13 @@ class NotXmlRpcTest(StubTestCase):
                 UnicodeEncodeError, lambda: proxy.execute_kw("res.partner", "search", [[]])
             )
         self.assertNotIsInstance(error, RequestError)
+
+    def test_a_login_answering_the_largest_uid_lets_the_call_go(self):
+        odoo = self.start(RawXmlRpc())
+        odoo.login_answer = Answer(200, xmlrpc_answer("<int>2147483647</int>"))
+        odoo.call_answer = Answer(200, xmlrpc_answer("<int>3</int>"))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
 
 
 class Json2ClientTest(StubTestCase):
