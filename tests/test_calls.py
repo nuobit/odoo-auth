@@ -10,6 +10,7 @@ Run from the repository root:
 
 import contextlib
 import datetime
+import gc
 import gzip
 import io
 import json
@@ -18,7 +19,9 @@ import socket
 import ssl
 import sys
 import threading
+import time
 import unittest
+import warnings
 import xmlrpc.client
 from unittest import mock
 
@@ -55,6 +58,37 @@ from support import (
     odoo_error,
     xmlrpc_answer,
 )
+
+
+def retried(attempt, waited_for):
+    """Call ``attempt`` until it returns true, again each time it returns
+    false, for 5 s at most; past them, fail, saying that the test waited for
+    ``waited_for``. No try sleeps a duration: ``attempt`` lets the other
+    threads run, if it needs them to."""
+    seconds = 5
+    deadline = time.monotonic() + seconds
+    while not attempt():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"waited {seconds} s for {waited_for}")
+
+
+def collect_garbage():
+    """Collect the garbage of every generation, as gc.collect() does, and
+    make sure the collection ran: while another thread is in one, which a
+    finalizer that lets the GIL go keeps running as this thread runs,
+    gc.collect() returns at once and collects nothing. Each try lets the
+    other threads go on (time.sleep), then drops a reference cycle, which
+    the collection finds if it ran, unless one another thread starts takes
+    the cycle first; the tries go on until one finds something (retried)."""
+
+    def collected():
+        time.sleep(0)
+        cycle = []
+        cycle.append(cycle)
+        del cycle
+        return gc.collect() > 0
+
+    retried(collected, "a collection of garbage in this thread")
 
 
 class StubTestCase(StoreMixin, unittest.TestCase):
@@ -96,6 +130,43 @@ class StubTestCase(StoreMixin, unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         return timeouts
+
+    def fail_on_resource_warnings(self):
+        """Fail the test if it leaves a socket or a file open: from now to
+        its end a ResourceWarning is an error, and a collection of garbage,
+        which closes what was left open with that warning, runs once the
+        test is over (collect_garbage). Raised in a finalizer, the error
+        reaches sys.unraisablehook, which records it here; any other
+        exception the hook gets goes on to the hook it replaces. Once that
+        collection ends, whatever ends it, the hook it replaced and the
+        warnings' filters it found are put back."""
+        warned = []
+        previous_hook = sys.unraisablehook
+
+        def hook(unraisable):
+            if issubclass(unraisable.exc_type, ResourceWarning):
+                warned.append(str(unraisable.exc_value))
+            else:
+                previous_hook(unraisable)
+
+        filters = warnings.catch_warnings()
+        filters.__enter__()
+        warnings.simplefilter("error", ResourceWarning)
+        patcher = mock.patch.object(sys, "unraisablehook", hook)
+        patcher.start()
+
+        def check():
+            # collect_garbage fails once it has waited 5 s (retried): the
+            # hook and the filters, left in place, would stay for the rest of
+            # the run.
+            try:
+                collect_garbage()
+            finally:
+                patcher.stop()
+                filters.__exit__(None, None, None)
+            self.assertEqual(warned, [])
+
+        self.addCleanup(check)
 
 
 class XmlRpcClientTest(StubTestCase):
@@ -758,6 +829,8 @@ class Json2ClientTest(StubTestCase):
             self.client.call("res.partner", "read", [7])
 
     def test_a_redirect_to_a_location_that_is_not_a_url_is_refused(self):
+        # The answer of a redirect it refuses is closed, its socket with it.
+        self.fail_on_resource_warnings()
         # A header goes as Latin-1: each character below is one byte sent.
         locations = {
             "not UTF-8": "/json/2/\xff\xfe",
@@ -1100,6 +1173,35 @@ class ArgumentTest(StubTestCase):
         )
         self.assertEqual(error.reason, "Object of type *** is not JSON serializable")
         self.assertNeverShows(error, KEY)
+
+
+class ResourceWarningsCheckTest(unittest.TestCase):
+    """What the check of a test that may leave no socket or file open
+    (StubTestCase.fail_on_resource_warnings) leaves once that test ends."""
+
+    def test_a_failed_collection_puts_the_hook_and_the_filters_back(self):
+        # The check's collection of garbage (collect_garbage) fails once it
+        # has waited 5 s for one in this thread. Here it fails at once, in a
+        # test that arms the check, run whole, so that its cleanups run while
+        # this test looks on.
+        hook = sys.unraisablehook
+        filters = list(warnings.filters)
+
+        class ArmsTheCheck(StubTestCase):
+            def runTest(self):
+                self.fail_on_resource_warnings()
+
+        failed_wait = AssertionError("waited 5 s for a collection of garbage in this thread")
+        result = unittest.TestResult()
+        with mock.patch(f"{__name__}.collect_garbage", side_effect=failed_wait):
+            ArmsTheCheck().run(result)
+        self.assertEqual(result.errors, [])
+        (failure,) = result.failures
+        self.assertIn(
+            "AssertionError: waited 5 s for a collection of garbage in this thread", failure[1]
+        )
+        self.assertIs(sys.unraisablehook, hook)
+        self.assertEqual(warnings.filters, filters)
 
 
 class FramesTest(StubTestCase):

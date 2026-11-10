@@ -1134,6 +1134,10 @@ class _OriginSession(requests.Session):
                 response=resp,
             )
         if failure is not None:
+            # requests reads and closes a redirect's answer only once it
+            # follows it, after this method: the answer refused here is
+            # closed before the error is raised, or its socket stays open.
+            resp.close()
             raise failure
         return target
 
