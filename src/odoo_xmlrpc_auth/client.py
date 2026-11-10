@@ -675,7 +675,7 @@ def _read_section(profile):
     except FileNotFoundError:
         # The folder or the file: the file cannot exist without its folder.
         failure = ConfigError(
-            f"Config file not found: {config_path}\n"
+            f"Config file not found: {config_path}. "
             f"Create it with a [{_SECTION}] section, the keys "
             + ", ".join(_REQUIRED_KEYS)
             + f", and the line {_ACCEPTED_API_LINES}"
