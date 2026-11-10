@@ -39,9 +39,9 @@ What else a 1.x caller meets:
   and urllib3 2.8.0, and on Python 3.13 with requests 2.32.3 and urllib3
   2.3.0; from 3.10, Python names a socket's timeout `TimeoutError`, the
   class a `RequestError` names for a timeout.
-- A profile is refused too when its `url` holds a backslash or port 0, or
-  when its `url`, `db`, `user` or `api` holds its `password` (§ Configure a
-  profile).
+- A profile is refused too when its `url` holds a backslash, port 0, a
+  query or a fragment, or when its `url`, `db`, `user` or `api` holds its
+  `password` (§ Configure a profile).
 - `ServerProxy` with a profile refuses `verbose=True`, and the library's
   connections print nothing at `http.client`'s debug level, where 1.x
   printed the password with each request (§ Security model).
@@ -394,12 +394,17 @@ The tool refuses to run if the config directory or files are accessible by
 group or others (like `ssh` does with `~/.ssh/`), or if `url` is not an http
 or https URL that names a host, with a port from 1 to 65535 if it has one,
 on one line of printable ASCII without spaces, or has a user or password
-before its host, or holds a backslash. The url is not shown, not even its
+before its host, or holds a backslash, or a query or a fragment, even an
+empty one (a lone `?` or `#`). The url is not shown, not even its
 scheme: xmlrpc.client would quote it, user info included, in its errors. A
 backslash and port 0 are refused because the two parsers of a url read
 them in different ways: requests ends the host at a backslash and sends a
 port 0 to the scheme's default port, where the profile's origin is read
-otherwise. An `api = json2` profile
+otherwise. A query or a fragment would swallow the path each request adds
+at the url's end (`/xmlrpc/2/common` and `/xmlrpc/2/object`, or
+`/json/2/<model>/<method>`), and no call could work; a path, as for a
+server behind a reverse proxy, is kept.
+An `api = json2` profile
 is refused too if its `password` is not an Odoo API key (40 lowercase
 hexadecimal digits) or its `db` is not one line of printable ASCII without
 spaces: JSON-2 sends both in headers. Neither is shown. It is refused as

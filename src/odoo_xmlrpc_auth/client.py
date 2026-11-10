@@ -592,15 +592,20 @@ def _check_url(section, config_path):
 def _url_fault(url):
     """The fault of ``url``, as the end of a sentence about it, or None
     when it names a host after one of _URL_SCHEMES, with a port from 1 to
-    65535 if it has one, no user or password and no backslash, on one line
-    of printable ASCII without spaces, and a host IDNA takes.
+    65535 if it has one, no user or password, no backslash and no query or
+    fragment, on one line of printable ASCII without spaces, and a host IDNA
+    takes. A path, such as that of a server behind a reverse proxy, passes.
 
     The transport quotes a url it refuses: the fault quotes no part of the
     url, not even its scheme, and is returned, never raised, so that the
     frame that raises holds no url. A backslash and port 0 are read one way
     by urllib.parse, which gives the profile's origin, and another by
     urllib3, which connects: the host ends at a backslash for urllib3, and
-    it drops port 0 for the scheme's default.
+    it drops port 0 for the scheme's default. A query or a fragment, even
+    an empty one, would swallow the API's path each request adds at the
+    url's end: over XML-RPC that path goes into the query, or after a # in
+    the request line; over JSON-2 into the query, or it is dropped with the
+    fragment, and the request goes to the url's own path.
     """
     try:
         parts = urllib.parse.urlsplit(url)
@@ -633,6 +638,15 @@ def _url_fault(url):
         fault = (
             "must hold no backslash: the JSON-2 transport ends the host at "
             "one, and would send the calls to another host"
+        )
+    # A lone ? or # makes an empty query or fragment, which urlsplit's parts
+    # cannot tell from none, and swallows the path all the same: the
+    # characters are looked for in the url itself.
+    elif "?" in url or "#" in url:
+        fault = (
+            "must hold no query or fragment, not even a lone ? or #: each "
+            "request adds its API's path at the url's end, where either would "
+            "swallow it"
         )
     elif port == 0:
         fault = "must name a port from 1 to 65535, if it names one"

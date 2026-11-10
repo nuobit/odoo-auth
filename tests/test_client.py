@@ -149,16 +149,19 @@ class UrlTest(StoreTestCase):
 
     A url holding the profile's own password is refused before these checks
     (PublicFieldTest): the urls here hold another secret, SECRET, such as
-    another account's password."""
+    another account's password.
 
-    def make_store_with_url(self, url):
+    So is a url through which no call could reach Odoo, over either API:
+    one with a query or a fragment."""
+
+    def make_store_with_url(self, url, api="xmlrpc", password=PASSWORD):
         self.make_store(
             "[odoo]\n"
             f"url = {url}\n"
             "db = odoo_db_test\n"
             "user = odoo_user_test\n"
-            "password = odoo_dummy_password_test\n"
-            "api = xmlrpc\n"
+            f"password = {password}\n"
+            f"api = {api}\n"
         )
 
     def test_a_url_with_a_password_is_refused_unshown(self):
@@ -273,6 +276,42 @@ class UrlTest(StoreTestCase):
         ):
             ServerProxy(profile="erp")
         self.common.authenticate.assert_not_called()
+
+    def test_a_url_with_a_query_or_a_fragment_is_refused_unshown(self):
+        # Each request adds its API's path at the url's end, where a query or
+        # a fragment would swallow it. A lone ? or # makes an empty one, which
+        # urlsplit's parts cannot tell from none.
+        urls = (
+            "https://odoo.example.com?x=1",
+            "https://odoo.example.com#frag",
+            "https://odoo.example.com?",
+            "https://odoo.example.com#",
+            "https://odoo.example.com/odoo?x=1",
+            "https://odoo.example.com/odoo#frag",
+            "https://odoo.example.com/odoo?",
+            "https://odoo.example.com/odoo#",
+        )
+        for api, password in (("xmlrpc", PASSWORD), ("json2", KEY)):
+            for url in urls:
+                with self.subTest(api=api, url=url):
+                    self.make_store_with_url(url, api, password)
+                    error = self.raised(ConfigError, lambda: Client(profile="erp"))
+                    self.assertRegex(
+                        str(error),
+                        r"^The url in .*/erp\.conf must hold no query or fragment, "
+                        r"not even a lone \? or #: each request adds its API's "
+                        r"path at the url's end, where either would swallow it$",
+                    )
+                    self.assertNeverShows(error, "odoo.example.com")
+                    self.assertNoFrameHolds(error, "odoo.example.com")
+
+    def test_a_url_with_a_path_passes(self):
+        # A server behind a reverse proxy, under a path of its host.
+        for api, password in (("xmlrpc", PASSWORD), ("json2", KEY)):
+            with self.subTest(api=api):
+                self.make_store_with_url("https://odoo.example.com/odoo", api, password)
+                with Client(profile="erp") as odoo:
+                    self.assertEqual(odoo.api, api)
 
     def test_a_host_that_idna_refuses_is_refused_unshown(self):
         # Both transports encode the host with IDNA before its lookup, and
