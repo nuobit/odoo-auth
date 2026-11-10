@@ -110,7 +110,10 @@ or a payload Python's json cannot read (`invalid JSON: …`, also for an int
 longer than it converts or nesting deeper than it follows). The library's
 own messages are one line each; an `OdooError` ends with Odoo's message,
 printed as it came, which can span lines (a traceback of the server's,
-for one).
+for one). A value a message quotes, such as a path, the name of a type,
+an error's code or a payload's key, shows quoted and escaped as Python's
+`repr` writes it when it holds a line break or another character that
+does not print, as a profile's name always does.
 
 ## Library usage
 
