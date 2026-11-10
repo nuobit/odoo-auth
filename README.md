@@ -108,7 +108,9 @@ the CLI exits with status 1, never with a traceback: one of the errors of
 `Client` below, in both forms of the payload, a call `Client` refuses
 (`ArgumentError`, such as an empty model, or NaN over JSON-2) among them,
 or a payload Python's json cannot read (`invalid JSON: …`, also for an int
-longer than it converts or nesting deeper than it follows). The library's
+longer than it converts or nesting deeper than it follows), or an answer
+JSON cannot write (over XML-RPC, a `dateTime`, `base64` or `bigdecimal`
+value), which Odoo sends after it ran the call. The library's
 own messages are one line each; an `OdooError` ends with Odoo's message,
 printed as it came, which can span lines (a traceback of the server's,
 for one). A value a message quotes, such as a path, the name of a type,

@@ -11,6 +11,7 @@ from .client import (
     OdooError,
     RequestError,
     _execute_kw,
+    _JSON_ERRORS,
     _one_line,
 )
 
@@ -65,6 +66,20 @@ def _named(call):
     return call["kwargs"] if call.get("kwargs") is not None else {}
 
 
+def _printed(answer):
+    """``answer``, Odoo's result, as the JSON text the CLI prints, or None
+    when JSON cannot write it: over XML-RPC, a dateTime, a base64 or a
+    bigdecimal value, or one nested deeper than json follows.
+
+    None, not json's error, whose frames hold the answer, which can echo
+    the password: the CLI ends with its own error, raised outside them."""
+    try:
+        text = json.dumps(answer)
+    except _JSON_ERRORS:
+        text = None
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Odoo call proxy, over the API the profile names — injects "
@@ -87,18 +102,27 @@ def main():
             if "args" in call:
                 # The form before 2.0, for an `api = xmlrpc` profile only:
                 # the library checks it and sends it as it is.
-                result = _execute_kw(
-                    odoo,
-                    call["model"],
-                    call["method"],
-                    call["args"],
-                    call.get("kwargs"),
+                printed = _printed(
+                    _execute_kw(
+                        odoo,
+                        call["model"],
+                        call["method"],
+                        call["args"],
+                        call.get("kwargs"),
+                    )
                 )
             else:
-                result = odoo.call(
-                    call["model"], call["method"], call.get("ids"), **_named(call)
+                printed = _printed(
+                    odoo.call(
+                        call["model"], call["method"], call.get("ids"), **_named(call)
+                    )
                 )
     except (ConfigError, AuthError, RequestError, OdooError, ArgumentError) as e:
         die(e)
-
-    print(json.dumps(result))
+    if printed is None:
+        die(
+            "Odoo ran the call, and its answer holds a value JSON cannot write, "
+            "such as a dateTime or base64 of XML-RPC: read back what the call "
+            "did before repeating it"
+        )
+    print(printed)
