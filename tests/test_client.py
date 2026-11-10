@@ -692,15 +692,32 @@ class Json2StoreTest(StoreTestCase):
     values with an error that quotes them: a json2 profile whose values
     cannot go there is refused before any call, without showing them."""
 
-    def make_json2_store(self, password=KEY, db="odoo_db_test"):
+    def make_json2_store(
+        self, password=KEY, db="odoo_db_test", url="https://odoo.example.com", api="json2"
+    ):
         self.make_store(
             "[odoo]\n"
-            "url = https://odoo.example.com\n"
+            f"url = {url}\n"
             f"db = {db}\n"
             "user = odoo_user_test\n"
             f"password = {password}\n"
-            "api = json2\n"
+            f"api = {api}\n"
         )
+
+    def test_a_url_requests_refuses_is_refused_unshown(self):
+        # requests refuses a host that starts with * as it prepares each
+        # call, before sending it. XML-RPC sends through http.client, which
+        # takes the host and looks it up.
+        self.make_json2_store(url="https://*.odoo.example.com")
+        error = self.raised(ConfigError, lambda: Client(profile="erp"))
+        self.assertIn(
+            "must be one requests can send, as `api = json2` goes through it",
+            str(error),
+        )
+        self.assertNeverShows(error, "odoo.example.com")
+        self.assertNoFrameHolds(error, "odoo.example.com")
+        self.make_json2_store(url="https://*.odoo.example.com", password=PASSWORD, api="xmlrpc")
+        Client(profile="erp").close()
 
     def test_a_password_that_is_not_an_api_key_is_refused_unshown(self):
         for password in (PASSWORD, KEY.upper(), KEY + "0", KEY[:-1] + "é"):
