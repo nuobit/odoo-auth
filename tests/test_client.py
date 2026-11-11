@@ -744,20 +744,33 @@ class Json2StoreTest(StoreTestCase):
             f"api = {api}\n"
         )
 
-    def test_a_url_requests_refuses_is_refused_unshown(self):
+    def test_a_url_requests_refuses_or_sends_elsewhere_is_refused_unshown(self):
         # requests refuses a host that starts with * as it prepares each
-        # call, before sending it. XML-RPC sends through http.client, which
-        # takes the host and looks it up.
-        self.make_json2_store(url="https://*.odoo.example.com")
-        error = self.raised(ConfigError, lambda: Client(profile="erp"))
-        self.assertIn(
-            "must be one requests can send, as `api = json2` goes through it",
-            str(error),
-        )
-        self.assertNeverShows(error, "odoo.example.com")
-        self.assertNoFrameHolds(error, "odoo.example.com")
-        self.make_json2_store(url="https://*.odoo.example.com", password=PASSWORD, api="xmlrpc")
-        Client(profile="erp").close()
+        # call, before sending it, and writes the others otherwise than
+        # urllib.parse, which gives the profile's origin, reads them: the
+        # library would refuse each call. XML-RPC sends through http.client,
+        # which takes each host as it is and looks it up.
+        urls = {
+            "a host that starts with *": ("https://*.odoo.example.com", "odoo.example.com"),
+            "an IPv6 zone": ("http://[fe80::1%eth0]:8069", "fe80::1"),
+            # requests decodes it into a host urllib.parse cannot read.
+            "an IPv6 zone that is the escape of a letter": ("http://[fe80::1%67]:8069", "fe80::1"),
+            "a dot written %2e": ("http://odoo%2eexample.invalid", "example.invalid"),
+            "a >": ("https://a>b.example.invalid", "example.invalid"),
+        }
+        for case, (url, host) in urls.items():
+            with self.subTest(case=case):
+                self.make_json2_store(url=url)
+                error = self.raised(ConfigError, lambda: Client(profile="erp"))
+                self.assertIn(
+                    "must be one requests sends to the same scheme, host and port, as "
+                    "`api = json2` goes through it",
+                    str(error),
+                )
+                self.assertNeverShows(error, host)
+                self.assertNoFrameHolds(error, host)
+                self.make_json2_store(url=url, password=PASSWORD, api="xmlrpc")
+                Client(profile="erp").close()
 
     def test_a_password_that_is_not_an_api_key_is_refused_unshown(self):
         for password in (PASSWORD, KEY.upper(), KEY + "0", KEY[:-1] + "é"):
