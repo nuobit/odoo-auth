@@ -340,12 +340,23 @@ class KeepAliveOdoo:
       comes on it is, and sets ``idle_read``.
     - "answer a head that cannot be read": a status line whose status is
       not a number; then the server closes the connection.
+    - "answer an error": a 500 whose body of 4 bytes its Content-Length
+      announces; the connection stays open.
+    - "answer an error in chunks": that 500, its body sent in chunks; the
+      connection stays open.
+    - "answer an error in chunks, then close": that 500 in chunks, saying
+      Connection: close; then the server closes the connection.
+    - "answer an error that stalls": a 500 whose head announces a body of
+      10 bytes, of which only the first 4 come; the connection stays open,
+      and the server reads on.
     - "drop": the server closes the connection unanswered, as one that ran
       the call and broke off before its answer.
     - "reset": the server resets the connection unanswered.
     """
 
     ANSWER = 3
+    # The 500's body, Fail, in chunks.
+    CHUNKED_FAIL = b"Transfer-Encoding: chunked\r\n\r\n4\r\nFail\r\n0\r\n\r\n"
 
     def __init__(self, plan=None):
         self.plan = plan if plan is not None else {}
@@ -401,6 +412,15 @@ class KeepAliveOdoo:
                 elif action == "answer a head that cannot be read":
                     connection.sendall(b"HTTP/1.1 two-hundred OK\r\n\r\n")
                     break
+                elif action == "answer an error":
+                    connection.sendall(self._error(b"Content-Length: 4\r\n\r\nFail"))
+                elif action == "answer an error in chunks":
+                    connection.sendall(self._error(self.CHUNKED_FAIL))
+                elif action == "answer an error in chunks, then close":
+                    connection.sendall(self._error(b"Connection: close\r\n" + self.CHUNKED_FAIL))
+                    break
+                elif action == "answer an error that stalls":
+                    connection.sendall(self._error(b"Content-Length: 10\r\n\r\nFail"))
                 elif action == "drop":
                     break
                 elif action == "reset":
@@ -436,6 +456,12 @@ class KeepAliveOdoo:
     @staticmethod
     def _what(path):
         return "login" if path == "/xmlrpc/2/common" else "call"
+
+    @staticmethod
+    def _error(rest):
+        """A 500 whose head ends with ``rest``, its last headers, the blank
+        line, then its body."""
+        return b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\n" + rest
 
     def _answer(self, path):
         if path.startswith("/xmlrpc/"):

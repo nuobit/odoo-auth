@@ -1054,6 +1054,27 @@ class _TimedConnection:
         self.sock.settimeout(self._read_timeout)
 
 
+class _AnswerClosing:
+    """For Client's http.client connections: closing one closes the answer
+    it gave last too. When the connection closes after an answer,
+    http.client hands that answer its socket (HTTPConnection.getresponse),
+    and xmlrpc.client does not close an answer it fails to read: a
+    transport that closes its connection after a failure (_Sending) then
+    leaves no socket open."""
+
+    _answer = None
+
+    def getresponse(self):
+        self._answer = super().getresponse()
+        return self._answer
+
+    def close(self):
+        super().close()
+        if self._answer is not None:
+            self._answer.close()
+            self._answer = None
+
+
 # Whether one of the library's connections is reading an answer, in this
 # thread or task (_Quiet.getresponse).
 _READING_OWN_ANSWER = contextvars.ContextVar("_READING_OWN_ANSWER", default=False)
@@ -1092,12 +1113,18 @@ class _Quiet:
             _READING_OWN_ANSWER.reset(reading)
 
 
-class _HTTPConnection(_Quiet, _TimedConnection, http.client.HTTPConnection):
-    """http.client's connection for http, with _TimedConnection."""
+class _HTTPConnection(
+    _Quiet, _AnswerClosing, _TimedConnection, http.client.HTTPConnection
+):
+    """http.client's connection for http, with _AnswerClosing and
+    _TimedConnection."""
 
 
-class _HTTPSConnection(_Quiet, _TimedConnection, http.client.HTTPSConnection):
-    """http.client's connection for https, with _TimedConnection."""
+class _HTTPSConnection(
+    _Quiet, _AnswerClosing, _TimedConnection, http.client.HTTPSConnection
+):
+    """http.client's connection for https, with _AnswerClosing and
+    _TimedConnection."""
 
 
 class _ProxyHTTPConnection(_Quiet, http.client.HTTPConnection):
@@ -1166,6 +1193,10 @@ class _Sending:
     connect timeout, a TLS handshake that fails) raises as it is, before
     anything was sent, and a failure of the open connection, but for the
     read timeout, raises _CutOff: the server may have read the request.
+    After any failure, whatever it raises, an interrupt such as Ctrl-C
+    among them, the connection is closed before the error goes on,
+    unchanged, and no socket of it is left open. A Fault, Odoo's own
+    answer, read whole, keeps it, as any answer does.
 
     ServerProxy keeps xmlrpc.client's own sending: it writes a request on
     its kept connection unchecked, and sends it again after those errors."""
@@ -1179,20 +1210,47 @@ class _Sending:
         ):
             self.close()
             connection = self.make_connection(host)
-        if connection.sock is None:
-            try:
+        try:
+            if connection.sock is None:
                 connection.connect()
-            except Exception:
-                # As single_request does, a connection that failed is not
-                # kept: a TLS handshake that fails leaves its TCP socket in it.
-                self.close()
-                raise
+            answer = self._answer(host, handler, request_body, verbose)
+        except xmlrpc.client.Fault:
+            # Read whole, at status 200: the connection is ready for the
+            # next request.
+            raise
+        except BaseException:
+            # Anything else leaves the connection unfit for the next request,
+            # and xmlrpc.client closes it only after an Exception raised in
+            # its own try. For a status other than 200 it reads the answer's
+            # body, only when it has a Content-Length, then raises its
+            # ProtocolError, both after that try: a body in chunks stays on
+            # the connection, and an answer that closes the connection keeps
+            # the socket http.client handed it. A TLS handshake that fails or is
+            # interrupted leaves the TCP socket in the connection: the one
+            # the ssl module detached, on which the check before reuse raises
+            # ValueError (its fileno is -1), or, interrupted before ssl takes
+            # it over, the plain one, which would carry the next request
+            # unencrypted. The TLS socket that took the detached one's
+            # descriptor over is closed by ssl itself after anything the
+            # handshake raises, from Python 3.11.8 and 3.12.2
+            # (SSLSocket._create): the reason the library requires 3.11.8 or
+            # later, but not 3.12.0 or 3.12.1. An interrupted send leaves the
+            # connection in the middle of a request. The connection is closed
+            # here, with the answer it handed its socket to (_AnswerClosing),
+            # and the error goes on as it is.
+            self.close()
+            raise
+        return answer
+
+    def _answer(self, host, handler, request_body, verbose):
+        """The answer to a request on the connection, open: a failure of
+        the connection, but for the read timeout, raises _CutOff."""
         failure = None
         try:
             answer = self.single_request(host, handler, request_body, verbose)
-        except socket.timeout:
+        except socket.timeout as timeout:
             # _ReadTimeout (_Timeouts), which says so itself.
-            raise
+            failure = timeout
         except (OSError, http.client.HTTPException) as error:
             # Its text can quote the url, and its frames hold the request:
             # _CutOff, raised after this block, keeps neither.

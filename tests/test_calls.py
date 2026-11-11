@@ -155,6 +155,29 @@ class StubTestCase(StoreMixin, unittest.TestCase):
         self.addCleanup(patcher.stop)
         return opened
 
+    def wait_for_heads(self):
+        """From now to the end of the test, each connection of http.client,
+        urllib3's among them, waits up to HOLD seconds for the head of an
+        answer, then reads its body under the timeout its socket had: a read
+        timeout far shorter than HOLD fires only where a body stops coming,
+        however late a stub on a loaded machine starts to answer."""
+        getresponse = http.client.HTTPConnection.getresponse
+
+        def waiting(connection):
+            sock = connection.sock
+            timeout = sock.gettimeout()
+            sock.settimeout(HOLD)
+            try:
+                return getresponse(connection)
+            finally:
+                # The body is read on that socket, also once http.client let
+                # it go for an answer that closes the connection.
+                sock.settimeout(timeout)
+
+        patcher = mock.patch.object(http.client.HTTPConnection, "getresponse", waiting)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def fail_on_resource_warnings(self):
         """Fail the test if it leaves a socket or a file open: from now to
         its end a ResourceWarning is an error, and a collection of garbage,
@@ -680,6 +703,9 @@ class NotXmlRpcTest(StubTestCase):
         self.assertNoFrameHolds(error, PASSWORD)
 
     def test_an_answer_to_a_call_that_cannot_be_read_says_the_call_may_have_run(self):
+        # The answer read in part is closed as the call ends, its socket
+        # with it, not left to the garbage collector.
+        opened = self.record_sockets(socket)
         odoo = self.start(RawXmlRpc())
         client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
         for case, answer in self.ANSWERS.items():
@@ -689,6 +715,7 @@ class NotXmlRpcTest(StubTestCase):
                     RequestError,
                     lambda: client.call("res.partner", "search_count", domain=[]),
                 )
+                self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
                 self.assertIsAnswerError(error, 200)
                 self.assertEqual(
                     str(error),
@@ -703,7 +730,9 @@ class NotXmlRpcTest(StubTestCase):
         # call: an answer that cannot be read, sent once, where
         # xmlrpc.client sends a request again on a reset
         # (Transport.request). Reading the answer's body raises it here, as
-        # a reset socket does.
+        # a reset socket does. The answer read in part is closed as the call
+        # ends, its socket with it, not left to the garbage collector.
+        opened = self.record_sockets(socket)
         odoo = self.start(RawXmlRpc())
         odoo.call_answer = Answer(200, xmlrpc_answer("<int>3</int>"))
         client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
@@ -713,6 +742,7 @@ class NotXmlRpcTest(StubTestCase):
             error = self.raised(
                 RequestError, lambda: client.call("res.partner", "search_count", domain=[])
             )
+        self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
         self.assertIsAnswerError(error, 200)
         self.assertEqual(
             [request["path"] for request in odoo.requests],
@@ -1769,8 +1799,9 @@ class KeptConnectionTest(StubTestCase):
     """Client keeps its connection from one call to the next, over both
     APIs, and checks it before a request goes out on it, as urllib3 checks a
     pooled one: a connection the server closed since its last answer carries
-    nothing, and the request goes out on a new one. ServerProxy keeps
-    xmlrpc.client's own sending."""
+    nothing, and the request goes out on a new one. Over XML-RPC, a failure
+    of a request, whatever it raises, closes its connection. ServerProxy
+    keeps xmlrpc.client's own sending."""
 
     def test_a_kept_connection_the_server_closed_carries_nothing(self):
         # The login closes its own connection (_log_in). Without the check,
@@ -1843,6 +1874,184 @@ class KeptConnectionTest(StubTestCase):
         first.close.assert_called_once_with()
         self.assertEqual(sent_requests(second), 1)
 
+    def test_a_connection_whose_error_answer_stalls_is_not_kept(self):
+        # An answer whose status is not 200, whose body stops coming on a
+        # connection that stays open: xmlrpc.client reads that body outside
+        # the try that closes a connection after a failure, so its read
+        # timeout kept the connection, its answer half read, for the next
+        # call to go out on. The read timeout waits for each answer's head
+        # (wait_for_heads): it fires for that body alone.
+        self.wait_for_heads()
+        odoo = self.start(KeepAliveOdoo({("call", 1): "answer an error that stalls"}))
+        self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+        with Client("erp", timeout=(5, 0.2)) as client:
+            error = self.raised(
+                RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+            self.assertEqual(error.timeout_fired, "read")
+            self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertEqual(odoo.requests, [(1, "login"), (2, "call"), (3, "call")])
+
+    def test_a_connection_whose_answer_is_not_a_200_is_not_kept(self):
+        # xmlrpc.client raises its ProtocolError for it outside the try that
+        # closes a connection after a failure, and reads its body only when
+        # it has a Content-Length. Sent in chunks, the body stayed unread on
+        # the connection, and the next call went out on it, to fail; on a
+        # connection that closes after it, the answer kept its socket open;
+        # with a Content-Length, the connection was kept.
+        opened = self.record_sockets(socket)
+        for action in (
+            "answer an error in chunks",
+            "answer an error in chunks, then close",
+            "answer an error",
+        ):
+            with self.subTest(action=action):
+                odoo = self.start(KeepAliveOdoo({("call", 1): action}))
+                self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+                with Client("erp") as client:
+                    error = self.raised(
+                        RequestError,
+                        lambda: client.call("res.partner", "search_count", domain=[]),
+                    )
+                    self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+                    self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                self.assertIsInstance(error, xmlrpc.client.ProtocolError)
+                self.assertEqual(
+                    str(error),
+                    "A request of profile 'erp' failed: ProtocolError, code 500. Its "
+                    "message is not shown, as it can quote the profile's values.",
+                )
+                self.assertEqual(odoo.requests, [(1, "login"), (2, "call"), (3, "call")])
+
+    def test_an_interrupted_request_closes_its_connection(self):
+        # An interrupt, such as Ctrl-C, is no Exception: xmlrpc.client's
+        # close after a failure missed it. As the request was sent, it left
+        # the connection in the middle of it, on which the next call failed;
+        # as the answer's head or its body was read, the answer unread on an
+        # open socket. It goes on unchanged, once the connection is closed.
+        points = {
+            "the request's send": (
+                http.client.HTTPConnection,
+                "send",
+                [(1, "login"), (2, "call"), (3, "call")],
+            ),
+            "the read of the answer's head": (
+                http.client.HTTPResponse,
+                "begin",
+                [(1, "login"), (2, "call"), (2, "call"), (3, "call")],
+            ),
+            # xmlrpc.client's parse_response reads the body and parses it,
+            # once the head was read.
+            "the read of the answer's body": (
+                xmlrpc.client.Transport,
+                "parse_response",
+                [(1, "login"), (2, "call"), (2, "call"), (3, "call")],
+            ),
+        }
+        opened = self.record_sockets(socket)
+        for point, (owner, step, received) in points.items():
+            with self.subTest(point=point):
+                odoo = self.start(KeepAliveOdoo())
+                self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+                interrupt = KeyboardInterrupt()
+                with Client("erp") as client:
+                    self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                    with mock.patch.object(owner, step, side_effect=interrupt):
+                        with self.assertRaises(KeyboardInterrupt) as raised:
+                            client.call("res.partner", "search_count", domain=[])
+                    self.assertIs(raised.exception, interrupt)
+                    self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+                    self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                # Once the server's threads are done, each request it read is
+                # recorded, the interrupted one's among them, in any order.
+                odoo.stop()
+                self.assertCountEqual(odoo.requests, received)
+
+    def test_an_interrupted_tls_handshake_leaves_nothing_for_the_next_call(self):
+        # Offline: the login is replaced, and the server, which speaks no
+        # TLS, reads any request sent in clear. Each TCP connection is real,
+        # and the ssl module's handshake raises an interrupt, then a reset,
+        # at the step each case names. Before ssl takes the socket over, the
+        # connection kept the plain socket, on which the next call went out
+        # unencrypted, the password in it; in the handshake, the socket ssl
+        # detached, on which the check before reuse raised ValueError. The TLS
+        # socket that took its descriptor over is closed by ssl itself after
+        # anything the handshake raises, the interrupt too, from Python 3.11.8
+        # and 3.12.2 (SSLSocket._create): that nothing is left open in the
+        # handshake rests on it, which is why the library requires 3.11.8 or
+        # later, but not 3.12.0 or 3.12.1. An earlier release's ssl, such as
+        # 3.11.6's, closes it after an OSError or a ValueError only, and
+        # leaves it open after the interrupt until it is collected.
+        self.fail_on_resource_warnings()
+        steps = {
+            "before ssl takes the socket over": (ssl.SSLContext, "wrap_socket"),
+            "in the handshake": (ssl.SSLSocket, "do_handshake"),
+        }
+        for case, (owner, step) in steps.items():
+            with self.subTest(case=case):
+                odoo = self.start(KeepAliveOdoo())
+                self.make_profile(odoo.url.replace("http://", "https://"), "xmlrpc", PASSWORD)
+                interrupt = KeyboardInterrupt()
+                reset = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+                with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", return_value=UID):
+                    with mock.patch.object(owner, step, side_effect=[interrupt, reset]):
+                        with Client("erp") as client:
+                            with self.assertRaises(KeyboardInterrupt) as raised:
+                                client.call("res.partner", "search_count", domain=[])
+                            error = self.raised(
+                                RequestError,
+                                lambda: client.call("res.partner", "search_count", domain=[]),
+                            )
+                self.assertIs(raised.exception, interrupt)
+                self.assertIsInstance(error, ConnectionResetError)
+                self.assertEqual(odoo.requests, [])
+
+    def test_an_interrupted_json2_tls_handshake_leaves_nothing_for_the_next_call(self):
+        # The test above over JSON-2, at the same two steps; JSON-2 has no
+        # login to replace. Offline: the server, which speaks no TLS, reads any
+        # request sent in clear. Each TCP connection is real, and the ssl
+        # module's handshake raises an interrupt, then a reset, at the step
+        # each case names; in the handshake, the TLS socket is the one ssl's
+        # own wrap_socket makes. urllib3 keeps the TCP socket in its connection
+        # while ssl wraps it (HTTPSConnection.connect): before ssl takes it
+        # over, the plain one, which would carry the next call unencrypted, the
+        # key in it; in the handshake, the one ssl detached. It closes that
+        # connection after anything a request raises, the interrupt too, and
+        # keeps it out of its pool (HTTPConnectionPool.urlopen): the reset,
+        # raised as the next call wraps its socket, shows that the call opened
+        # a new connection. The TLS socket that took the detached one's
+        # descriptor over is out of urllib3's reach: ssl closes it after
+        # anything the handshake raises, from Python 3.11.8 and 3.12.2
+        # (SSLSocket._create). An earlier release's ssl, such as 3.11.6's,
+        # leaves it open after the interrupt: the test fails there.
+        self.fail_on_resource_warnings()
+        steps = {
+            "before ssl takes the socket over": (ssl.SSLContext, "wrap_socket"),
+            "in the handshake": (ssl.SSLSocket, "do_handshake"),
+        }
+        for case, (owner, step) in steps.items():
+            with self.subTest(case=case):
+                odoo = self.start(KeepAliveOdoo())
+                self.make_profile(odoo.url.replace("http://", "https://"), "json2", KEY)
+                interrupt = KeyboardInterrupt()
+                reset = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+                with mock.patch.object(owner, step, side_effect=[interrupt, reset]):
+                    with Client("erp") as client:
+                        with self.assertRaises(KeyboardInterrupt) as raised:
+                            client.call("res.partner", "search_count", domain=[])
+                        error = self.raised(
+                            RequestError,
+                            lambda: client.call("res.partner", "search_count", domain=[]),
+                        )
+                self.assertIs(raised.exception, interrupt)
+                self.assertIsInstance(error, requests.ConnectionError)
+                self.assertEqual(
+                    str(error),
+                    "A request of profile 'erp' failed: ConnectionError. Its message is "
+                    "not shown, as it can quote the profile's values.",
+                )
+                self.assertEqual(odoo.requests, [])
+
     def test_server_proxy_writes_a_call_on_its_kept_connection_unchecked(self):
         # A guard of xmlrpc.client's own sending, which ServerProxy keeps:
         # the call goes out on the connection the server closed, and that
@@ -1870,15 +2079,23 @@ def sent_requests(tls_socket):
 
 
 class FailingAnswer(io.BytesIO):
-    """The file a fake TLS socket gives to read its answer, whose first line,
-    the status line, cannot be read: reading it raises ``failure``."""
+    """The file a fake TLS socket gives to read its answer: ``head``, its
+    first bytes if any, then any read past them raises ``failure``. Without
+    a head, its status line cannot be read."""
 
-    def __init__(self, failure):
-        super().__init__()
+    def __init__(self, failure, head=b""):
+        super().__init__(head)
         self.failure = failure
 
     def readline(self, size=-1):
-        raise self.failure
+        if self.tell() == len(self.getvalue()):
+            raise self.failure
+        return super().readline(size)
+
+    def read(self, size=-1):
+        if self.tell() == len(self.getvalue()):
+            raise self.failure
+        return super().read(size)
 
 
 class CutOffTest(StubTestCase):
@@ -2106,9 +2323,14 @@ class CutOffTest(StubTestCase):
     def test_an_xmlrpc_tls_handshake_that_fails_leaves_nothing_for_the_next_call(self):
         # Offline: the login is replaced, and the sockets are fakes. A
         # handshake that fails leaves its TCP socket in the connection
-        # (http.client's HTTPSConnection.connect), here one whose descriptor
-        # is a real socket's, the kept end of a pair, open and silent: kept,
-        # it would carry the next call, unencrypted.
+        # (http.client's HTTPSConnection.connect). The ssl module detaches
+        # that socket before its handshake, and the check before reuse
+        # raises ValueError on a detached one; here the handshake fails
+        # before ssl takes the socket over, as an interrupt there can
+        # (test_an_interrupted_tls_handshake_leaves_nothing_for_the_next_call),
+        # and leaves the socket whole: one whose descriptor is a real
+        # socket's, the kept end of a pair, open and silent. Kept, it would
+        # carry the next call unencrypted.
         kept_end, server_end = socket.socketpair()
         self.addCleanup(kept_end.close)
         self.addCleanup(server_end.close)
@@ -2161,6 +2383,65 @@ class CutOffTest(StubTestCase):
             "profile's values.",
         )
         self.assertEqual(odoo.requests, [(1, "login"), (2, "call")])
+
+    def test_a_call_whose_error_answer_breaks_off_leaves_no_socket_open(self):
+        # An answer whose status is not 200, on a connection that closes after
+        # it and so hands the answer its socket: xmlrpc.client reads that body
+        # outside the try that closes a connection after a failure, and a
+        # reset there left the answer and its socket open. Reading the body
+        # raises it here, as a reset socket does. The call says that the
+        # server may have run it, as any call cut off.
+        opened = self.record_sockets(socket)
+        odoo = self.start(RawXmlRpc())
+        odoo.call_answer = Answer(200, xmlrpc_answer("<int>3</int>"))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        odoo.call_answer = Answer(
+            500, b"<html>Internal Server Error</html>", {"Content-Type": "text/html"}
+        )
+        reset = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+        with mock.patch.object(http.client.HTTPResponse, "read", side_effect=reset):
+            error = self.raised(
+                RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+        self.assertIsInstance(error, ConnectionResetError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ConnectionResetError, code 104. It "
+            "failed after the call started to go out, before its answer was read "
+            "whole: the server may have run the call, so do not repeat it before "
+            "reading back what it did. Its message is not shown, as it can quote the "
+            "profile's values.",
+        )
+        self.assertEqual(
+            [request["path"] for request in odoo.requests],
+            ["/xmlrpc/2/common", "/xmlrpc/2/object", "/xmlrpc/2/object"],
+        )
+
+    def test_an_https_error_answer_that_breaks_off_is_closed(self):
+        # Offline, without a TLS handshake: the sockets are fakes, and the
+        # file the TLS socket gives to read its answer stands for a real
+        # socket's, which holds that socket open until it is closed. The
+        # answer, a 500 on a connection that closes after it, breaks off in
+        # its body.
+        answer_file = FailingAnswer(
+            ConnectionResetError(errno.ECONNRESET, "Connection reset by peer"),
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 10\r\n"
+            b"Connection: close\r\n\r\n",
+        )
+        tls_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+        tls_socket.makefile.return_value = answer_file
+        tcp_socket = mock.create_autospec(socket.socket, instance=True)
+        transport = _SafeTransport((2, 9.5))
+        with mock.patch("socket.create_connection", return_value=tcp_socket) as connect:
+            with mock.patch.object(ssl.SSLContext, "wrap_socket", return_value=tls_socket):
+                self.raised(
+                    odoo_xmlrpc_auth.client._CutOff,
+                    lambda: transport.request("127.0.0.1", "/xmlrpc/2/object", b"<call/>"),
+                )
+        connect.assert_called_once()
+        self.assertTrue(answer_file.closed)
 
     def test_an_answer_whose_head_cannot_be_read_says_the_call_may_have_run(self):
         # Over JSON-2, urllib3 raises it as a connection aborted.
