@@ -443,6 +443,11 @@ to see the wire, would print each request's headers and body, the API key
 or the password among them. A `transport` the caller gives `ServerProxy`
 is not the library's, and prints them at that level (§ ServerProxy: the
 XML-RPC drop-in). To see what a call sends, use a local stub.
+While one of them reads an answer, `urllib3` logs nothing either: its
+warning for headers it cannot parse quotes them as the server sent them,
+the API key among them when the server echoes it, and an application that
+configured logging (`logging.basicConfig()`) would print it. Every other
+record of the process is logged as before.
 
 What the transports take from the environment, and what they do not:
 

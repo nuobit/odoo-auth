@@ -1,9 +1,11 @@
 import configparser
+import contextvars
 import decimal
 import functools
 import http.client
 import inspect
 import json
+import logging
 import os
 import re
 import socket
@@ -874,15 +876,42 @@ class _TimedConnection:
         self.sock.settimeout(self._read_timeout)
 
 
+# Whether one of the library's connections is reading an answer, in this
+# thread or task (_Quiet.getresponse).
+_READING_OWN_ANSWER = contextvars.ContextVar("_READING_OWN_ANSWER", default=False)
+
+
+class _OwnAnswerRecords(logging.Filter):
+    """For urllib3.connection's logger: drops the records it logs while one
+    of the library's connections reads an answer, and lets every other
+    through as it is. Its warning for headers it cannot parse quotes them as
+    the server sent them, the API key among them when the server echoes it,
+    and any application that configured logging would print it."""
+
+    def filter(self, record):
+        return not _READING_OWN_ANSWER.get()
+
+
+logging.getLogger(urllib3.connection.__name__).addFilter(_OwnAnswerRecords())
+
+
 class _Quiet:
     """For every connection of http.client the library makes, Client's
     over both APIs and ServerProxy's with a profile: it prints nothing,
-    whatever the process's debug level. At http.client.HTTPConnection's
+    whatever the process's debug level, and while it reads an answer
+    urllib3 logs nothing (_OwnAnswerRecords). At http.client.HTTPConnection's
     debuglevel 1, as requests' docs set it to see the wire, a connection
     prints each request's headers and body, the API key or the password
     among them."""
 
     debuglevel = 0
+
+    def getresponse(self):
+        reading = _READING_OWN_ANSWER.set(True)
+        try:
+            return super().getresponse()
+        finally:
+            _READING_OWN_ANSWER.reset(reading)
 
 
 class _HTTPConnection(_Quiet, _TimedConnection, http.client.HTTPConnection):
