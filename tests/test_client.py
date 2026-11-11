@@ -5,8 +5,10 @@ endpoint that authenticates is replaced, so no test can reach a server. A
 store that cannot be read must not show its text: the error that says so
 carries none of it, in its message, its repr or a chained exception.
 
-A call after the authentication is stopped at xmlrpc.client's Transport,
-which raises what the test gives it. A refused connection is the
+A call after the authentication is stopped at its transport's request,
+which raises what the test gives it: xmlrpc.client's Transport.request for
+ServerProxy, Client's own (_Sending.request) for Client, which never goes
+through xmlrpc.client's. A refused connection is the
 ConnectionRefusedError(111, 'Connection refused') that xmlrpc.client raised
 for 127.0.0.1 port 1 on 2026-10-28; a ProtocolError is what xmlrpc.client
 raises for an HTTP status other than 200, its url being the host and the
@@ -39,6 +41,7 @@ from odoo_xmlrpc_auth.client import (
     _read_config,
     _Secret,
     _send,
+    _Sending,
 )
 from support import KEY, PASSWORD, StoreMixin
 
@@ -1135,7 +1138,7 @@ class OneLineTest(StoreTestCase):
         self.make_store(self.XMLRPC_STORE)
         self.common.authenticate.return_value = 7
         fault = xmlrpc.client.Fault("4\nfour", "Access denied\non res.partner")
-        with mock.patch.object(xmlrpc.client.Transport, "request", side_effect=fault):
+        with mock.patch.object(_Sending, "request", side_effect=fault):
             with Client(profile="erp") as odoo:
                 error = self.raised(OdooError, lambda: odoo.call("res.partner", "read", [7]))
         self.assertEqual(

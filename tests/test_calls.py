@@ -699,9 +699,10 @@ class NotXmlRpcTest(StubTestCase):
 
     def test_a_call_whose_answer_breaks_off_is_sent_once(self):
         # A connection reset as the answer comes, after the server ran the
-        # call: xmlrpc.client sends a request again on a reset
-        # (Transport.request), which would run the call twice. Reading the
-        # answer's body raises it here, as a reset socket does.
+        # call: an answer that cannot be read, sent once, where
+        # xmlrpc.client sends a request again on a reset
+        # (Transport.request). Reading the answer's body raises it here, as
+        # a reset socket does.
         odoo = self.start(RawXmlRpc())
         odoo.call_answer = Answer(200, xmlrpc_answer("<int>3</int>"))
         client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
@@ -1854,6 +1855,62 @@ def sent_requests(tls_socket):
     in what it was given to send."""
     sent = b"".join(call.args[0] for call in tls_socket.sendall.call_args_list)
     return sent.count(b"POST /xmlrpc/2/object HTTP/1.1\r\n")
+
+
+class CutOffTest(StubTestCase):
+    """Client sends each request once, the XML-RPC login's too, and never
+    again by itself after a failure: xmlrpc.client sends one a second time
+    after its connection was closed or reset before the answer
+    (Transport.request), and a server that ran the call would run it
+    twice. ServerProxy keeps that second sending.
+
+    The server here reads the request, then closes the connection without
+    answering ("drop"), as one that ran the call and broke off before its
+    answer."""
+
+    def test_a_call_cut_off_on_a_new_connection_is_sent_once(self):
+        # The login closes its own connection (_log_in): the first call
+        # goes out on a new one.
+        odoo = self.start(KeepAliveOdoo({("call", 1): "drop"}))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        error = self.raised(
+            RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+        )
+        self.assertIsInstance(error, http.client.RemoteDisconnected)
+        self.assertEqual(odoo.requests, [(1, "login"), (2, "call")])
+        self.assertNeverShows(error, PASSWORD)
+        self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_a_call_cut_off_on_a_kept_connection_is_sent_once(self):
+        odoo = self.start(KeepAliveOdoo({("call", 2): "drop"}))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        error = self.raised(
+            RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+        )
+        self.assertIsInstance(error, http.client.RemoteDisconnected)
+        self.assertEqual(odoo.requests, [(1, "login"), (2, "call"), (2, "call")])
+        self.assertNeverShows(error, PASSWORD)
+        self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_a_login_cut_off_is_sent_once(self):
+        odoo = self.start(KeepAliveOdoo({("login", 1): "drop"}))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        error = self.raised(
+            RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+        )
+        self.assertIsInstance(error, http.client.RemoteDisconnected)
+        self.assertEqual(odoo.requests, [(1, "login")])
+        self.assertNeverShows(error, PASSWORD)
+        self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_server_proxy_sends_a_call_cut_off_a_second_time(self):
+        # A guard of xmlrpc.client's own sending, which ServerProxy keeps.
+        odoo = self.start(KeepAliveOdoo({("call", 1): "drop"}))
+        self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+        with ServerProxy(profile="erp") as proxy:
+            self.assertEqual(proxy.execute_kw("res.partner", "search_count", [[]]), 3)
+        self.assertEqual(odoo.requests, [(1, "login"), (2, "call"), (3, "call")])
 
 
 # How long, in seconds, a stub holds a request at most before it lets the
