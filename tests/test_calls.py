@@ -15,6 +15,7 @@ import gzip
 import http.client
 import io
 import json
+import logging
 import os
 import socket
 import ssl
@@ -924,6 +925,28 @@ class Json2ClientTest(StubTestCase):
                 self.assertNeverShows(error, KEY)
                 self.assertNoFrameHolds(error, KEY)
         self.assertEqual(self.odoo.requests, [])
+
+    def test_urllib3_logs_nothing_of_an_answer_the_client_reads(self):
+        # urllib3 warns of headers it cannot parse, quoting them as the
+        # server sent them: here, a header whose name holds the key. An
+        # application that configured logging prints every warning; the one
+        # of another connection still reaches it.
+        logged = io.StringIO()
+        handler = logging.StreamHandler(logged)
+        logging.getLogger().addHandler(handler)
+        self.addCleanup(logging.getLogger().removeHandler, handler)
+        self.odoo.answers[("res.partner", "search_count")] = Answer(
+            200, 3, {f"X-Echo {KEY}": "echo"}
+        )
+        self.assertEqual(self.client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertEqual(logged.getvalue(), "")
+        with urllib3.HTTPConnectionPool("127.0.0.1", self.odoo.server.server_address[1]) as pool:
+            pool.request(
+                "POST",
+                "/json/2/res.partner/search_count",
+                headers={"Authorization": f"Bearer {KEY}"},
+            )
+        self.assertIn("Failed to parse headers", logged.getvalue())
 
     def test_a_redirect_to_a_url_that_names_no_origin_is_refused(self):
         self.odoo.answers[("res.partner", "read")] = Answer(
