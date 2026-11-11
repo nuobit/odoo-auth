@@ -626,21 +626,23 @@ def _check_public_fields(profile, section, password, config_path):
 
 def _check_url(section, config_path):
     """Raise ConfigError when the url of ``section``, the profile's, has a
-    fault (_url_fault), or, with `api = json2`, when requests refuses it
-    (_requests_refuses): each API's url must be one its transport sends,
-    http.client's for XML-RPC, requests' for JSON-2.
+    fault (_url_fault), or, with `api = json2`, when requests does not send
+    it to its own origin (_requests_sends_elsewhere): each API's url must be
+    one its transport sends, http.client's for XML-RPC, requests' for JSON-2.
 
     A url line that is wrong can hold a secret, such as another account's
     password before its host: no frame of the error holds the url, and its
     message quotes no part of it.
     """
     fault = _url_fault(section["url"])
-    if fault is None and section["api"] == "json2" and _requests_refuses(
+    if fault is None and section["api"] == "json2" and _requests_sends_elsewhere(
         section["url"]
     ):
         fault = (
-            "must be one requests can send, as `api = json2` goes through it: "
-            "requests refuses a host that starts with *, for one"
+            "must be one requests sends to the same scheme, host and port, as "
+            "`api = json2` goes through it: requests refuses a host that starts "
+            "with *, and writes some others otherwise, such as one with a % or a "
+            "> in it"
         )
     if fault is not None:
         raise ConfigError(f"The url in {_one_line(config_path)} {fault}")
@@ -658,7 +660,10 @@ def _url_fault(url):
     frame that raises holds no url. A backslash and port 0 are read one way
     by urllib.parse, which gives the profile's origin, and another by
     urllib3, which connects: the host ends at a backslash for urllib3, and
-    it drops port 0 for the scheme's default. A query or a fragment, even
+    it drops port 0 for the scheme's default. For `api = json2`, the origin
+    requests prepares for either differs as well (_requests_sends_elsewhere);
+    for `api = xmlrpc`, whose url requests never prepares, these rules are
+    the only ones. A query or a fragment, even
     an empty one, would swallow the API's path each request adds at the
     url's end: over XML-RPC that path goes into the query, or after a # in
     the request line; over JSON-2 into the query, or it is dropped with the
@@ -712,20 +717,29 @@ def _url_fault(url):
     return fault
 
 
-def _requests_refuses(url):
-    """Whether requests refuses ``url``, which _url_fault let through, as
-    it prepares a request for it before anything is sent: as it does for
-    a host that starts with * (requests' PreparedRequest.prepare_url).
+def _requests_sends_elsewhere(url):
+    """Whether requests, as it prepares a request for ``url``, which
+    _url_fault let through, refuses it, or gives it another origin than
+    ``url``'s: the auth would refuse each call, as it sets the key only for
+    the url's own origin (_BearerKey). requests
+    refuses a host that starts with * (PreparedRequest.prepare_url), and
+    writes some hosts otherwise than urllib.parse reads them: it quotes a >
+    or a {, writes the % of an IPv6 zone as %25 when no escape follows it
+    (%eth0), decodes a zone that starts with the escape of a letter, a digit
+    or one of -._~ into that character, its % gone (%67 gives g, and so does
+    %2567), and decodes %2e into a dot, as it drops port 0 and ends the host
+    at a backslash.
 
     requests owns what it sends: it is asked, not copied. Its error quotes
     the url, and is not raised over. It looks no name up and sends
     nothing."""
-    refused = False
     try:
-        requests.PreparedRequest().prepare_url(url, None)
+        prepared = requests.PreparedRequest()
+        prepared.prepare_url(url, None)
+        elsewhere = _origin(prepared.url) != _origin(url)
     except requests.RequestException:
-        refused = True
-    return refused
+        elsewhere = True
+    return elsewhere
 
 
 def _idna_refuses(hostname):

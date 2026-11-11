@@ -417,8 +417,11 @@ is refused too if its `password` is not an Odoo API key (40 lowercase
 hexadecimal digits) or its `db` is not one line of printable ASCII without
 spaces: JSON-2 sends both in headers. Neither is shown. It is refused as
 well if `requests`, which JSON-2 sends through, refuses its `url` as it
-prepares a request, as for a host that starts with `*`; XML-RPC sends
-through `http.client`, which takes such a host and looks it up.
+prepares a request, as for a host that starts with `*`, or prepares it for
+another scheme, host or port than the `url` names, as for a host with a
+`%`, a `>` or a `{` in it, which it writes otherwise, so that no call could
+go; XML-RPC sends through `http.client`, which takes such a host as it is
+and looks it up.
 
 A profile whose `url`, `db`, `user` or `api` holds its `password`, in any
 of the forms an error is masked in (§ Errors, above), is refused as well,
