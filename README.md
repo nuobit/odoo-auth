@@ -342,7 +342,8 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   is read, for a `timeout` that is not a `(connect, read)` tuple of two
   numbers (a `TypeError`) or whose values are not above 0 and at most
   `threading.TIMEOUT_MAX` (a `ValueError`); `ServerProxy(profile=...)`, for
-  `verbose=True` (a `ValueError`).
+  `verbose=True` (a `ValueError`). Its message then says that the `Client`
+  or the `ServerProxy` of the profile cannot be created.
 
 `ServerProxy` raises `ConfigError`, `AuthError` and `RequestError`, as in
 1.x; an Odoo `xmlrpc.client.Fault`, and an answer that is not XML-RPC,

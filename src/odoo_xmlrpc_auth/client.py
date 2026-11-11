@@ -269,7 +269,9 @@ class ArgumentError(Exception):
     encoder follows). Raised by Client too, before the profile is read, for
     a timeout that is not a (connect, read) tuple of positive numbers, and
     by ServerProxy with a profile for verbose, which would print each
-    request, the password among them.
+    request, the password among them: its message then says that the
+    Client or the ServerProxy cannot be created (``constructor``, the
+    class's name), not that a call cannot be sent.
 
     It carries the profile (``profile``) and the reason (``reason``), for a
     value the encoder's own text, which shows *** wherever it held the
@@ -278,16 +280,20 @@ class ArgumentError(Exception):
     RecursionError, so ``except TypeError`` and the like keep catching it.
     """
 
-    def __init__(self, profile, reason):
+    def __init__(self, profile, reason, constructor=None):
         self.profile = profile
         self.reason = reason
+        self._constructor = constructor
         super().__init__(str(self))
 
     def __str__(self):
-        return (
-            f"A call of profile {self.profile!r} cannot be sent: "
-            f"{_one_line(self.reason)}"
-        )
+        if self._constructor is not None:
+            refused = (
+                f"A {self._constructor} of profile {self.profile!r} cannot be created"
+            )
+        else:
+            refused = f"A call of profile {self.profile!r} cannot be sent"
+        return f"{refused}: {_one_line(self.reason)}"
 
 
 class RedirectError(requests.RequestException):
@@ -1230,8 +1236,9 @@ class ServerProxy(xmlrpc.client.ServerProxy):
             if given.arguments.get("verbose"):
                 raise _error_class(ArgumentError, ValueError)(
                     profile,
-                    "verbose would print each request, the password among them: "
-                    "ServerProxy takes no verbose with a profile",
+                    "it takes no verbose, which would print each request, the "
+                    "password among them",
+                    constructor="ServerProxy",
                 )
             config = _load_config(profile)
             if config["api"] != "xmlrpc":
@@ -1779,13 +1786,16 @@ def _check_timeout(profile, timeout):
         )
     ):
         raise _error_class(ArgumentError, TypeError)(
-            profile, "timeout must be a (connect, read) tuple of two numbers of seconds"
+            profile,
+            "timeout must be a (connect, read) tuple of two numbers of seconds",
+            constructor="Client",
         )
     if not all(0 < seconds <= threading.TIMEOUT_MAX for seconds in timeout):
         raise _error_class(ArgumentError, ValueError)(
             profile,
             "each timeout must be a number of seconds above 0 and at most "
             "threading.TIMEOUT_MAX",
+            constructor="Client",
         )
 
 

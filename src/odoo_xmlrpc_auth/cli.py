@@ -124,7 +124,8 @@ def main():
         die(e)
     if printed is None:
         die(
-            "Odoo answered the call with a value JSON cannot write, such as NaN, "
-            f"or a dateTime or base64 of XML-RPC: it ran the call, so {_READ_BACK}"
+            f"Odoo answered a call of profile {args.profile!r} with a value JSON "
+            "cannot write, such as NaN, or a dateTime or base64 of XML-RPC: it ran "
+            f"the call, so {_READ_BACK}"
         )
     print(printed)
