@@ -27,6 +27,7 @@ import xmlrpc.client
 from unittest import mock
 
 import requests
+import urllib3
 
 import odoo_xmlrpc_auth.client
 from odoo_xmlrpc_auth import cli
@@ -900,6 +901,29 @@ class Json2ClientTest(StubTestCase):
                 self.assertIsNone(caught.exception.response)
                 self.assertNeverShows(caught.exception, KEY)
         self.assertEqual(elsewhere.requests, [])
+
+    def test_an_error_of_urllib3_that_requests_lets_through_is_a_request_error(self):
+        # requests raises as it is an error of urllib3 its adapter does not
+        # know (HTTPAdapter.send), from frames that hold the key: under
+        # requests 2.34.2 and urllib3 2.3.0, the LocationParseError of a
+        # redirect to <origin>//x:y. urllib3's pool raises each here, on any
+        # version, the others with an __init__ or a repr of their own.
+        errors = {
+            "LocationParseError": urllib3.exceptions.LocationParseError("//x:y"),
+            "HeaderParsingError": urllib3.exceptions.HeaderParsingError([], b"X-Echo"),
+            "IncompleteRead": urllib3.exceptions.IncompleteRead(1, 399),
+        }
+        for name, raised in errors.items():
+            with self.subTest(error=name):
+                with mock.patch.object(urllib3.HTTPConnectionPool, "urlopen", side_effect=raised):
+                    error = self.raised(
+                        RequestError, lambda: self.client.call("res.partner", "read", [7])
+                    )
+                self.assertIsInstance(error, type(raised))
+                self.assertEqual((error.error_class, error.code), (name, None))
+                self.assertNeverShows(error, KEY)
+                self.assertNoFrameHolds(error, KEY)
+        self.assertEqual(self.odoo.requests, [])
 
     def test_a_redirect_to_a_url_that_names_no_origin_is_refused(self):
         self.odoo.answers[("res.partner", "read")] = Answer(

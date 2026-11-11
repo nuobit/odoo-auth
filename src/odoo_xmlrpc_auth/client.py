@@ -87,14 +87,17 @@ class _ReadTimeout(socket.timeout):
 
 # What a call raises in its transport: the socket's and TLS's errors, a
 # malformed HTTP answer, an HTTP status other than 200, every error of
-# requests, which are OSErrors, and an answer that is not XML-RPC. An Odoo
-# Fault is the server's answer, not one of them. IDNA's refusal of the host
-# (a UnicodeError over XML-RPC, urllib3's LocationParseError over JSON-2)
-# is not either: the load refuses such a host with the same codec
-# (_idna_refuses).
+# requests, which are OSErrors, every error of urllib3, which requests
+# raises as it is when its adapter does not know it (HTTPAdapter.send: under
+# requests 2.34.2 and urllib3 2.3.0, the LocationParseError of a redirect
+# to <origin>//x:y), and an answer that is not XML-RPC. An Odoo Fault is
+# the server's answer, not one of them. IDNA's refusal of the host, a
+# UnicodeError over XML-RPC, is not either: the load refuses such a host
+# with the same codec (_idna_refuses).
 _TRANSPORT_ERRORS = (
     OSError,
     http.client.HTTPException,
+    urllib3.exceptions.HTTPError,
     xmlrpc.client.ProtocolError,
     _InvalidAnswer,
 )
@@ -148,7 +151,8 @@ class RequestError(Exception):
     error's class, so ``except OSError``, ``except
     xmlrpc.client.ProtocolError``, ``except requests.ConnectionError`` and the
     like keep catching it; standing for an error of requests, its
-    ``request`` and ``response`` are None. For an answer that is not XML-RPC,
+    ``request`` and ``response`` are None, and standing for one of urllib3,
+    it has none of that error's own fields. For an answer that is not XML-RPC,
     Client's stands for xmlrpc.client's ResponseError, whatever the parser
     raised. Such an answer, and one that is not JSON (JSONDecodeError, code
     200), came from a server that answered: answering a call, it may have
@@ -174,8 +178,18 @@ class RequestError(Exception):
             # other arguments (requests' JSONDecodeError takes a document
             # and a position).
             requests.RequestException.__init__(self, str(self))
+        elif isinstance(self, urllib3.exceptions.HTTPError):
+            # urllib3's own __init__s take what each error describes (a
+            # pool, a url, a location, a count of bytes), none of which this
+            # one keeps.
+            Exception.__init__(self, str(self))
         else:
             super().__init__(str(self))
+
+    def __repr__(self):
+        # Its message: the class it stands for can write its repr from the
+        # fields this one does not keep (urllib3's IncompleteRead).
+        return f"{type(self).__name__}({str(self)!r})"
 
     def __str__(self):
         code = f", code {_one_line(self.code)}" if self.code is not None else ""
@@ -679,7 +693,7 @@ def _idna_refuses(hostname):
     look it up (socket.getaddrinfo over XML-RPC, urllib3's
     create_connection over JSON-2), and its refusal is a UnicodeError, or
     urllib3's LocationParseError, that quotes the host: the load refuses
-    such a host, so that no call meets either.
+    such a host, so that no call meets that refusal.
     """
     refused = False
     try:
