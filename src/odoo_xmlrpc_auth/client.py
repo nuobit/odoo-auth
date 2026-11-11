@@ -23,15 +23,22 @@ import urllib3
 # the connection, then to wait for the answer once connected. A Client
 # takes others at its creation.
 _DEFAULT_TIMEOUT = (30, 600)
+# What a message says to do, after the words "the call", when the server
+# may have run the call: RequestError's notes below, and the CLI's message
+# for an answer JSON cannot write.
+_READ_BACK = "do not repeat it before reading back what it did"
 # What a RequestError adds to its message when one of Client's timeouts
 # fired, by its timeout_fired.
 _TIMEOUT_NOTES = {
     "connect": "The connect timeout fired, before anything was sent. ",
     "read": (
         "The read timeout fired: the server may still complete the call, so "
-        "do not repeat it before reading back what it did. "
+        f"{_READ_BACK}. "
     ),
 }
+# What it adds for an answer to a call that came with status 200 and could
+# not be read (code 200).
+_ANSWERED_NOTE = f"The server answered: it may have run the call, so {_READ_BACK}. "
 _SECTION = "odoo"
 _REQUIRED_KEYS = ("url", "db", "user", "password")
 # The values of a profile a caller may print (Client's repr shows the api):
@@ -58,7 +65,11 @@ _API_KEY = re.compile(r"[0-9a-f]{40}")
 # value, a fault without one (IndexError, a LookupError); XML that names an
 # encoding Python does not know (LookupError, from expat's handler of
 # unknown encodings); a bigdecimal that is not a number; a gzip body cut
-# short or corrupt. A body that is not gzip at all is an OSError.
+# short or corrupt. Reading the body raises the others _AnswerParsing
+# takes: http.client's IncompleteRead (an HTTPException) for a body cut
+# short or sent in bad chunks, gzip's BadGzipFile (an OSError) for one that
+# is not the gzip it says, and a socket's OSError for a connection that
+# breaks off as it comes.
 _PARSE_ERRORS = (
     xml.parsers.expat.ExpatError,
     xmlrpc.client.ResponseError,
@@ -72,9 +83,16 @@ _PARSE_ERRORS = (
 
 
 class _InvalidAnswer(Exception):
-    """Raised by Client's XML-RPC transports for an answer that is not
-    XML-RPC, whatever their parser raised for it: a RequestError stands for
-    it as xmlrpc.client's ResponseError."""
+    """Raised by Client's XML-RPC transports for an answer they cannot read
+    as XML-RPC, whatever reading or parsing it raised: a RequestError stands
+    for it as xmlrpc.client's ResponseError. ``status`` is 200 for the
+    answer to a call, which xmlrpc.client reads only at that status
+    (Transport.single_request), and None for the login's, after which no
+    call was sent (_XmlRpc._request)."""
+
+    def __init__(self, status=None):
+        super().__init__()
+        self.status = status
 
 
 class _ConnectTimeout(socket.timeout):
@@ -154,15 +172,20 @@ class RequestError(Exception):
     xmlrpc.client.ProtocolError``, ``except requests.ConnectionError`` and the
     like keep catching it; standing for an error of requests, its
     ``request`` and ``response`` are None, and standing for one of urllib3,
-    it has none of that error's own fields. For an answer that is not XML-RPC,
-    Client's stands for xmlrpc.client's ResponseError, whatever the parser
-    raised. Such an answer, and one that is not JSON (JSONDecodeError, code
-    200), came from a server that answered: answering a call, it may have
-    run it, so a retry would run it again.
+    it has none of that error's own fields. For an answer that cannot be
+    read as XML-RPC, Client's stands for xmlrpc.client's ResponseError,
+    whatever reading or parsing it raised.
+
+    When the answer to a call came with status 200 and could not be read,
+    not XML-RPC, not JSON (JSONDecodeError), cut short, sent in bad chunks,
+    not the gzip it says, or broken off, ``code`` is 200, on both APIs, and
+    the message says that the server may have run the call, so that a
+    retry would run it again.
 
     When one of Client's timeouts fired, ``timeout_fired`` says which,
     "connect" or "read" (None otherwise), and so does the message: after a
-    read timeout the server may still complete the call.
+    read timeout the server may still complete the call. Its ``code`` is
+    then None, wherever the timeout fired.
     """
 
     def __init__(self, profile, error_class, code=None, timeout_fired=None):
@@ -195,9 +218,12 @@ class RequestError(Exception):
 
     def __str__(self):
         code = f", code {_one_line(self.code)}" if self.code is not None else ""
-        note = (
-            _TIMEOUT_NOTES[self.timeout_fired] if self.timeout_fired is not None else ""
-        )
+        if self.timeout_fired is not None:
+            note = _TIMEOUT_NOTES[self.timeout_fired]
+        elif self.code == 200:
+            note = _ANSWERED_NOTE
+        else:
+            note = ""
         return (
             f"A request of profile {self.profile!r} failed: "
             f"{_one_line(self.error_class)}{code}. {note}Its message is not "
@@ -283,17 +309,17 @@ def _error_class(base, error_class):
     return type(base.__name__, (base, error_class), {})
 
 
-def _request_error(profile, error):
-    """The RequestError raised instead of ``error``, one of _TRANSPORT_ERRORS."""
-    if isinstance(error, xmlrpc.client.ProtocolError):
-        code = error.errcode
-    elif isinstance(error, requests.RequestException):
-        # The status of the answer it came with, such as a redirect's.
-        code = error.response.status_code if error.response is not None else None
-    elif isinstance(error, OSError):
-        code = error.errno
-    else:
-        code = None
+def _request_error(profile, error, status=None):
+    """The RequestError raised instead of ``error``, one of _TRANSPORT_ERRORS.
+
+    ``status`` is given when ``error`` was raised reading the body of an
+    answer to a call, and is that answer's status: its code, as the server
+    answered (an answer of XML-RPC that cannot be read gives its own,
+    _InvalidAnswer). A timeout keeps its code None, wherever it fired:
+    timeout_fired reports it."""
+    answered = error.status if isinstance(error, _InvalidAnswer) else status
+    fired = _timeout_fired(error)
+    code = answered if answered is not None and fired is None else _error_code(error)
     # The library's own signals stand for the public class they are: an
     # answer that is not XML-RPC for xmlrpc.client's own error for it, as
     # its parser's errors are no class a caller catches; a timeout of
@@ -305,8 +331,23 @@ def _request_error(profile, error):
     else:
         stands_for = type(error)
     return _error_class(RequestError, stands_for)(
-        profile, stands_for.__name__, code, _timeout_fired(error)
+        profile, stands_for.__name__, code, fired
     )
+
+
+def _error_code(error):
+    """The errno or the HTTP status of ``error``, one of _TRANSPORT_ERRORS,
+    if it has one, else None."""
+    if isinstance(error, xmlrpc.client.ProtocolError):
+        code = error.errcode
+    elif isinstance(error, requests.RequestException):
+        # The status of the answer it came with, such as a redirect's.
+        code = error.response.status_code if error.response is not None else None
+    elif isinstance(error, OSError):
+        code = error.errno
+    else:
+        code = None
+    return code
 
 
 def _timeout_fired(error):
@@ -835,15 +876,22 @@ def _read_config(profile):
 
 
 class _AnswerParsing:
-    """For xmlrpc.client's transports: an answer they cannot parse as
-    XML-RPC raises _InvalidAnswer, whatever their parser raised for it.
-    Client's transports have it; ServerProxy keeps xmlrpc.client's own."""
+    """For xmlrpc.client's transports: an answer they cannot read as
+    XML-RPC raises _InvalidAnswer, whatever reading or parsing it raised but
+    the socket's timeout, the read timeout's, which goes on to _Timeouts.
+    Client's transports have it; ServerProxy keeps xmlrpc.client's own.
+
+    xmlrpc.client sends a request again when its connection is reset
+    (Transport.request): as an _InvalidAnswer, a connection reset while the
+    answer comes, which the server sent after it ran the call, is not."""
 
     def parse_response(self, response):
         failure = None
         try:
             answer = super().parse_response(response)
-        except _PARSE_ERRORS:
+        except socket.timeout:
+            raise
+        except (*_PARSE_ERRORS, http.client.HTTPException, OSError):
             # Their text can quote the answer, and their traceback's frames
             # hold the request: _InvalidAnswer, raised after this block,
             # keeps neither, nor does the RequestError raised for it.
@@ -1505,8 +1553,15 @@ class _XmlRpc:
     def _request(self, body):
         """The answer to ``body``, a request of execute_kw, as ServerProxy
         gives it (Python 3.11, ServerProxy.__request): its one value, or
-        the tuple of them when it holds another number."""
-        answer = self._transport.request(self._host, self._handler, body)
+        the tuple of them when it holds another number. An answer it cannot
+        read raises _InvalidAnswer at status 200: the call's own."""
+        failure = None
+        try:
+            answer = self._transport.request(self._host, self._handler, body)
+        except _InvalidAnswer:
+            failure = _InvalidAnswer(200)
+        if failure is not None:
+            raise failure
         return answer[0] if len(answer) == 1 else answer
 
     def close(self):
@@ -1583,6 +1638,8 @@ class _Json2:
                         "X-Odoo-Database": self._db,
                     },
                     timeout=self._timeout,
+                    # The body is read in _outcome, where its status is known.
+                    stream=True,
                 )
             ),
         )
@@ -1591,15 +1648,28 @@ class _Json2:
         return result
 
     def _outcome(self, response):
-        """The outcome of ``response``, the answer to a call: (None, the
-        result it carries), or (the error it stands for, None).
+        """The outcome of ``response``, the answer to a call, whose body it
+        reads: (None, the result it carries), or (the error it stands for,
+        None). A body that cannot be read, cut short, sent in bad chunks, not
+        the gzip it says or broken off, is the error of its transport with
+        the answer's status as its code (_request_error).
 
         Returned, not raised: the frame that raises the error holds neither
         the answer, whose request carries the key in its headers, nor its
         body, which can echo the key, unmasked.
         """
         status = response.status_code
-        answer = _loaded(response.content)
+        failure = None
+        try:
+            content = response.content
+        except _TRANSPORT_ERRORS as error:
+            failure = _request_error(self._profile, error, status)
+        if failure is not None:
+            # An answer read in part keeps its connection until it is closed
+            # (requests' stream=True).
+            response.close()
+            return failure, None
+        answer = _loaded(content)
         if status == 200:
             if answer is _NOT_JSON:
                 outcome = (

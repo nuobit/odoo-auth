@@ -10,6 +10,7 @@ Run from the repository root:
 
 import contextlib
 import datetime
+import errno
 import gc
 import gzip
 import http.client
@@ -54,6 +55,7 @@ from support import (
     Answer,
     HttpRecorder,
     Json2Odoo,
+    RawAnswer,
     RawXmlRpc,
     StoreMixin,
     XmlRpcOdoo,
@@ -598,11 +600,14 @@ def _gzip_corrupt():
 
 
 class NotXmlRpcTest(StubTestCase):
-    """An answer that is not XML-RPC, to the login or to a call, is a
-    RequestError that stands for xmlrpc.client's ResponseError, whatever its
-    parser raised; no frame of it holds the password."""
+    """An answer that cannot be read as XML-RPC, to the login or to a call,
+    is a RequestError that stands for xmlrpc.client's ResponseError,
+    whatever reading or parsing it raised; no frame of it holds the
+    password. A call's has code 200, the status it came with, and its
+    message says that the server may have run the call; the login's has
+    none, as no call was sent."""
 
-    # Each answer, after what xmlrpc.client's parser raises for it.
+    # Each answer, after what xmlrpc.client raises reading it.
     ANSWERS = {
         "ExpatError: a page that is not XML": Answer(200, b"<html><body>Log in</html>"),
         "ResponseError: XML that is no answer": Answer(200, b"<html><body>Log in</body></html>"),
@@ -636,39 +641,76 @@ class NotXmlRpcTest(StubTestCase):
         "zlib.error: a gzip body corrupt": Answer(
             200, _gzip_corrupt(), {"Content-Encoding": "gzip"}
         ),
+        "IncompleteRead: a body cut short": RawAnswer(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: 400\r\n\r\n"
+            b"<?xml version='1.0'?><methodResponse>"
+        ),
+        "IncompleteRead: a body sent in bad chunks": RawAnswer(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"zz\r\n<?xml version='1.0'?>\r\n0\r\n\r\n"
+        ),
+        "BadGzipFile: a body that is not the gzip it says": Answer(
+            200, xmlrpc_answer("<int>7</int>"), {"Content-Encoding": "gzip"}
+        ),
     }
 
-    def assertIsAnswerError(self, error):
+    def assertIsAnswerError(self, error, code):
         self.assertIsInstance(error, xmlrpc.client.ResponseError)
-        self.assertEqual((error.error_class, error.code), ("ResponseError", None))
+        self.assertEqual((error.error_class, error.code), ("ResponseError", code))
         self.assertNeverShows(error, PASSWORD)
         self.assertNoFrameHolds(error, PASSWORD)
 
-    def test_an_answer_to_a_call_that_is_not_xml_rpc_is_a_request_error(self):
+    def test_an_answer_to_a_call_that_cannot_be_read_says_the_call_may_have_run(self):
         odoo = self.start(RawXmlRpc())
         client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
         for case, answer in self.ANSWERS.items():
             with self.subTest(case=case):
                 odoo.call_answer = answer
-                self.assertIsAnswerError(
-                    self.raised(
-                        RequestError,
-                        lambda: client.call("res.partner", "search_count", domain=[]),
-                    )
+                error = self.raised(
+                    RequestError,
+                    lambda: client.call("res.partner", "search_count", domain=[]),
+                )
+                self.assertIsAnswerError(error, 200)
+                self.assertEqual(
+                    str(error),
+                    "A request of profile 'erp' failed: ResponseError, code 200. The "
+                    "server answered: it may have run the call, so do not repeat it "
+                    "before reading back what it did. Its message is not shown, as it "
+                    "can quote the profile's values.",
                 )
 
-    def test_an_answer_to_the_login_that_is_not_xml_rpc_is_a_request_error(self):
+    def test_a_call_whose_answer_breaks_off_is_sent_once(self):
+        # A connection reset as the answer comes, after the server ran the
+        # call: xmlrpc.client sends a request again on a reset
+        # (Transport.request), which would run the call twice. Reading the
+        # answer's body raises it here, as a reset socket does.
+        odoo = self.start(RawXmlRpc())
+        odoo.call_answer = Answer(200, xmlrpc_answer("<int>3</int>"))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        reset = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+        with mock.patch.object(http.client.HTTPResponse, "read", side_effect=reset):
+            error = self.raised(
+                RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        self.assertIsAnswerError(error, 200)
+        self.assertEqual(
+            [request["path"] for request in odoo.requests],
+            ["/xmlrpc/2/common", "/xmlrpc/2/object", "/xmlrpc/2/object"],
+        )
+
+    def test_an_answer_to_the_login_that_cannot_be_read_is_a_request_error(self):
         odoo = self.start(RawXmlRpc())
         for number, (case, answer) in enumerate(self.ANSWERS.items()):
             with self.subTest(case=case):
                 odoo.login_answer = answer
                 client = self.make_client(odoo.url, "xmlrpc", PASSWORD, f"login-{number}")
-                self.assertIsAnswerError(
-                    self.raised(
-                        RequestError,
-                        lambda: client.call("res.partner", "search_count", domain=[]),
-                    )
+                error = self.raised(
+                    RequestError,
+                    lambda: client.call("res.partner", "search_count", domain=[]),
                 )
+                self.assertIsAnswerError(error, None)
+                self.assertNotIn("The server answered", str(error))
         self.assertEqual(
             [request["path"] for request in odoo.requests],
             ["/xmlrpc/2/common"] * len(self.ANSWERS),
@@ -694,7 +736,8 @@ class NotXmlRpcTest(StubTestCase):
                     self.raised(
                         RequestError,
                         lambda: client.call("res.partner", "search_count", domain=[]),
-                    )
+                    ),
+                    None,
                 )
         self.assertEqual(
             [request["path"] for request in odoo.requests],
@@ -870,6 +913,67 @@ class Json2ClientTest(StubTestCase):
             (caught.exception.error_class, caught.exception.code), ("JSONDecodeError", 200)
         )
         self.assertNeverShows(caught.exception, KEY)
+
+    def test_a_200_whose_body_cannot_be_read_says_the_call_may_have_run(self):
+        # Odoo answers 200 once the call ran: a retry would run it again. The
+        # answer read in part is closed as the call ends, its socket with it,
+        # not left to the garbage collector.
+        answers = {
+            "not JSON": (
+                "JSONDecodeError",
+                Answer(200, f"<html>Log in {KEY}</html>".encode(), {"Content-Type": "text/html"}),
+            ),
+            "cut short": (
+                "ChunkedEncodingError",
+                RawAnswer(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: 400\r\n\r\n3"
+                ),
+            ),
+            "sent in bad chunks": (
+                "ChunkedEncodingError",
+                RawAnswer(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Transfer-Encoding: chunked\r\n\r\nzz\r\n3\r\n0\r\n\r\n"
+                ),
+            ),
+            # Over HTTP/1.1, which keeps the connection, and longer than one
+            # read of requests (10 KiB): urllib3 decodes the first read, which
+            # is not gzip, before the rest has come, and leaves the
+            # connection open.
+            "not the gzip it says": (
+                "ContentDecodingError",
+                RawAnswer(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Content-Encoding: gzip\r\nContent-Length: 20003\r\n\r\n[3]"
+                    + b" " * 20_000
+                ),
+            ),
+        }
+        send = requests.Session.send
+        responses = []
+
+        def recording_send(session, request, **kwargs):
+            responses.append(send(session, request, **kwargs))
+            return responses[-1]
+
+        for case, (error_class, answer) in answers.items():
+            with self.subTest(case=case):
+                self.odoo.answers[("res.partner", "write")] = answer
+                with mock.patch.object(requests.Session, "send", recording_send):
+                    error = self.raised(
+                        RequestError,
+                        lambda: self.client.call("res.partner", "write", [7], vals={}),
+                    )
+                self.assertTrue(responses[-1].raw.closed)
+                self.assertEqual((error.error_class, error.code), (error_class, 200))
+                self.assertIn(
+                    "The server answered: it may have run the call, so do not repeat "
+                    "it before reading back what it did.",
+                    str(error),
+                )
+                self.assertNeverShows(error, KEY)
+                self.assertNoFrameHolds(error, KEY)
 
     def test_a_refused_connection_is_a_request_error(self):
         client = self.make_client(f"http://127.0.0.1:{free_port()}", "json2", KEY, "other")
@@ -1887,10 +1991,32 @@ class TimeoutTest(StubTestCase):
                 RequestError, lambda: client.call("res.partner", "search_count", domain=[])
             )
         self.assertIsInstance(error, requests.ConnectionError)
-        self.assertEqual(error.timeout_fired, "read")
+        # A timeout has no code, wherever it fired: the answer's status 200
+        # is not its code.
+        self.assertEqual((error.timeout_fired, error.code), ("read", None))
         self.assertIn("The read timeout fired", str(error))
         self.assertNeverShows(error, KEY)
         self.assertNoFrameHolds(error, KEY)
+
+    def test_an_xmlrpc_answer_whose_body_stops_coming_is_a_read_timeout(self):
+        # Not an answer that cannot be read: the read timeout fired.
+        odoo = self.start(RawXmlRpc())
+        released = threading.Event()
+        self.addCleanup(released.set)
+        odoo.call_answer = RawAnswer(
+            b"HTTP/1.0 200 OK\r\nContent-Type: text/xml\r\nContent-Length: 400\r\n\r\n"
+            b"<?xml version='1.0'?>",
+            after=lambda: released.wait(HOLD),
+        )
+        self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+        with Client("erp", timeout=(5, 0.2)) as client:
+            error = self.raised(
+                RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        self.assertIsInstance(error, socket.timeout)
+        self.assertEqual((error.timeout_fired, error.code), ("read", None))
+        self.assertNeverShows(error, PASSWORD)
+        self.assertNoFrameHolds(error, PASSWORD)
 
     def test_server_proxy_sets_no_timeout(self):
         odoo = self.start(XmlRpcOdoo())
@@ -2160,9 +2286,9 @@ class CliTest(StubTestCase):
                 self.assertEqual((code, out), (1, ""))
                 self.assertEqual(
                     err,
-                    "Error: Odoo ran the call, and its answer holds a value JSON "
-                    "cannot write, such as a dateTime or base64 of XML-RPC: read "
-                    "back what the call did before repeating it\n",
+                    "Error: Odoo answered the call with a value JSON cannot write, "
+                    "such as a dateTime or base64 of XML-RPC: it ran the call, so do "
+                    "not repeat it before reading back what it did\n",
                 )
 
     def test_a_value_json2_cannot_send_ends_as_one_message(self):

@@ -13,6 +13,7 @@ from .client import (
     _execute_kw,
     _JSON_ERRORS,
     _one_line,
+    _READ_BACK,
 )
 
 # What a payload holds: model and method, then ids and kwargs for
@@ -121,8 +122,7 @@ def main():
         die(e)
     if printed is None:
         die(
-            "Odoo ran the call, and its answer holds a value JSON cannot write, "
-            "such as a dateTime or base64 of XML-RPC: read back what the call "
-            "did before repeating it"
+            "Odoo answered the call with a value JSON cannot write, such as a "
+            f"dateTime or base64 of XML-RPC: it ran the call, so {_READ_BACK}"
         )
     print(printed)
