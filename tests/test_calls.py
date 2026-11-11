@@ -1665,9 +1665,9 @@ class WireDebugTest(StubTestCase):
                 self.assertIsInstance(error, ValueError)
                 self.assertEqual(
                     str(error),
-                    "A call of profile 'no-such-profile' cannot be sent: verbose "
-                    "would print each request, the password among them: "
-                    "ServerProxy takes no verbose with a profile",
+                    "A ServerProxy of profile 'no-such-profile' cannot be created: "
+                    "it takes no verbose, which would print each request, the "
+                    "password among them",
                 )
 
 
@@ -1889,13 +1889,19 @@ class TimeoutTest(StubTestCase):
             "infinite": ((30, float("inf")), ValueError),
             "beyond what a socket takes": ((30, 1e10), ValueError),
         }
+        messages = {
+            TypeError: "A Client of profile 'erp' cannot be created: timeout must be a "
+            "(connect, read) tuple of two numbers of seconds",
+            ValueError: "A Client of profile 'erp' cannot be created: each timeout must "
+            "be a number of seconds above 0 and at most threading.TIMEOUT_MAX",
+        }
         for case, (timeout, error_class) in cases.items():
             with self.subTest(case=case):
                 error = self.raised(
                     ArgumentError, lambda: Client("erp", timeout=timeout)
                 )
                 self.assertIsInstance(error, error_class)
-                self.assertIn("timeout", str(error))
+                self.assertEqual(str(error), messages[error_class])
 
     def test_a_client_takes_the_largest_timeout_a_socket_takes(self):
         odoo = self.start(Json2Odoo())
@@ -2302,29 +2308,39 @@ class CliTest(StubTestCase):
                 self.assertEqual((code, out), (1, ""))
                 self.assertEqual(
                     err,
-                    "Error: Odoo answered the call with a value JSON cannot write, "
-                    "such as NaN, or a dateTime or base64 of XML-RPC: it ran the call, "
-                    "so do not repeat it before reading back what it did\n",
+                    "Error: Odoo answered a call of profile 'erp-xmlrpc' with a value "
+                    "JSON cannot write, such as NaN, or a dateTime or base64 of "
+                    "XML-RPC: it ran the call, so do not repeat it before reading back "
+                    "what it did\n",
                 )
 
     def test_an_answer_holding_nan_or_an_infinity_ends_as_one_message(self):
         # JSON has neither, though json.dumps writes them by default, as NaN
         # and Infinity: a double of XML-RPC, or what json reads over JSON-2.
-        odoos = {"erp-xmlrpc": self.xmlrpc_odoo, "erp-json2": self.json2_odoo}
-        for profile, odoo in odoos.items():
+        cases = {
+            "erp-xmlrpc": (
+                self.xmlrpc_odoo,
+                "Error: Odoo answered a call of profile 'erp-xmlrpc' with a value "
+                "JSON cannot write, such as NaN, or a dateTime or base64 of XML-RPC: "
+                "it ran the call, so do not repeat it before reading back what it "
+                "did\n",
+            ),
+            "erp-json2": (
+                self.json2_odoo,
+                "Error: Odoo answered a call of profile 'erp-json2' with a value "
+                "JSON cannot write, such as NaN, or a dateTime or base64 of XML-RPC: "
+                "it ran the call, so do not repeat it before reading back what it "
+                "did\n",
+            ),
+        }
+        for profile, (odoo, message) in cases.items():
             for case, value in (("NaN", float("nan")), ("an infinity", float("-inf"))):
                 with self.subTest(profile=profile, case=case):
                     odoo.answers[("res.partner", "read")] = [{"id": 7, "x": value}]
                     code, out, err = self.run_cli(
                         profile, {"model": "res.partner", "method": "read", "ids": [7]}
                     )
-                    self.assertEqual((code, out), (1, ""))
-                    self.assertEqual(
-                        err,
-                        "Error: Odoo answered the call with a value JSON cannot write, "
-                        "such as NaN, or a dateTime or base64 of XML-RPC: it ran the "
-                        "call, so do not repeat it before reading back what it did\n",
-                    )
+                    self.assertEqual((code, out, err), (1, "", message))
 
     def test_a_value_json2_cannot_send_ends_as_one_message(self):
         # NaN is no JSON, but Python's json reads it; JSON-2 cannot send it.
