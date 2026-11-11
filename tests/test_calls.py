@@ -2303,9 +2303,28 @@ class CliTest(StubTestCase):
                 self.assertEqual(
                     err,
                     "Error: Odoo answered the call with a value JSON cannot write, "
-                    "such as a dateTime or base64 of XML-RPC: it ran the call, so do "
-                    "not repeat it before reading back what it did\n",
+                    "such as NaN, or a dateTime or base64 of XML-RPC: it ran the call, "
+                    "so do not repeat it before reading back what it did\n",
                 )
+
+    def test_an_answer_holding_nan_or_an_infinity_ends_as_one_message(self):
+        # JSON has neither, though json.dumps writes them by default, as NaN
+        # and Infinity: a double of XML-RPC, or what json reads over JSON-2.
+        odoos = {"erp-xmlrpc": self.xmlrpc_odoo, "erp-json2": self.json2_odoo}
+        for profile, odoo in odoos.items():
+            for case, value in (("NaN", float("nan")), ("an infinity", float("-inf"))):
+                with self.subTest(profile=profile, case=case):
+                    odoo.answers[("res.partner", "read")] = [{"id": 7, "x": value}]
+                    code, out, err = self.run_cli(
+                        profile, {"model": "res.partner", "method": "read", "ids": [7]}
+                    )
+                    self.assertEqual((code, out), (1, ""))
+                    self.assertEqual(
+                        err,
+                        "Error: Odoo answered the call with a value JSON cannot write, "
+                        "such as NaN, or a dateTime or base64 of XML-RPC: it ran the "
+                        "call, so do not repeat it before reading back what it did\n",
+                    )
 
     def test_a_value_json2_cannot_send_ends_as_one_message(self):
         # NaN is no JSON, but Python's json reads it; JSON-2 cannot send it.
