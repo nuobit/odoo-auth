@@ -55,6 +55,7 @@ from support import (
     Answer,
     HttpRecorder,
     Json2Odoo,
+    KeepAliveOdoo,
     RawAnswer,
     RawXmlRpc,
     StoreMixin,
@@ -135,6 +136,23 @@ class StubTestCase(StoreMixin, unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         return timeouts
+
+    def record_sockets(self, module):
+        """The list where each socket that ``module``'s create_connection
+        opens, from now to the end of the test, is recorded in order: the
+        connections of a Client's transport, real ones, over XML-RPC with
+        socket's, over JSON-2 with urllib3.util.connection's."""
+        opened = []
+        create = module.create_connection
+
+        def recording(*args, **kwargs):
+            opened.append(create(*args, **kwargs))
+            return opened[-1]
+
+        patcher = mock.patch.object(module, "create_connection", recording)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return opened
 
     def fail_on_resource_warnings(self):
         """Fail the test if it leaves a socket or a file open: from now to
@@ -1736,6 +1754,106 @@ class ServerProxyTransportTest(StubTestCase):
         with ServerProxy(profile="erp", allow_none=False) as proxy:
             with self.assertRaisesRegex(TypeError, "cannot marshal None"):
                 proxy.execute_kw("res.partner", "write", [[7], {"name": None}], {})
+
+
+class KeptConnectionTest(StubTestCase):
+    """Client keeps its connection from one call to the next, over both
+    APIs, and checks it before a request goes out on it, as urllib3 checks a
+    pooled one: a connection the server closed since its last answer carries
+    nothing, and the request goes out on a new one. ServerProxy keeps
+    xmlrpc.client's own sending."""
+
+    def test_a_kept_connection_the_server_closed_carries_nothing(self):
+        # The login closes its own connection (_log_in). Without the check,
+        # the third call goes out on the closed connection, and its end
+        # makes xmlrpc.client send it again on a new one.
+        opened = self.record_sockets(socket)
+        odoo = self.start(KeepAliveOdoo({("call", 2): "answer, then close idle"}))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        # The calls' connection, the second, once the server's end of it has
+        # come: readable, as the check before reuse reads it.
+        self.assertTrue(urllib3.util.wait_for_read(opened[1], timeout=5))
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertTrue(odoo.idle_read.wait(5))
+        self.assertEqual(odoo.after_close, [])
+        self.assertEqual(
+            odoo.requests, [(1, "login"), (2, "call"), (2, "call"), (3, "call")]
+        )
+
+    def test_a_json2_connection_the_server_closed_carries_nothing(self):
+        # urllib3's own check, which JSON-2 has always had.
+        opened = self.record_sockets(urllib3.util.connection)
+        odoo = self.start(KeepAliveOdoo({("call", 2): "answer, then close idle"}))
+        client = self.make_client(odoo.url, "json2", KEY)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        # The calls' connection, once the server's end of it has come:
+        # readable, as urllib3's check before reuse reads it.
+        self.assertTrue(urllib3.util.wait_for_read(opened[0], timeout=5))
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertTrue(odoo.idle_read.wait(5))
+        self.assertEqual(odoo.after_close, [])
+        self.assertEqual(odoo.requests, [(1, "call"), (1, "call"), (2, "call")])
+
+    def test_an_https_connection_the_server_closed_carries_nothing(self):
+        # Offline, without a TLS handshake: the TLS sockets are fakes, each
+        # one's file descriptor a real socket's, the kept end of a pair, which
+        # is readable once its other end, the server's, is closed.
+        body = xmlrpc.client.dumps((3,), methodresponse=True).encode()
+        answer = (
+            "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode() + body
+        tls_sockets = []
+        server_ends = []
+        for _ in range(2):
+            kept_end, server_end = socket.socketpair()
+            self.addCleanup(kept_end.close)
+            self.addCleanup(server_end.close)
+            tls_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+            tls_socket.fileno.return_value = kept_end.fileno()
+            tls_socket.makefile.side_effect = lambda *args, **kwargs: io.BytesIO(answer)
+            tls_sockets.append(tls_socket)
+            server_ends.append(server_end)
+        tcp_sockets = [mock.create_autospec(socket.socket, instance=True) for _ in range(2)]
+        transport = _SafeTransport((2, 9.5))
+        with mock.patch("socket.create_connection", side_effect=tcp_sockets):
+            with mock.patch.object(ssl.SSLContext, "wrap_socket", side_effect=tls_sockets):
+                for _ in range(2):
+                    self.assertEqual(
+                        transport.request("127.0.0.1", "/xmlrpc/2/object", b"<call/>"), (3,)
+                    )
+                server_ends[0].close()
+                self.assertEqual(
+                    transport.request("127.0.0.1", "/xmlrpc/2/object", b"<call/>"), (3,)
+                )
+        first, second = tls_sockets
+        self.assertEqual(sent_requests(first), 2)
+        first.close.assert_called_once_with()
+        self.assertEqual(sent_requests(second), 1)
+
+    def test_server_proxy_writes_a_call_on_its_kept_connection_unchecked(self):
+        # A guard of xmlrpc.client's own sending, which ServerProxy keeps:
+        # the call goes out on the connection the server closed, and that
+        # connection's end makes xmlrpc.client send it again on a new one.
+        odoo = self.start(KeepAliveOdoo({("call", 1): "answer, then close idle"}))
+        self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+        with ServerProxy(profile="erp") as proxy:
+            self.assertEqual(proxy.execute_kw("res.partner", "search_count", [[]]), 3)
+            self.assertTrue(odoo.idle_closed.wait(5))
+            self.assertEqual(proxy.execute_kw("res.partner", "search_count", [[]]), 3)
+        self.assertTrue(odoo.idle_read.wait(5))
+        self.assertEqual(odoo.after_close, ["call"])
+        self.assertEqual(odoo.requests, [(1, "login"), (2, "call"), (3, "call")])
+
+
+def sent_requests(tls_socket):
+    """How many requests went out on ``tls_socket``, a fake: the request lines
+    in what it was given to send."""
+    sent = b"".join(call.args[0] for call in tls_socket.sendall.call_args_list)
+    return sent.count(b"POST /xmlrpc/2/object HTTP/1.1\r\n")
 
 
 # How long, in seconds, a stub holds a request at most before it lets the

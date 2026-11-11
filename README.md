@@ -218,6 +218,11 @@ urllib3's over JSON-2): a name with several addresses that do not answer
 waits that long for each one. The name's resolution itself is under
 neither timeout: it takes as long as the system's resolver takes.
 
+A `Client` keeps its connection open from one call to the next, over both
+APIs, and checks it before a request goes out on it, as `urllib3` checks a
+connection of its pool: when the server has closed it since its last
+answer, the request goes out on a new connection.
+
 ### ServerProxy: the XML-RPC drop-in
 
 Drop-in replacement for `xmlrpc.client.ServerProxy`, for `api = xmlrpc`
@@ -245,6 +250,8 @@ An `api = json2` profile is refused with a `ConfigError` that names `Client`:
 the profile decides the API. It sets no timeout, as in 1.x: a request waits
 as long as the server takes, unless the script sets one for every socket
 (`socket.setdefaulttimeout`), whose error then names no timeout of `Client`.
+It sends a request as `xmlrpc.client` does, on its kept connection without
+checking it first.
 With a profile it refuses `verbose=True`, which asks `xmlrpc.client` to
 print each request, the password among them, with an `ArgumentError`
 before the profile is read. A `transport` given to it is the caller's, and

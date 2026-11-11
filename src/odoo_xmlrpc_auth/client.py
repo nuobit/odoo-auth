@@ -1040,8 +1040,32 @@ class _Timeouts:
         return answer
 
 
-class _Transport(_OwnConnections, _Timeouts, _AnswerParsing, xmlrpc.client.Transport):
-    """xmlrpc.client's transport for http, with _Timeouts and
+class _Sending:
+    """For Client's XML-RPC transports: how a request goes out. On the kept
+    connection, unless the server closed it since its last answer, or wrote
+    on it unasked: that one is closed, and the request goes out on a new
+    connection. urllib3 checks a pooled connection so before reusing it,
+    over JSON-2 (HTTPConnectionPool._get_conn, is_connection_dropped), with
+    the check used here, wait_for_read.
+
+    ServerProxy keeps xmlrpc.client's own sending, and writes a request on
+    its kept connection unchecked."""
+
+    def request(self, host, handler, request_body, verbose=False):
+        connection = self.make_connection(host)
+        # Readable before a request: at its end, or holding what no request
+        # asked for. No answer to this request can come on it.
+        if connection.sock is not None and urllib3.util.wait_for_read(
+            connection.sock, timeout=0.0
+        ):
+            self.close()
+        return super().request(host, handler, request_body, verbose)
+
+
+class _Transport(
+    _Sending, _OwnConnections, _Timeouts, _AnswerParsing, xmlrpc.client.Transport
+):
+    """xmlrpc.client's transport for http, with _Sending, _Timeouts and
     _AnswerParsing."""
 
     def _connect_to(self, chost, x509):
@@ -1051,9 +1075,9 @@ class _Transport(_OwnConnections, _Timeouts, _AnswerParsing, xmlrpc.client.Trans
 
 
 class _SafeTransport(
-    _OwnConnections, _Timeouts, _AnswerParsing, xmlrpc.client.SafeTransport
+    _Sending, _OwnConnections, _Timeouts, _AnswerParsing, xmlrpc.client.SafeTransport
 ):
-    """xmlrpc.client's transport for https, with _Timeouts and
+    """xmlrpc.client's transport for https, with _Sending, _Timeouts and
     _AnswerParsing."""
 
     def _connect_to(self, chost, x509):
