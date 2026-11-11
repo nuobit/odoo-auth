@@ -6,6 +6,7 @@ table the test fills and record every request they get, so that a test can
 check what was sent, and where.
 """
 
+import contextlib
 import http.server
 import json
 import os
@@ -315,6 +316,140 @@ class RawXmlRpc(HttpRecorder):
 
     def answer(self, request):
         return self.login_answer if request["path"] == "/xmlrpc/2/common" else self.call_answer
+
+
+class KeepAliveOdoo:
+    """Odoo's two APIs over HTTP/1.1 on raw sockets, keeping each connection
+    open from one request to the next, as Odoo's server does and the stubs
+    above, which close it after each answer, do not: for a client that keeps
+    its connection, and a server that closes it or breaks it off.
+
+    Each request is read in full, then recorded in ``requests`` as (the
+    number of its connection, from 1 in the order they open, and what it is:
+    "login" for /xmlrpc/2/common, "call" for any other path). The server
+    then does what ``plan`` says for it, by what it is and its number among
+    those, from 1, such as ``plan[("call", 2)]`` for the second call:
+
+    - "answer", what it does when the plan says nothing: a 200, UID to the
+      login and ANSWER to a call over XML-RPC, ANSWER as JSON over JSON-2;
+      the connection stays open.
+    - "answer, then close": that 200, saying Connection: close; then the
+      server closes the connection.
+    - "answer, then close idle": that 200; then the server closes its side
+      of the connection and sets ``idle_closed``, reads the connection to
+      its end, recording in ``after_close`` what each request that still
+      comes on it is, and sets ``idle_read``.
+    - "drop": the server closes the connection unanswered, as one that ran
+      the call and broke off before its answer.
+    """
+
+    ANSWER = 3
+
+    def __init__(self, plan=None):
+        self.plan = plan if plan is not None else {}
+        self.requests = []
+        self.after_close = []
+        self.idle_closed = threading.Event()
+        self.idle_read = threading.Event()
+        self._lock = threading.Lock()
+        self._connections = []
+        self._stopping = threading.Event()
+        self._listener = socket.socket()
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(8)
+        # accept() gives up every 10 ms, so that it sees a stop.
+        self._listener.settimeout(0.01)
+        self.url = f"http://127.0.0.1:{self._listener.getsockname()[1]}"
+        self._threads = [threading.Thread(target=self._accept, daemon=True)]
+        self._threads[0].start()
+
+    def _accept(self):
+        while not self._stopping.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            connection.settimeout(None)
+            with self._lock:
+                self._connections.append(connection)
+                number = len(self._connections)
+            thread = threading.Thread(target=self._serve, args=(connection, number), daemon=True)
+            self._threads.append(thread)
+            thread.start()
+
+    def _serve(self, connection, number):
+        reader = connection.makefile("rb")
+        try:
+            while (path := self._path_read(reader)) is not None:
+                what = self._what(path)
+                with self._lock:
+                    nth = 1 + [done for _, done in self.requests].count(what)
+                    self.requests.append((number, what))
+                action = self.plan.get((what, nth), "answer")
+                if action == "drop":
+                    break
+                connection.sendall(self._answer(path, close=action == "answer, then close"))
+                if action == "answer, then close":
+                    break
+                if action == "answer, then close idle":
+                    connection.shutdown(socket.SHUT_WR)
+                    self.idle_closed.set()
+                    while (late := self._path_read(reader)) is not None:
+                        self.after_close.append(self._what(late))
+                    self.idle_read.set()
+                    break
+        except OSError:
+            # stop() shut the connection down.
+            pass
+        finally:
+            reader.close()
+            connection.close()
+
+    @staticmethod
+    def _path_read(reader):
+        """The path of the next request ``reader`` reads in full, or None at
+        the connection's end."""
+        line = reader.readline()
+        if not line:
+            return None
+        length = 0
+        while (header := reader.readline()) not in (b"\r\n", b""):
+            name, _, value = header.partition(b":")
+            if name.strip().lower() == b"content-length":
+                length = int(value)
+        reader.read(length)
+        return line.split()[1].decode("ascii")
+
+    @staticmethod
+    def _what(path):
+        return "login" if path == "/xmlrpc/2/common" else "call"
+
+    def _answer(self, path, close):
+        if path.startswith("/xmlrpc/"):
+            value = UID if self._what(path) == "login" else self.ANSWER
+            body = xmlrpc.client.dumps((value,), methodresponse=True).encode()
+            kind = "text/xml"
+        else:
+            body = json.dumps(self.ANSWER).encode()
+            kind = "application/json"
+        head = f"HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {len(body)}\r\n"
+        if close:
+            head += "Connection: close\r\n"
+        return f"{head}\r\n".encode() + body
+
+    def stop(self):
+        self._stopping.set()
+        self._threads[0].join()
+        self._listener.close()
+        with self._lock:
+            connections = list(self._connections)
+        for connection in connections:
+            # A thread still reading its connection then reads its end; one
+            # its own thread closed raises.
+            with contextlib.suppress(OSError):
+                connection.shutdown(socket.SHUT_RDWR)
+        for thread in self._threads[1:]:
+            thread.join(5)
 
 
 def xmlrpc_answer(value):
