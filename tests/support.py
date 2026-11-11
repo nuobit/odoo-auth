@@ -203,11 +203,23 @@ class Answer:
         self.headers = headers if headers is not None else {}
 
 
+class RawAnswer:
+    """An HTTP answer of a stub written as it is, its status line and its
+    headers included (``raw``, bytes), after which the connection closes:
+    for answers no HTTP server sends, such as a body cut short. ``after``,
+    when given, is called once the bytes are sent and before the
+    connection closes: a test holds the connection open there."""
+
+    def __init__(self, raw, after=None):
+        self.raw = raw
+        self.after = after
+
+
 class HttpRecorder:
     """An HTTP server that records each request it gets in ``requests``
     (method, path, headers with lower-case names, body) and answers with
     ``answer(request)``: by default 404 with an empty body; None answers
-    nothing."""
+    nothing; a RawAnswer, its bytes."""
 
     def __init__(self):
         self.requests = []
@@ -226,6 +238,12 @@ class HttpRecorder:
                 answer = recorder.answer(request)
                 if answer is None:
                     # No answer: the connection closes.
+                    return
+                if isinstance(answer, RawAnswer):
+                    self.close_connection = True
+                    self.wfile.write(answer.raw)
+                    if answer.after is not None:
+                        answer.after()
                     return
                 body = (
                     answer.body
@@ -258,7 +276,8 @@ class Json2Odoo(HttpRecorder):
 
     A request without ``Authorization: Bearer KEY`` gets the 401 Odoo sends
     for a key it does not take. Any other answers from ``answers``: the
-    Answer set for its model and method, or a 200 with the value set.
+    Answer or the RawAnswer set for its model and method, or a 200 with the
+    value set.
     """
 
     def __init__(self):
@@ -280,7 +299,7 @@ class Json2Odoo(HttpRecorder):
             )
         _, _, _, model, method = request["path"].split("/")
         answer = self.answers[(model, method)]
-        return answer if isinstance(answer, Answer) else Answer(200, answer)
+        return answer if isinstance(answer, (Answer, RawAnswer)) else Answer(200, answer)
 
 
 class RawXmlRpc(HttpRecorder):

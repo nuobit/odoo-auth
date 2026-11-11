@@ -284,17 +284,23 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   also an instance of that error's class, so `except OSError`,
   `except xmlrpc.client.ProtocolError`, `except requests.ConnectionError`
   and the like keep catching it; as a `ProtocolError` it keeps its
-  `errcode`, while its `url` and `errmsg` are empty. For an answer that is
-  not XML-RPC it stands for `xmlrpc.client.ResponseError`, whatever the
-  parser raised (an `ExpatError`, a `ValueError`…). Such an answer, and one
-  that is not JSON (`JSONDecodeError`, `code` 200), came from a server that
-  answered: answering a call, it may have run it, and only its answer was
-  not read, so a retry would run it again. Read back what it did before
-  repeating it. When one of `Client`'s
-  timeouts fires, `timeout_fired` says which, `"connect"` or `"read"`
-  (`None` otherwise), and so does the message. After the connect timeout
-  nothing was sent. After the read timeout the server may still complete
-  the call: read back what it did before repeating it. It is then an
+  `errcode`, while its `url` and `errmsg` are empty. For an answer that
+  cannot be read as XML-RPC it stands for `xmlrpc.client.ResponseError`,
+  whatever reading or parsing it raised (an `ExpatError`, a `ValueError`,
+  an `IncompleteRead`…). When the answer to a call came with status 200
+  and cannot be read, not XML-RPC or not JSON (`JSONDecodeError`), cut
+  short, sent in bad chunks, not the gzip it says, or broken off, its
+  `code` is 200 on both APIs, and its message says: «The server answered:
+  it may have run the call, so do not repeat it before reading back what
+  it did.» A retry would run the call again. An answer to the login that
+  cannot be read has no `code`: no call was sent. Over XML-RPC, `Client`
+  does not send a call again when its connection breaks off as the answer
+  comes, as `xmlrpc.client` does for a reset connection. When one of
+  `Client`'s timeouts fires, `timeout_fired` says which, `"connect"` or
+  `"read"` (`None` otherwise), and so does the message, and its `code` is
+  `None`. After the connect timeout nothing was sent. After the read
+  timeout the server may still complete the call, so do not repeat it
+  before reading back what it did. It is then an
   instance of `socket.timeout` (`TimeoutError`) over XML-RPC, and of
   `requests.ConnectTimeout`, `requests.ReadTimeout` or
   `requests.ConnectionError` over JSON-2, where `requests` reports a TLS
