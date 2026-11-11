@@ -773,17 +773,20 @@ def _url_fault(url):
 
     The transport quotes a url it refuses: the fault quotes no part of the
     url, not even its scheme, and is returned, never raised, so that the
-    frame that raises holds no url. A backslash and port 0 are read one way
-    by urllib.parse, which gives the profile's origin, and another by
-    urllib3, which connects: the host ends at a backslash for urllib3, and
-    it drops port 0 for the scheme's default. For `api = json2`, the origin
-    requests prepares for either differs as well (_requests_sends_elsewhere);
-    for `api = xmlrpc`, whose url requests never prepares, these rules are
-    the only ones. A query or a fragment, even
-    an empty one, would swallow the API's path each request adds at the
-    url's end: over XML-RPC that path goes into the query, or after a # in
-    the request line; over JSON-2 into the query, or it is dropped with the
-    fragment, and the request goes to the url's own path.
+    frame that raises holds no url. A backslash is in no URL unencoded: RFC
+    3986 has it in neither its reserved nor its unreserved characters, and
+    writes it %5C. It is refused anywhere in the url, on both APIs; urllib3,
+    which JSON-2 goes through, would also end the host at one in it, where
+    urllib.parse, which gives the profile's origin, and http.client, which
+    XML-RPC goes through, read the whole name. No connection goes to port
+    0: http.client is refused there, and requests sends it to the scheme's
+    default port. For `api = json2`, requests' own reading of the url is
+    checked as well (_requests_sends_elsewhere); for `api = xmlrpc`, whose
+    url requests never prepares, these rules are the only ones. A query or a
+    fragment, even an empty one, would swallow the API's path each request
+    adds at the url's end: over XML-RPC that path goes into the query, or
+    after a # in the request line; over JSON-2 into the query, or it is
+    dropped with the fragment, and the request goes to the url's own path.
     """
     try:
         parts = urllib.parse.urlsplit(url)
@@ -813,10 +816,7 @@ def _url_fault(url):
     elif "@" in parts.netloc:
         fault = "must have no user or password before its host"
     elif "\\" in url:
-        fault = (
-            "must hold no backslash: the JSON-2 transport ends the host at "
-            "one, and would send the calls to another host"
-        )
+        fault = "must hold no backslash, which RFC 3986 allows in a URL only as %5C"
     # A lone ? or # makes an empty query or fragment, which urlsplit's parts
     # cannot tell from none, and swallows the path all the same: the
     # characters are looked for in the url itself.

@@ -258,19 +258,32 @@ class UrlTest(StoreTestCase):
         self.assertIn("cannot be parsed as a URL", str(caught.exception))
         self.assertNeverShows(caught.exception, SECRET)
 
-    def test_a_url_with_a_backslash_is_refused_unshown(self):
-        # requests ends the host at the backslash: the calls would go to
-        # evil.example, where urllib.parse reads the profile's origin as the
-        # whole name.
-        self.make_store_with_url("https://evil.example\\.odoo.example.com")
-        with self.assertRaises(ConfigError) as caught:
-            ServerProxy(profile="erp")
-        self.assertIn("must hold no backslash", str(caught.exception))
-        self.assertNeverShows(caught.exception, "evil.example")
-        self.common.authenticate.assert_not_called()
+    def test_a_url_with_a_backslash_is_refused_unshown_on_either_api(self):
+        # RFC 3986 allows a backslash in a URL only as %5C. In the host,
+        # requests, which JSON-2 goes through, would also end it at the
+        # backslash, at evil.example, where urllib.parse and http.client,
+        # which XML-RPC goes through, read the whole name; in the path, all
+        # three read the same host.
+        urls = {
+            "in the host": ("https://evil.example\\.odoo.example.com", "evil.example"),
+            "in the path": ("https://odoo.example.com/odoo\\evil", "odoo\\evil"),
+        }
+        for api, password in (("xmlrpc", PASSWORD), ("json2", KEY)):
+            for case, (url, part) in urls.items():
+                with self.subTest(api=api, case=case):
+                    self.make_store_with_url(url, api, password)
+                    error = self.raised(ConfigError, lambda: Client(profile="erp"))
+                    self.assertRegex(
+                        str(error),
+                        r"\AThe url in [^\n]*/erp\.conf must hold no backslash, which "
+                        r"RFC 3986 allows in a URL only as %5C\Z",
+                    )
+                    self.assertNeverShows(error, part)
 
     def test_a_url_with_port_0_is_refused(self):
-        # requests drops port 0 and goes to the scheme's default port.
+        # No connection goes to port 0: http.client, which XML-RPC goes
+        # through, is refused there, and requests, which JSON-2 goes
+        # through, sends it to the scheme's default port.
         self.make_store_with_url("https://odoo.example.com:0")
         with self.assertRaisesRegex(
             ConfigError,

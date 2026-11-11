@@ -440,11 +440,13 @@ on one line of printable ASCII without spaces, or has a user or password
 before its host, or holds a backslash, or a query or a fragment, even an
 empty one (a lone `?` or `#`). The url is not shown, not even its
 scheme: xmlrpc.client would quote it, user info included, in its errors. A
-backslash and port 0 are refused because the two parsers of a url read
-them in different ways: requests ends the host at a backslash and sends a
-port 0 to the scheme's default port, where the profile's origin is read
-otherwise. A query or a fragment would swallow the path each request adds
-at the url's end (`/xmlrpc/2/common` and `/xmlrpc/2/object`, or
+backslash is refused because RFC 3986 allows one in a URL only as `%5C`,
+and `requests`, which JSON-2 goes through, would end the host at a
+backslash in it. Port 0 is refused because no connection goes to it:
+`http.client`, which XML-RPC goes through, is refused there, and
+`requests` sends it to the scheme's default port. A query or a fragment
+would swallow the path each request adds at the url's end
+(`/xmlrpc/2/common` and `/xmlrpc/2/object`, or
 `/json/2/<model>/<method>`), and no call could work; a path, as for a
 server behind a reverse proxy, is kept.
 An `api = json2` profile
