@@ -221,7 +221,8 @@ neither timeout: it takes as long as the system's resolver takes.
 A `Client` keeps its connection open from one call to the next, over both
 APIs, and checks it before a request goes out on it, as `urllib3` checks a
 connection of its pool: when the server has closed it since its last
-answer, the request goes out on a new connection.
+answer, the request goes out on a new connection. Each request goes out
+once, never again by itself after a failure ([Errors](#errors)).
 
 ### ServerProxy: the XML-RPC drop-in
 
@@ -250,8 +251,9 @@ An `api = json2` profile is refused with a `ConfigError` that names `Client`:
 the profile decides the API. It sets no timeout, as in 1.x: a request waits
 as long as the server takes, unless the script sets one for every socket
 (`socket.setdefaulttimeout`), whose error then names no timeout of `Client`.
-It sends a request as `xmlrpc.client` does, on its kept connection without
-checking it first.
+It sends a request as `xmlrpc.client` does: on its kept connection without
+checking it first, and a second time after a connection closed or reset
+before the answer, so that a call the server ran runs twice.
 With a profile it refuses `verbose=True`, which asks `xmlrpc.client` to
 print each request, the password among them, with an `ArgumentError`
 before the profile is read. A `transport` given to it is the caller's, and
@@ -301,9 +303,11 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   `code` is 200 on both APIs, and its message says: «The server answered:
   it may have run the call, so do not repeat it before reading back what
   it did.» A retry would run the call again. An answer to the login that
-  cannot be read has no `code`: no call was sent. Over XML-RPC, `Client`
-  does not send a call again when its connection breaks off as the answer
-  comes, as `xmlrpc.client` does for a reset connection. When one of
+  cannot be read has no `code`: no call was sent. `Client` sends each
+  request once, the XML-RPC login's too, and never again by itself after a
+  failure, where `xmlrpc.client`, and so `ServerProxy`, sends a request a
+  second time after its connection was closed or reset before the answer:
+  a call the server ran would run twice. When one of
   `Client`'s timeouts fires, `timeout_fired` says which, `"connect"` or
   `"read"` (`None` otherwise), and so does the message, and its `code` is
   `None`. After the connect timeout nothing was sent. After the read

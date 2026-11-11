@@ -901,9 +901,9 @@ class _AnswerParsing:
     the socket's timeout, the read timeout's, which goes on to _Timeouts.
     Client's transports have it; ServerProxy keeps xmlrpc.client's own.
 
-    xmlrpc.client sends a request again when its connection is reset
-    (Transport.request): as an _InvalidAnswer, a connection reset while the
-    answer comes, which the server sent after it ran the call, is not."""
+    A connection reset while the answer comes, which the server sent after
+    it ran the call, is such an answer: the call's RequestError has code
+    200, and says that the server may have run it."""
 
     def parse_response(self, response):
         failure = None
@@ -1017,8 +1017,8 @@ class _Timeouts:
     """For Client's XML-RPC transports, whose connections are
     _TimedConnections under ``timeout``, a (connect, read) pair of seconds:
     the socket's timeout raised once connected, the read timeout's, raises
-    _ReadTimeout. xmlrpc.client sends a timed out request only once
-    (Transport.request retries a reset connection, not a timeout)."""
+    _ReadTimeout. A timed out request is sent once, as every request of
+    Client (_Sending)."""
 
     def __init__(self, timeout):
         super().__init__()
@@ -1041,15 +1041,20 @@ class _Timeouts:
 
 
 class _Sending:
-    """For Client's XML-RPC transports: how a request goes out. On the kept
-    connection, unless the server closed it since its last answer, or wrote
-    on it unasked: that one is closed, and the request goes out on a new
-    connection. urllib3 checks a pooled connection so before reusing it,
-    over JSON-2 (HTTPConnectionPool._get_conn, is_connection_dropped), with
-    the check used here, wait_for_read.
+    """For Client's XML-RPC transports: how a request goes out. Once, never
+    again after a failure: xmlrpc.client sends it a second time after
+    http.client's RemoteDisconnected, or an OSError ECONNRESET, ECONNABORTED
+    or EPIPE, on any connection (Transport.request, Python 3.11 and 3.13),
+    and a server that ran the call before the connection broke off would run
+    it twice. On the kept connection, unless the server closed it since its
+    last answer, or wrote on it unasked: that one is closed, and the request
+    goes out on a new connection. Over JSON-2, urllib3 checks a pooled
+    connection so before reusing it (HTTPConnectionPool._get_conn,
+    is_connection_dropped), with the check used here, wait_for_read, and
+    sends a request once, under requests' Retry(0, read=False).
 
-    ServerProxy keeps xmlrpc.client's own sending, and writes a request on
-    its kept connection unchecked."""
+    ServerProxy keeps xmlrpc.client's own sending: it writes a request on
+    its kept connection unchecked, and sends it again after those errors."""
 
     def request(self, host, handler, request_body, verbose=False):
         connection = self.make_connection(host)
@@ -1059,7 +1064,7 @@ class _Sending:
             connection.sock, timeout=0.0
         ):
             self.close()
-        return super().request(host, handler, request_body, verbose)
+        return self.single_request(host, handler, request_body, verbose)
 
 
 class _Transport(
