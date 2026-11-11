@@ -269,7 +269,9 @@ down, in `_password`, which stays readable as in 1.x. The errors:
 - `AuthError`: Odoo refuses the profile's credentials, at the XML-RPC login
   or, over JSON-2, as an HTTP 401 for the API key.
 - `RequestError`: a failure of the transport, in place of the error of
-  `socket`, `ssl`, `http.client`, `xmlrpc.client` or `requests`: a name that
+  `socket`, `ssl`, `http.client`, `xmlrpc.client`, `requests`, or `urllib3`,
+  which `requests` raises as it is when it does not know one (such as the
+  error of `urllib3` 2.3.0 for a redirect to `<origin>//x:y`): a name that
   does not resolve, a connection refused or dropped, TLS, an HTTP status
   other than 200 that carries no error of Odoo (such as the 404 page Odoo
   sends when `X-Odoo-Database` names no database it serves), an answer that
