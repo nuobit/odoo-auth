@@ -1221,11 +1221,12 @@ class ServerProxy(xmlrpc.client.ServerProxy):
                                  {"fields": ["name"], "limit": 10})
     """
 
-    def __init__(self, uri=None, /, *args, profile=None, **kwargs):
+    def __init__(self, *args, profile=None, **kwargs):
         if profile is not None:
             # xmlrpc.client.ServerProxy's arguments by their names, whether
-            # given by name or in their places.
-            given = inspect.signature(super().__init__).bind(uri, *args, **kwargs)
+            # given by name or in their places, the uri among them, which the
+            # profile's url replaces and which may be left out.
+            given = inspect.signature(super().__init__).bind_partial(*args, **kwargs)
             if given.arguments.get("verbose"):
                 raise _error_class(ArgumentError, ValueError)(
                     profile,
@@ -1257,15 +1258,16 @@ class ServerProxy(xmlrpc.client.ServerProxy):
                 given.arguments["transport"] = _proxy_transport(
                     config["url"], given.arguments
                 )
-            uri, *args = given.args
-            kwargs = given.kwargs
+            args, kwargs = given.args, given.kwargs
         else:
             self._profile = None
             self._db = None
             self._uid = None
             self._password = None
 
-        super().__init__(uri, *args, **kwargs)
+        # Without a profile, the arguments as they were given, so that
+        # xmlrpc.client's ServerProxy takes or refuses them as it would.
+        super().__init__(*args, **kwargs)
 
     def execute_kw(self, *args, **kwargs):
         execute_kw = super().__getattr__("execute_kw")

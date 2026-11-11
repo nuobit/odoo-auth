@@ -1710,6 +1710,22 @@ class ServerProxyTransportTest(StubTestCase):
         self.assertIs(transport.context, context)
         self.assertIs(transport.make_connection("127.0.0.1")._context, context)
 
+    def test_it_takes_its_uri_by_name_as_xmlrpc_client_does(self):
+        # Without a profile exactly like xmlrpc.client's ServerProxy; with
+        # one, the profile's url replaces it, given by name or in its place.
+        with ServerProxy(uri=f"{self.odoo.url}/xmlrpc/2/common") as proxy:
+            self.assertEqual(proxy.authenticate(DB, USER, PASSWORD, {}), UID)
+        self.odoo.answers[("res.partner", "search_count")] = 3
+        with ServerProxy(uri="http://127.0.0.1:9/xmlrpc/2/object", profile="erp") as proxy:
+            self.assertEqual(proxy.execute_kw("res.partner", "search_count", [[]], {}), 3)
+        for factory in (xmlrpc.client.ServerProxy, ServerProxy):
+            with self.subTest(factory=factory.__module__):
+                with self.assertRaisesRegex(
+                    TypeError, r"\AServerProxy.__init__\(\) missing 1 required positional "
+                    r"argument: 'uri'\Z"
+                ):
+                    factory()
+
     def test_it_allows_none_unless_it_is_told_otherwise(self):
         self.odoo.answers[("res.partner", "write")] = True
         with ServerProxy(profile="erp") as proxy:
