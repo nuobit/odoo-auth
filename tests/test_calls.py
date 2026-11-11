@@ -20,6 +20,7 @@ import logging
 import os
 import socket
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -1021,6 +1022,13 @@ class Json2ClientTest(StubTestCase):
                     self.client.call("res.partner", "read", [7])
                 self.assertIsInstance(caught.exception, RedirectError)
                 self.assertEqual(caught.exception.code, status)
+                # The call went out, and the server answered: no connection
+                # failed.
+                self.assertEqual(
+                    str(caught.exception),
+                    f"A request of profile 'erp' failed: RedirectError, code {status}. "
+                    "Its message is not shown, as it can quote the profile's values.",
+                )
                 self.assertIsNone(caught.exception.request)
                 self.assertIsNone(caught.exception.response)
                 self.assertNeverShows(caught.exception, KEY)
@@ -1850,11 +1858,27 @@ class KeptConnectionTest(StubTestCase):
         self.assertEqual(odoo.requests, [(1, "login"), (2, "call"), (3, "call")])
 
 
+def sent(tls_socket):
+    """What ``tls_socket``, a fake, was given to send, in order."""
+    return b"".join(call.args[0] for call in tls_socket.sendall.call_args_list)
+
+
 def sent_requests(tls_socket):
     """How many requests went out on ``tls_socket``, a fake: the request lines
     in what it was given to send."""
-    sent = b"".join(call.args[0] for call in tls_socket.sendall.call_args_list)
-    return sent.count(b"POST /xmlrpc/2/object HTTP/1.1\r\n")
+    return sent(tls_socket).count(b"POST /xmlrpc/2/object HTTP/1.1\r\n")
+
+
+class FailingAnswer(io.BytesIO):
+    """The file a fake TLS socket gives to read its answer, whose first line,
+    the status line, cannot be read: reading it raises ``failure``."""
+
+    def __init__(self, failure):
+        super().__init__()
+        self.failure = failure
+
+    def readline(self, size=-1):
+        raise self.failure
 
 
 class CutOffTest(StubTestCase):
@@ -1864,11 +1888,61 @@ class CutOffTest(StubTestCase):
     (Transport.request), and a server that ran the call would run it
     twice. ServerProxy keeps that second sending.
 
+    When the connection of a call fails after the call started to go out,
+    the RequestError says that the server may have run it, on both APIs. A
+    failure before anything was sent says nothing of it, nor does the
+    login's.
+
     The server here reads the request, then closes the connection without
     answering ("drop"), as one that ran the call and broke off before its
     answer."""
 
-    def test_a_call_cut_off_on_a_new_connection_is_sent_once(self):
+    def handshake_reset(self):
+        """The url of a server that reads the client's first message of a
+        TLS handshake, then resets the connection: a handshake that fails
+        before anything was sent."""
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+
+        def reset():
+            connection, _ = listener.accept()
+            with connection:
+                connection.recv(65536)
+                # Closed with a linger of 0 seconds, it sends a reset.
+                connection.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                )
+
+        thread = threading.Thread(target=reset, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        return f"https://127.0.0.1:{listener.getsockname()[1]}"
+
+    @contextlib.contextmanager
+    def json2_https_client(self, *handshakes):
+        """A Client over JSON-2 to https://127.0.0.1, offline, for the with
+        block: each connection's TCP socket is a fake, and its TLS handshake
+        gives the next of ``handshakes``, a fake TLS socket, or raises it, an
+        error. Every connection stops at its fake TCP socket, none looks a
+        name up, and the block uses every handshake."""
+        tcp_sockets = [mock.create_autospec(socket.socket, instance=True) for _ in handshakes]
+        with mock.patch(
+            "urllib3.util.connection.create_connection", side_effect=tcp_sockets
+        ) as connect:
+            with mock.patch.object(ssl.SSLContext, "wrap_socket", side_effect=handshakes):
+                yield self.make_client("https://127.0.0.1", "json2", KEY)
+        self.assertEqual(connect.call_count, len(handshakes))
+
+    def json2_https_call(self, *handshakes):
+        """The RequestError of a call of json2_https_client(*handshakes)."""
+        with self.json2_https_client(*handshakes) as client:
+            return self.raised(
+                RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+
+    def test_a_call_cut_off_on_a_new_connection_is_sent_once_and_may_have_run(self):
         # The login closes its own connection (_log_in): the first call
         # goes out on a new one.
         odoo = self.start(KeepAliveOdoo({("call", 1): "drop"}))
@@ -1877,11 +1951,18 @@ class CutOffTest(StubTestCase):
             RequestError, lambda: client.call("res.partner", "search_count", domain=[])
         )
         self.assertIsInstance(error, http.client.RemoteDisconnected)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: RemoteDisconnected. It failed after "
+            "the call started to go out, before its answer was read whole: the server "
+            "may have run the call, so do not repeat it before reading back what it "
+            "did. Its message is not shown, as it can quote the profile's values.",
+        )
         self.assertEqual(odoo.requests, [(1, "login"), (2, "call")])
         self.assertNeverShows(error, PASSWORD)
         self.assertNoFrameHolds(error, PASSWORD)
 
-    def test_a_call_cut_off_on_a_kept_connection_is_sent_once(self):
+    def test_a_call_cut_off_on_a_kept_connection_is_sent_once_and_may_have_run(self):
         odoo = self.start(KeepAliveOdoo({("call", 2): "drop"}))
         client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
         self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
@@ -1889,20 +1970,485 @@ class CutOffTest(StubTestCase):
             RequestError, lambda: client.call("res.partner", "search_count", domain=[])
         )
         self.assertIsInstance(error, http.client.RemoteDisconnected)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: RemoteDisconnected. It failed after "
+            "the call started to go out, before its answer was read whole: the server "
+            "may have run the call, so do not repeat it before reading back what it "
+            "did. Its message is not shown, as it can quote the profile's values.",
+        )
         self.assertEqual(odoo.requests, [(1, "login"), (2, "call"), (2, "call")])
         self.assertNeverShows(error, PASSWORD)
         self.assertNoFrameHolds(error, PASSWORD)
 
-    def test_a_login_cut_off_is_sent_once(self):
+    def test_a_json2_call_cut_off_on_a_new_connection_says_it_may_have_run(self):
+        odoo = self.start(KeepAliveOdoo({("call", 1): "drop"}))
+        client = self.make_client(odoo.url, "json2", KEY)
+        error = self.raised(
+            RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+        )
+        self.assertIsInstance(error, requests.ConnectionError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ConnectionError. It failed after the "
+            "call started to go out, before its answer was read whole: the server may "
+            "have run the call, so do not repeat it before reading back what it did. "
+            "Its message is not shown, as it can quote the profile's values.",
+        )
+        self.assertEqual(odoo.requests, [(1, "call")])
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_a_json2_call_cut_off_on_a_kept_connection_says_it_may_have_run(self):
+        odoo = self.start(KeepAliveOdoo({("call", 2): "drop"}))
+        client = self.make_client(odoo.url, "json2", KEY)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        error = self.raised(
+            RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+        )
+        self.assertIsInstance(error, requests.ConnectionError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ConnectionError. It failed after the "
+            "call started to go out, before its answer was read whole: the server may "
+            "have run the call, so do not repeat it before reading back what it did. "
+            "Its message is not shown, as it can quote the profile's values.",
+        )
+        self.assertEqual(odoo.requests, [(1, "call"), (1, "call")])
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_a_login_cut_off_is_sent_once_and_runs_no_call(self):
         odoo = self.start(KeepAliveOdoo({("login", 1): "drop"}))
         client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
         error = self.raised(
             RequestError, lambda: client.call("res.partner", "search_count", domain=[])
         )
         self.assertIsInstance(error, http.client.RemoteDisconnected)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: RemoteDisconnected. Its message is "
+            "not shown, as it can quote the profile's values.",
+        )
         self.assertEqual(odoo.requests, [(1, "login")])
         self.assertNeverShows(error, PASSWORD)
         self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_a_call_whose_connection_cannot_open_has_no_note(self):
+        # The server is gone after the first call: the kept connection is at
+        # its end, and the new one is refused, before anything was sent.
+        cases = {
+            "xmlrpc": (
+                PASSWORD,
+                socket,
+                ConnectionRefusedError,
+                "ConnectionRefusedError, code 111",
+                [(1, "login"), (2, "call")],
+            ),
+            "json2": (
+                KEY,
+                urllib3.util.connection,
+                requests.ConnectionError,
+                "ConnectionError",
+                [(1, "call")],
+            ),
+        }
+        for api, (secret, module, original, name, received) in cases.items():
+            with self.subTest(api=api):
+                opened = self.record_sockets(module)
+                odoo = self.start(KeepAliveOdoo())
+                client = self.make_client(odoo.url, api, secret, f"erp-{api}")
+                self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                odoo.stop()
+                # The kept connection, the last one opened, once the server's
+                # end of it has come: readable, as the check before reuse
+                # reads it.
+                self.assertTrue(urllib3.util.wait_for_read(opened[-1], timeout=5))
+                error = self.raised(
+                    RequestError,
+                    lambda: client.call("res.partner", "search_count", domain=[]),
+                )
+                self.assertIsInstance(error, original)
+                self.assertEqual(
+                    str(error),
+                    f"A request of profile 'erp-{api}' failed: {name}. Its message is "
+                    "not shown, as it can quote the profile's values.",
+                )
+                self.assertEqual(odoo.requests, received)
+
+    def test_an_xmlrpc_tls_handshake_that_fails_has_no_note(self):
+        # Offline: the login is replaced, and the call's TLS handshake, on a
+        # fake socket, fails as one the server resets: once, as every
+        # request of Client, where xmlrpc.client would try a reset again.
+        self.make_profile("https://127.0.0.1", "xmlrpc", PASSWORD)
+        tcp_socket = mock.create_autospec(socket.socket, instance=True)
+        reset = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+        with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", return_value=UID):
+            with mock.patch("socket.create_connection", return_value=tcp_socket):
+                with mock.patch.object(
+                    ssl.SSLContext, "wrap_socket", side_effect=reset
+                ) as wrap:
+                    with Client("erp") as client:
+                        error = self.raised(
+                            RequestError,
+                            lambda: client.call("res.partner", "search_count", domain=[]),
+                        )
+        self.assertIsInstance(error, ConnectionResetError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ConnectionResetError, code 104. Its "
+            "message is not shown, as it can quote the profile's values.",
+        )
+        wrap.assert_called_once()
+        tcp_socket.sendall.assert_not_called()
+        self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_an_xmlrpc_tls_handshake_that_fails_leaves_nothing_for_the_next_call(self):
+        # Offline: the login is replaced, and the sockets are fakes. A
+        # handshake that fails leaves its TCP socket in the connection
+        # (http.client's HTTPSConnection.connect), here one whose descriptor
+        # is a real socket's, the kept end of a pair, open and silent: kept,
+        # it would carry the next call, unencrypted.
+        kept_end, server_end = socket.socketpair()
+        self.addCleanup(kept_end.close)
+        self.addCleanup(server_end.close)
+        failed_tcp_socket, tcp_socket = (
+            mock.create_autospec(socket.socket, instance=True) for _ in range(2)
+        )
+        failed_tcp_socket.fileno.return_value = kept_end.fileno()
+        body = xmlrpc.client.dumps((3,), methodresponse=True).encode()
+        tls_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+        tls_socket.makefile.return_value = io.BytesIO(
+            (
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n"
+            ).encode()
+            + body
+        )
+        reset = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+        with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", return_value=UID):
+            with mock.patch(
+                "socket.create_connection", side_effect=[failed_tcp_socket, tcp_socket]
+            ):
+                with mock.patch.object(
+                    ssl.SSLContext, "wrap_socket", side_effect=[reset, tls_socket]
+                ):
+                    client = self.make_client("https://127.0.0.1", "xmlrpc", PASSWORD)
+                    self.raised(
+                        RequestError,
+                        lambda: client.call("res.partner", "search_count", domain=[]),
+                    )
+                    failed_tcp_socket.close.assert_called_once_with()
+                    self.assertEqual(
+                        client.call("res.partner", "search_count", domain=[]), 3
+                    )
+        failed_tcp_socket.sendall.assert_not_called()
+        self.assertEqual(sent_requests(tls_socket), 1)
+
+    def test_a_call_cut_off_by_a_reset_keeps_the_errno_of_its_error(self):
+        odoo = self.start(KeepAliveOdoo({("call", 1): "reset"}))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        error = self.raised(
+            RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+        )
+        self.assertIsInstance(error, ConnectionResetError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ConnectionResetError, code 104. It "
+            "failed after the call started to go out, before its answer was read "
+            "whole: the server may have run the call, so do not repeat it before "
+            "reading back what it did. Its message is not shown, as it can quote the "
+            "profile's values.",
+        )
+        self.assertEqual(odoo.requests, [(1, "login"), (2, "call")])
+
+    def test_an_answer_whose_head_cannot_be_read_says_the_call_may_have_run(self):
+        # Over JSON-2, urllib3 raises it as a connection aborted.
+        cases = {
+            "xmlrpc": (
+                PASSWORD,
+                http.client.BadStatusLine,
+                "BadStatusLine",
+                [(1, "login"), (2, "call")],
+            ),
+            "json2": (KEY, requests.ConnectionError, "ConnectionError", [(1, "call")]),
+        }
+        for api, (secret, original, name, received) in cases.items():
+            with self.subTest(api=api):
+                odoo = self.start(
+                    KeepAliveOdoo({("call", 1): "answer a head that cannot be read"})
+                )
+                client = self.make_client(odoo.url, api, secret, f"erp-{api}")
+                error = self.raised(
+                    RequestError,
+                    lambda: client.call("res.partner", "search_count", domain=[]),
+                )
+                self.assertIsInstance(error, original)
+                self.assertEqual(
+                    str(error),
+                    f"A request of profile 'erp-{api}' failed: {name}. It failed after "
+                    "the call started to go out, before its answer was read whole: the "
+                    "server may have run the call, so do not repeat it before reading "
+                    "back what it did. Its message is not shown, as it can quote the "
+                    "profile's values.",
+                )
+                self.assertEqual(odoo.requests, received)
+
+    def test_a_json2_tls_handshake_that_fails_has_no_note(self):
+        error = self.json2_https_call(
+            ssl.SSLError(1, "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] handshake failure")
+        )
+        self.assertIsInstance(error, requests.exceptions.SSLError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: SSLError. Its message is not shown, "
+            "as it can quote the profile's values.",
+        )
+
+    def test_a_json2_tls_handshake_reset_has_no_note(self):
+        # urllib3 raises it as it raises a call cut off, a ProtocolError
+        # "Connection aborted.": nothing of the call had gone out.
+        client = self.make_client(self.handshake_reset(), "json2", KEY)
+        error = self.raised(
+            RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+        )
+        self.assertIsInstance(error, requests.ConnectionError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ConnectionError. Its message is not "
+            "shown, as it can quote the profile's values.",
+        )
+        self.assertNeverShows(error, KEY)
+
+    def test_a_json2_tls_error_as_the_call_goes_out_says_it_may_have_run(self):
+        # urllib3 raises it as it raises a handshake that fails, an SSLError.
+        tls_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+        tls_socket.sendall.side_effect = ssl.SSLError(1, "[SSL: BAD_LENGTH] bad length")
+        error = self.json2_https_call(tls_socket)
+        self.assertIsInstance(error, requests.exceptions.SSLError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: SSLError. It failed after the call "
+            "started to go out, before its answer was read whole: the server may have "
+            "run the call, so do not repeat it before reading back what it did. Its "
+            "message is not shown, as it can quote the profile's values.",
+        )
+        tls_socket.sendall.assert_called_once()
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_a_json2_call_whose_first_bytes_fail_says_it_may_have_run(self):
+        # Offline, over http, where the connection opens as the request
+        # starts to go out: its TCP socket, a fake, fails as the request's
+        # head is sent, before its body.
+        tcp_socket = mock.create_autospec(socket.socket, instance=True)
+        tcp_socket.sendall.side_effect = ConnectionAbortedError(
+            errno.ECONNABORTED, "Software caused connection abort"
+        )
+        with mock.patch(
+            "urllib3.util.connection.create_connection", return_value=tcp_socket
+        ) as connect:
+            client = self.make_client("http://127.0.0.1", "json2", KEY)
+            error = self.raised(
+                RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        connect.assert_called_once()
+        self.assertIsInstance(error, requests.ConnectionError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ConnectionError. It failed after the "
+            "call started to go out, before its answer was read whole: the server may "
+            "have run the call, so do not repeat it before reading back what it did. "
+            "Its message is not shown, as it can quote the profile's values.",
+        )
+        tcp_socket.sendall.assert_called_once()
+
+    def test_a_json2_tls_eof_as_the_answer_comes_says_it_may_have_run(self):
+        # A server that ran the call, then dropped the connection without
+        # TLS's close_notify.
+        tls_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+        tls_socket.makefile.return_value = FailingAnswer(
+            ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+        )
+        error = self.json2_https_call(tls_socket)
+        self.assertIsInstance(error, requests.exceptions.SSLError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: SSLError. It failed after the call "
+            "started to go out, before its answer was read whole: the server may have "
+            "run the call, so do not repeat it before reading back what it did. Its "
+            "message is not shown, as it can quote the profile's values.",
+        )
+        self.assertTrue(sent(tls_socket).endswith(b'{"domain": []}'))
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_a_redirect_whose_connection_cannot_open_says_the_call_may_have_run(self):
+        # The call's request goes out and is answered with a redirect within
+        # the origin, on a connection the answer closes: the redirect's
+        # request goes on a new connection, whose handshake fails. The server
+        # may have run the call: a 303 is the answer to a request it
+        # processed, which requests follows with a GET.
+        for status in (303, 307):
+            with self.subTest(status=status):
+                redirecting = mock.create_autospec(ssl.SSLSocket, instance=True)
+                redirecting.makefile.return_value = io.BytesIO(
+                    f"HTTP/1.1 {status} {http.HTTPStatus(status).phrase}\r\n"
+                    "Location: /json/2/res.partner/search_count\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n".encode()
+                )
+                error = self.json2_https_call(
+                    redirecting,
+                    ssl.SSLError(1, "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] handshake failure"),
+                )
+                self.assertIsInstance(error, requests.exceptions.SSLError)
+                self.assertEqual(
+                    str(error),
+                    "A request of profile 'erp' failed: SSLError. It failed after the "
+                    "call started to go out, before its answer was read whole: the "
+                    "server may have run the call, so do not repeat it before reading "
+                    "back what it did. Its message is not shown, as it can quote the "
+                    "profile's values.",
+                )
+                self.assertEqual(
+                    sent(redirecting).count(
+                        b"POST /json/2/res.partner/search_count HTTP/1.1\r\n"
+                    ),
+                    1,
+                )
+
+    def test_a_json2_handshake_that_fails_after_a_call_that_went_out_has_no_note(self):
+        # The mark is the call's own: the first call's request goes out, and
+        # its answer closes the connection; the second call's new connection
+        # fails its handshake before anything of that call is sent.
+        answering = mock.create_autospec(ssl.SSLSocket, instance=True)
+        answering.makefile.return_value = io.BytesIO(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: 1\r\nConnection: close\r\n\r\n3"
+        )
+        handshake = ssl.SSLError(1, "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] handshake failure")
+        with self.json2_https_client(answering, handshake) as client:
+            self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+            error = self.raised(
+                RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        self.assertIsInstance(error, requests.exceptions.SSLError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: SSLError. Its message is not shown, "
+            "as it can quote the profile's values.",
+        )
+
+    def test_a_json2_call_reads_no_other_calls_mark(self):
+        # Offline, two clients in two threads, their sockets fakes: the first
+        # call's request goes out, and its answer is held while the second
+        # call's handshake fails; then the first call's connection is reset.
+        reached, released = threading.Event(), threading.Event()
+        self.addCleanup(released.set)
+
+        def held_answer(*args):
+            reached.set()
+            released.wait(HOLD)
+            return FailingAnswer(ConnectionResetError(errno.ECONNRESET, "Connection reset"))
+
+        first_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
+        first_socket.makefile.side_effect = held_answer
+        handshake = ssl.SSLError(1, "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] handshake failure")
+        tcp_sockets = [mock.create_autospec(socket.socket, instance=True) for _ in range(2)]
+        first_errors = []
+
+        def first_call():
+            try:
+                first.call("res.partner", "search_count", domain=[])
+            except RequestError as error:
+                first_errors.append(error)
+
+        with mock.patch(
+            "urllib3.util.connection.create_connection", side_effect=tcp_sockets
+        ) as connect:
+            with mock.patch.object(
+                ssl.SSLContext, "wrap_socket", side_effect=[first_socket, handshake]
+            ):
+                first = self.make_client("https://127.0.0.1", "json2", KEY, "erp-first")
+                second = self.make_client("https://127.0.0.1", "json2", KEY, "erp-second")
+                thread = threading.Thread(target=first_call, daemon=True)
+                thread.start()
+                self.assertTrue(reached.wait(HOLD))
+                second_error = self.raised(
+                    RequestError,
+                    lambda: second.call("res.partner", "search_count", domain=[]),
+                )
+                released.set()
+                thread.join(HOLD)
+        self.assertEqual(connect.call_count, 2)
+        self.assertEqual(
+            [str(error) for error in first_errors],
+            [
+                "A request of profile 'erp-first' failed: ConnectionError. It failed "
+                "after the call started to go out, before its answer was read whole: "
+                "the server may have run the call, so do not repeat it before reading "
+                "back what it did. Its message is not shown, as it can quote the "
+                "profile's values."
+            ],
+        )
+        self.assertEqual(
+            str(second_error),
+            "A request of profile 'erp-second' failed: SSLError. Its message is not "
+            "shown, as it can quote the profile's values.",
+        )
+
+    def test_a_json2_body_cut_short_after_an_error_status_says_the_call_may_have_run(self):
+        odoo = self.start(Json2Odoo())
+        odoo.answers[("res.partner", "write")] = RawAnswer(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n"
+            b"Content-Length: 400\r\n\r\n{"
+        )
+        client = self.make_client(odoo.url, "json2", KEY)
+        error = self.raised(
+            RequestError, lambda: client.call("res.partner", "write", [7], vals={})
+        )
+        self.assertIsInstance(error, requests.exceptions.ChunkedEncodingError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ChunkedEncodingError, code 500. It "
+            "failed after the call started to go out, before its answer was read "
+            "whole: the server may have run the call, so do not repeat it before "
+            "reading back what it did. Its message is not shown, as it can quote the "
+            "profile's values.",
+        )
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_a_json2_body_the_connection_brought_whole_has_no_note(self):
+        # After an error status, a body sent in bad chunks, which requests
+        # raises as it raises a body cut short, or one that is not the gzip it
+        # says: the connection did not fail.
+        answers = {
+            "sent in bad chunks": (
+                "ChunkedEncodingError",
+                b"Transfer-Encoding: chunked\r\n\r\nzz\r\n3\r\n0\r\n\r\n",
+            ),
+            "not the gzip it says": (
+                "ContentDecodingError",
+                b"Content-Encoding: gzip\r\nContent-Length: 3\r\n\r\n[3]",
+            ),
+        }
+        odoo = self.start(Json2Odoo())
+        client = self.make_client(odoo.url, "json2", KEY)
+        for case, (error_class, rest) in answers.items():
+            with self.subTest(case=case):
+                odoo.answers[("res.partner", "write")] = RawAnswer(
+                    b"HTTP/1.1 500 Internal Server Error\r\n"
+                    b"Content-Type: application/json\r\n" + rest
+                )
+                error = self.raised(
+                    RequestError, lambda: client.call("res.partner", "write", [7], vals={})
+                )
+                self.assertEqual(
+                    str(error),
+                    f"A request of profile 'erp' failed: {error_class}, code 500. Its "
+                    "message is not shown, as it can quote the profile's values.",
+                )
 
     def test_server_proxy_sends_a_call_cut_off_a_second_time(self):
         # A guard of xmlrpc.client's own sending, which ServerProxy keeps.
@@ -1984,12 +2530,17 @@ class TimeoutTest(StubTestCase):
     and after the read timeout that the call may still complete. ServerProxy
     sets none, as before 2.0."""
 
-    def held(self):
+    def held(self, receive_buffer=None):
         """The url of a server whose system takes each connection, and which
         never reads a request nor answers it, for HOLD seconds: its listener
-        closes then, and the system resets the connections it took."""
+        closes then, and the system resets the connections it took. With
+        ``receive_buffer``, each connection's receive buffer is set to that
+        many bytes, which the system then does not grow."""
         listener = socket.socket()
         self.addCleanup(listener.close)
+        if receive_buffer is not None:
+            # Set before listen, as each connection the system takes inherits it.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
         listener.bind(("127.0.0.1", 0))
         listener.listen(8)
         close_after_hold(self, listener)
@@ -2194,6 +2745,94 @@ class TimeoutTest(StubTestCase):
         self.assertIn("The read timeout fired", str(error))
         self.assertNeverShows(error, KEY)
         self.assertNoFrameHolds(error, KEY)
+
+    def test_a_json2_call_whose_sending_stops_is_a_connect_timeout_after_it_started(self):
+        # A server that never reads, both sockets' buffers set to 16 KB,
+        # which the system then does not grow: a body of 1 MB fills them,
+        # whatever buffers the system gives by default, and its sending
+        # stops. requests sends a request under the connect timeout, and
+        # raises its end as a call cut off, over the socket's timeout: the
+        # connect timeout fired, after the call started to go out.
+        create = urllib3.util.connection.create_connection
+
+        def connect(*args, **kwargs):
+            sock = create(*args, **kwargs)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16384)
+            return sock
+
+        self.make_profile(self.held(receive_buffer=16384), "json2", KEY)
+        with mock.patch.object(urllib3.util.connection, "create_connection", connect):
+            with Client("erp", timeout=(0.2, 5)) as client:
+                error = self.raised(
+                    RequestError,
+                    lambda: client.call(
+                        "res.partner", "search_count", domain=["x" * 1_000_000]
+                    ),
+                )
+        self.assertIsInstance(error, requests.ConnectionError)
+        self.assertEqual((error.timeout_fired, error.code), ("connect", None))
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ConnectionError. The connect timeout "
+            "fired after the call started to go out: the server may have run the "
+            "call, so do not repeat it before reading back what it did. Its message "
+            "is not shown, as it can quote the profile's values.",
+        )
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_a_redirects_connect_timeout_says_the_call_may_have_run(self):
+        # The call's request goes out and is answered with a redirect within
+        # the origin, on a connection the answer closes; the redirect's new
+        # connection times out as it opens. A 303 answers a request the
+        # server processed.
+        odoo = self.start(Json2Odoo())
+        odoo.answers[("res.partner", "write")] = Answer(
+            303, b"", {"Location": "/json/2/res.partner/search_count"}
+        )
+        odoo.answers[("res.partner", "search_count")] = 3
+        client = self.make_client(odoo.url, "json2", KEY)
+        opened = []
+        create = urllib3.util.connection.create_connection
+
+        def connect(*args, **kwargs):
+            # The first connection opens; the next one's connect times out.
+            if opened:
+                raise socket.timeout("timed out")
+            opened.append(create(*args, **kwargs))
+            return opened[0]
+
+        with mock.patch.object(urllib3.util.connection, "create_connection", connect):
+            error = self.raised(
+                RequestError, lambda: client.call("res.partner", "write", [7], vals={})
+            )
+        self.assertIsInstance(error, requests.ConnectTimeout)
+        self.assertEqual((error.timeout_fired, error.code), ("connect", None))
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ConnectTimeout. The connect timeout "
+            "fired after the call started to go out: the server may have run the "
+            "call, so do not repeat it before reading back what it did. Its message "
+            "is not shown, as it can quote the profile's values.",
+        )
+        self.assertEqual([request["method"] for request in odoo.requests], ["POST"])
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_a_json2_tls_handshake_that_times_out_counts_as_read(self):
+        # requests reports it as a ReadTimeout. Nothing of the call was sent.
+        tcp_socket = mock.create_autospec(socket.socket, instance=True)
+        handshake = socket.timeout("_ssl.c:999: The handshake operation timed out")
+        with mock.patch("urllib3.util.connection.create_connection", return_value=tcp_socket):
+            with mock.patch.object(ssl.SSLContext, "wrap_socket", side_effect=handshake):
+                client = self.make_client("https://127.0.0.1", "json2", KEY)
+                error = self.raised(
+                    RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+                )
+        self.assertIsInstance(error, requests.ReadTimeout)
+        self.assertEqual((error.timeout_fired, error.code), ("read", None))
+        self.assertIn("The read timeout fired: the server may still complete", str(error))
+        tcp_socket.sendall.assert_not_called()
 
     def test_an_xmlrpc_answer_whose_body_stops_coming_is_a_read_timeout(self):
         # Not an answer that cannot be read: the read timeout fired.

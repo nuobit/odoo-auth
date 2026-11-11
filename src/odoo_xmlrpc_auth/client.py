@@ -36,9 +36,23 @@ _TIMEOUT_NOTES = {
         f"{_READ_BACK}. "
     ),
 }
+# What it adds when the connect timeout fired after the call started to go
+# out (_cut_off): over JSON-2, on a redirect's new connection, or as a
+# request goes out, which requests sends under the connect timeout.
+_LATE_CONNECT_TIMEOUT_NOTE = (
+    "The connect timeout fired after the call started to go out: the server "
+    f"may have run the call, so {_READ_BACK}. "
+)
 # What it adds for an answer to a call that came with status 200 and could
 # not be read (code 200).
 _ANSWERED_NOTE = f"The server answered: it may have run the call, so {_READ_BACK}. "
+# What it adds for a request of a call that failed after the call started
+# to go out, before its answer was read whole (_cut_off): its connection
+# failed, or the answer's head could not be read.
+_CUT_OFF_NOTE = (
+    "It failed after the call started to go out, before its answer was read "
+    f"whole: the server may have run the call, so {_READ_BACK}. "
+)
 _SECTION = "odoo"
 _REQUIRED_KEYS = ("url", "db", "user", "password")
 # The values of a profile a caller may print (Client's repr shows the api):
@@ -105,14 +119,31 @@ class _ReadTimeout(socket.timeout):
     a RequestError stands for it as the socket's timeout it replaces."""
 
 
+class _CutOff(Exception):
+    """Raised by Client's XML-RPC transports when the connection fails once
+    open, after the request started to go out, but for the read timeout
+    (_ReadTimeout): a RequestError stands for it as the error it replaces,
+    ``stands_for``, with that error's errno, ``code``, and keeps neither its
+    text nor its frames. ``call`` is True for a call's request, whose
+    RequestError says that the server may have run the call
+    (_XmlRpc._request), and False for the login's, which is not the call."""
+
+    def __init__(self, stands_for, code, call=False):
+        super().__init__()
+        self.stands_for = stands_for
+        self.code = code
+        self.call = call
+
+
 # What a call raises in its transport: the socket's and TLS's errors, a
 # malformed HTTP answer, an HTTP status other than 200, every error of
 # requests, which are OSErrors, every error of urllib3, which requests
 # raises as it is when its adapter does not know it (HTTPAdapter.send: under
 # requests 2.34.2 and urllib3 2.3.0, the LocationParseError of a redirect
-# to <origin>//x:y), and an answer that is not XML-RPC. An Odoo Fault is
-# the server's answer, not one of them. IDNA's refusal of the host, a
-# UnicodeError over XML-RPC, is not either: the load refuses such a host
+# to <origin>//x:y), an answer that is not XML-RPC, and a connection of
+# Client's XML-RPC that failed after the request started to go out. An Odoo
+# Fault is the server's answer, not one of them. IDNA's refusal of the host,
+# a UnicodeError over XML-RPC, is not either: the load refuses such a host
 # with the same codec (_idna_refuses).
 _TRANSPORT_ERRORS = (
     OSError,
@@ -120,6 +151,7 @@ _TRANSPORT_ERRORS = (
     urllib3.exceptions.HTTPError,
     xmlrpc.client.ProtocolError,
     _InvalidAnswer,
+    _CutOff,
 )
 # What xmlrpc.client's Marshaller raises for a value of a call it cannot
 # write (read in Python 3.11's xmlrpc/client.py): a type it does not know, a
@@ -182,17 +214,41 @@ class RequestError(Exception):
     the message says that the server may have run the call, so that a
     retry would run it again.
 
+    When a request of a call failed after the call started to go out, even
+    in part, before its answer was read whole, on either API, the message
+    says so, and that the server may have run the call: its connection
+    reset, closed or failing in TLS, or the head of its answer that cannot
+    be read. Over JSON-2 that holds for a redirect's new connection too,
+    even one that fails to open: a redirect, such as a 303, can answer a
+    request the server processed. A failure before anything of the call
+    was sent says nothing of it (a name that does not resolve, a
+    connection refused, the connect timeout, a TLS handshake that fails or
+    is reset), nor does one of the XML-RPC login, which is not the call,
+    nor one over JSON-2 that is not a connection's: a redirect refused or
+    one to a location urllib3 cannot parse, a body sent in bad chunks after
+    a status other than 200 (_cut_off).
+
     When one of Client's timeouts fired, ``timeout_fired`` says which,
-    "connect" or "read" (None otherwise), and so does the message: after a
-    read timeout the server may still complete the call. Its ``code`` is
-    then None, wherever the timeout fired.
+    "connect" or "read" (None otherwise), and so does the message, in place
+    of the note above: after a read timeout the server may still complete
+    the call. After the connect timeout the message says that nothing was
+    sent, unless it fired over JSON-2 after the call started to go out, on
+    a redirect's new connection or as a request goes out, which requests
+    sends under the connect timeout: it then says that the server may have
+    run the call. Its ``code`` is None, wherever the timeout fired.
     """
 
-    def __init__(self, profile, error_class, code=None, timeout_fired=None):
+    def __init__(
+        self, profile, error_class, code=None, timeout_fired=None, *, cut_off=False
+    ):
         self.profile = profile
         self.error_class = error_class
         self.code = code
         self.timeout_fired = timeout_fired
+        # Whether a request of a call failed after the call started to go
+        # out, before its answer was read whole (_cut_off): the message says
+        # so, unless a timeout fired, whose note it gives instead.
+        self._cut_off = cut_off
         if isinstance(self, xmlrpc.client.ProtocolError):
             # Its own fields, the status kept, without the url and the
             # server's text.
@@ -218,10 +274,15 @@ class RequestError(Exception):
 
     def __str__(self):
         code = f", code {_one_line(self.code)}" if self.code is not None else ""
-        if self.timeout_fired is not None:
+        if self.timeout_fired == "connect" and self._cut_off:
+            # The connect timeout's own note says that nothing was sent.
+            note = _LATE_CONNECT_TIMEOUT_NOTE
+        elif self.timeout_fired is not None:
             note = _TIMEOUT_NOTES[self.timeout_fired]
         elif self.code == 200:
             note = _ANSWERED_NOTE
+        elif self._cut_off:
+            note = _CUT_OFF_NOTE
         else:
             note = ""
         return (
@@ -329,15 +390,18 @@ def _request_error(profile, error, status=None):
     # The library's own signals stand for the public class they are: an
     # answer that is not XML-RPC for xmlrpc.client's own error for it, as
     # its parser's errors are no class a caller catches; a timeout of
-    # Client's for the socket's timeout it replaces.
+    # Client's for the socket's timeout it replaces; a connection cut off
+    # for the error it replaces.
     if isinstance(error, _InvalidAnswer):
         stands_for = xmlrpc.client.ResponseError
     elif isinstance(error, (_ConnectTimeout, _ReadTimeout)):
         stands_for = socket.timeout
+    elif isinstance(error, _CutOff):
+        stands_for = error.stands_for
     else:
         stands_for = type(error)
     return _error_class(RequestError, stands_for)(
-        profile, stands_for.__name__, code, fired
+        profile, stands_for.__name__, code, fired, cut_off=_cut_off(error)
     )
 
 
@@ -351,9 +415,44 @@ def _error_code(error):
         code = error.response.status_code if error.response is not None else None
     elif isinstance(error, OSError):
         code = error.errno
+    elif isinstance(error, _CutOff):
+        code = error.code
     else:
         code = None
     return code
+
+
+def _cut_off(error):
+    """Whether ``error``, one of _TRANSPORT_ERRORS, stands for a request of
+    a call that failed after the call started to go out, before its answer
+    was read whole: its connection failed, or the answer's head could not
+    be read, which http.client and urllib3 raise as they raise a connection
+    that failed.
+
+    Over XML-RPC, Client's transports open the connection before a request
+    goes out (_Sending): a failure to open it raises as it is, before
+    anything was sent, and a failure of the open connection raises
+    _CutOff, a call's in the call's request (_XmlRpc._request). Over JSON-2,
+    the error does not say it: urllib3 2.3.0 and 2.8.0 raise a TLS
+    handshake whose connection is reset as they raise a call cut off, a
+    ConnectionError over their ProtocolError "Connection aborted.", and a
+    TLS error once connected as a handshake that fails, an SSLError over a
+    MaxRetryError. The library's connections mark the call as started
+    instead, just before the first byte of one of its requests is sent
+    (_MarkedSending). Once it is, a failure of any connection of the call
+    counts, the new one of a redirect included: the ConnectionError of
+    requests, its SSLError among them, and, as the answer's body comes, its
+    ChunkedEncodingError, but for a body sent in bad chunks (urllib3's
+    InvalidChunkLength), which the connection brought whole. An error that
+    is not a connection's, such as a redirect refused, does not count.
+    """
+    return (isinstance(error, _CutOff) and error.call) or (
+        isinstance(
+            error, (requests.ConnectionError, requests.exceptions.ChunkedEncodingError)
+        )
+        and not _over(error, urllib3.exceptions.InvalidChunkLength)
+        and _REQUEST_STARTED.get()
+    )
 
 
 def _timeout_fired(error):
@@ -361,28 +460,39 @@ def _timeout_fired(error):
     for: "connect", "read", or None for none, as for every error of
     ServerProxy, which sets no timeout.
 
-    Over XML-RPC, Client's transports raise _ConnectTimeout and _ReadTimeout.
-    Over JSON-2, requests raises ConnectTimeout and ReadTimeout, and a
-    ConnectionError over the socket's timeout when the answer's body stops
-    coming (requests' Response.iter_content) or the request stops going
-    out. requests also reports a TLS handshake that times out as a
-    ReadTimeout (urllib3 2.8's HTTPConnectionPool._make_request), which
-    counts as read: its note says what is safe, not what is sure.
+    Over XML-RPC, Client's transports raise _ConnectTimeout and
+    _ReadTimeout, and a request goes out under the read timeout. Over
+    JSON-2, requests raises ConnectTimeout and ReadTimeout, and a
+    ConnectionError over the socket's timeout in two more cases. Over
+    urllib3's ReadTimeoutError, when the answer's body stops coming
+    (requests' Response.iter_content): the read timeout's. Over urllib3's
+    ProtocolError "Connection aborted.", with no ReadTimeoutError, when the
+    request stops going out: the connect timeout's, under which requests
+    sends a request, giving the socket the read timeout only once it went
+    out whole (urllib3's HTTPConnectionPool._make_request). After the call
+    started to go out, the connect timeout's message says so (_cut_off),
+    and that the server may have run the call. requests also reports a
+    TLS handshake that times out as a ReadTimeout (urllib3 2.8's
+    HTTPConnectionPool._make_request), which counts as read: its note says
+    what is safe, not what is sure.
     """
     if isinstance(error, (_ConnectTimeout, requests.ConnectTimeout)):
         fired = "connect"
-    elif isinstance(error, (_ReadTimeout, requests.ReadTimeout)) or (
-        isinstance(error, requests.ConnectionError) and _over_socket_timeout(error)
-    ):
+    elif isinstance(error, (_ReadTimeout, requests.ReadTimeout)):
         fired = "read"
+    elif isinstance(error, requests.ConnectionError) and _over(error, socket.timeout):
+        if _over(error, urllib3.exceptions.ReadTimeoutError):
+            fired = "read"
+        else:
+            fired = "connect"
     else:
         fired = None
     return fired
 
 
-def _over_socket_timeout(error):
-    """Whether ``error`` was raised over a socket's timeout: one is among the
-    errors of its chain, by __cause__ or else __context__."""
+def _over(error, kind):
+    """Whether ``error`` was raised over an error of ``kind``: one is among
+    the errors of its chain, by __cause__ or else __context__."""
     chain = []
     cause = error.__cause__ or error.__context__
     # Python keeps a chain free of cycles when it sets __context__; a cause
@@ -390,7 +500,7 @@ def _over_socket_timeout(error):
     while cause is not None and cause not in chain:
         chain.append(cause)
         cause = cause.__cause__ or cause.__context__
-    return any(isinstance(cause, socket.timeout) for cause in chain)
+    return any(isinstance(cause, kind) for cause in chain)
 
 
 def _argument_error(profile, error, causes, secret):
@@ -1016,9 +1126,9 @@ class _OwnConnections:
 class _Timeouts:
     """For Client's XML-RPC transports, whose connections are
     _TimedConnections under ``timeout``, a (connect, read) pair of seconds:
-    the socket's timeout raised once connected, the read timeout's, raises
-    _ReadTimeout. A timed out request is sent once, as every request of
-    Client (_Sending)."""
+    the socket's timeout raised in single_request, which runs once the
+    connection is open (_Sending), the read timeout's, raises _ReadTimeout.
+    A timed out request is sent once, as every request of Client."""
 
     def __init__(self, timeout):
         super().__init__()
@@ -1028,8 +1138,6 @@ class _Timeouts:
         failure = None
         try:
             answer = super().single_request(host, handler, request_body, verbose)
-        except _ConnectTimeout:
-            raise
         except socket.timeout:
             # Raised once connected, where the socket's timeout is the read
             # timeout. The frames of its traceback hold the request:
@@ -1053,6 +1161,12 @@ class _Sending:
     is_connection_dropped), with the check used here, wait_for_read, and
     sends a request once, under requests' Retry(0, read=False).
 
+    The connection is open before the request starts to go out: a failure
+    to open it (a name that does not resolve, a connection refused, the
+    connect timeout, a TLS handshake that fails) raises as it is, before
+    anything was sent, and a failure of the open connection, but for the
+    read timeout, raises _CutOff: the server may have read the request.
+
     ServerProxy keeps xmlrpc.client's own sending: it writes a request on
     its kept connection unchecked, and sends it again after those errors."""
 
@@ -1064,7 +1178,28 @@ class _Sending:
             connection.sock, timeout=0.0
         ):
             self.close()
-        return self.single_request(host, handler, request_body, verbose)
+            connection = self.make_connection(host)
+        if connection.sock is None:
+            try:
+                connection.connect()
+            except Exception:
+                # As single_request does, a connection that failed is not
+                # kept: a TLS handshake that fails leaves its TCP socket in it.
+                self.close()
+                raise
+        failure = None
+        try:
+            answer = self.single_request(host, handler, request_body, verbose)
+        except socket.timeout:
+            # _ReadTimeout (_Timeouts), which says so itself.
+            raise
+        except (OSError, http.client.HTTPException) as error:
+            # Its text can quote the url, and its frames hold the request:
+            # _CutOff, raised after this block, keeps neither.
+            failure = _CutOff(type(error), _error_code(error))
+        if failure is not None:
+            raise failure
+        return answer
 
 
 class _Transport(
@@ -1375,12 +1510,37 @@ class _BearerKey(requests.auth.AuthBase):
         return repr(self._key)
 
 
-class _Json2HTTPConnection(_Quiet, urllib3.connection.HTTPConnection):
-    """urllib3's connection for http, for JSON-2."""
+# Whether a request of the JSON-2 call this thread or task runs, a redirect's
+# included, started to go out on an open connection (_MarkedSending), for
+# _cut_off. It is the call's: only a call clears it, as it starts
+# (_Json2.call), so that it reads no earlier call's.
+_REQUEST_STARTED = contextvars.ContextVar("_REQUEST_STARTED", default=False)
 
 
-class _Json2HTTPSConnection(_Quiet, urllib3.connection.HTTPSConnection):
-    """urllib3's connection for https, for JSON-2."""
+class _MarkedSending:
+    """For the library's urllib3 connections: marks the call as started
+    (_REQUEST_STARTED) just before the first byte of one of its requests is
+    sent, on an open connection. The mark stays until the next call clears
+    it: once a request of the call went out, the server may have run the
+    call, also when it answered with a redirect, such as a 303, which is the
+    answer to a request the server processed (RFC 9110, § 15.4.4)."""
+
+    def send(self, data):
+        # http.client's send opens a closed connection itself (urllib3 opens
+        # an https one before the request): it is opened here first, so that
+        # the mark comes once it is open.
+        if self.sock is None:
+            self.connect()
+        _REQUEST_STARTED.set(True)
+        super().send(data)
+
+
+class _Json2HTTPConnection(_MarkedSending, _Quiet, urllib3.connection.HTTPConnection):
+    """urllib3's connection for http, for JSON-2, with _MarkedSending."""
+
+
+class _Json2HTTPSConnection(_MarkedSending, _Quiet, urllib3.connection.HTTPSConnection):
+    """urllib3's connection for https, for JSON-2, with _MarkedSending."""
 
 
 class _Json2HTTPConnectionPool(urllib3.HTTPConnectionPool):
@@ -1606,12 +1766,16 @@ class _XmlRpc:
         """The answer to ``body``, a request of execute_kw, as ServerProxy
         gives it (Python 3.11, ServerProxy.__request): its one value, or
         the tuple of them when it holds another number. An answer it cannot
-        read raises _InvalidAnswer at status 200: the call's own."""
+        read raises _InvalidAnswer at status 200, and a connection that
+        failed after the request started to go out, the call's _CutOff: the
+        call's own, which the login's are not."""
         failure = None
         try:
             answer = self._transport.request(self._host, self._handler, body)
         except _InvalidAnswer:
             failure = _InvalidAnswer(200)
+        except _CutOff as cut_off:
+            failure = _CutOff(cut_off.stands_for, cut_off.code, call=True)
         if failure is not None:
             raise failure
         return answer[0] if len(answer) == 1 else answer
@@ -1676,6 +1840,9 @@ class _Json2:
         if failure is not None:
             raise failure
         path = "/".join(urllib.parse.quote(name, safe="") for name in (model, method))
+        # Nothing of this call has gone out yet, whatever an earlier call
+        # left in the mark (_MarkedSending).
+        _REQUEST_STARTED.set(False)
         failure, result = _send(
             self._profile,
             lambda: self._outcome(

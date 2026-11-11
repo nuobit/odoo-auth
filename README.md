@@ -307,10 +307,32 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   request once, the XML-RPC login's too, and never again by itself after a
   failure, where `xmlrpc.client`, and so `ServerProxy`, sends a request a
   second time after its connection was closed or reset before the answer:
-  a call the server ran would run twice. When one of
+  a call the server ran would run twice. When a request of a call fails
+  after the call started to go out, even in part, before its answer was
+  read whole (its connection reset, closed or failing in TLS, or an answer
+  whose head cannot be read), the message says: «It failed after the call
+  started to go out, before its answer was read whole: the server may have
+  run the call, so do not repeat it before reading back what it did.» Over
+  JSON-2 that
+  holds for a redirect's new connection too, even one that fails to open:
+  a redirect, such as a 303, can answer a request the server processed. A
+  failure before anything of the call was sent says nothing of it (a name
+  that does not resolve, a connection refused, the connect timeout, a TLS
+  handshake that fails or is reset), nor does one of the XML-RPC login,
+  which is not the call, nor one over JSON-2 that is not a connection's (a
+  redirect refused, a body sent in bad chunks after a status other than
+  200). Over JSON-2, where `urllib3` raises the same errors before and
+  after a request starts to go out, the library's connections mark the
+  call as started just before the first byte of one of its requests is
+  sent. When one of
   `Client`'s timeouts fires, `timeout_fired` says which, `"connect"` or
   `"read"` (`None` otherwise), and so does the message, and its `code` is
-  `None`. After the connect timeout nothing was sent. After the read
+  `None`. After the connect timeout nothing was sent, unless it fired over
+  JSON-2 after the call started to go out: on a redirect's new connection,
+  or as a request goes out, which `requests` sends under the connect
+  timeout. The message then says: «The connect timeout fired after the
+  call started to go out: the server may have run the call, so do not
+  repeat it before reading back what it did.» After the read
   timeout the server may still complete the call, so do not repeat it
   before reading back what it did. It is then an
   instance of `socket.timeout` (`TimeoutError`) over XML-RPC, and of
