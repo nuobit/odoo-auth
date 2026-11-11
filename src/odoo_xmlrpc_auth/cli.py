@@ -69,13 +69,15 @@ def _named(call):
 
 def _printed(answer):
     """``answer``, Odoo's result, as the JSON text the CLI prints, or None
-    when JSON cannot write it: over XML-RPC, a dateTime, a base64 or a
-    bigdecimal value, or one nested deeper than json follows.
+    when JSON cannot write it: NaN or an infinity, which json.dumps writes
+    by default though JSON has neither, over either API; over XML-RPC, a
+    dateTime, a base64 or a bigdecimal value; or one nested deeper than json
+    follows.
 
     None, not json's error, whose frames hold the answer, which can echo
     the password: the CLI ends with its own error, raised outside them."""
     try:
-        text = json.dumps(answer)
+        text = json.dumps(answer, allow_nan=False)
     except _JSON_ERRORS:
         text = None
     return text
@@ -122,7 +124,7 @@ def main():
         die(e)
     if printed is None:
         die(
-            "Odoo answered the call with a value JSON cannot write, such as a "
-            f"dateTime or base64 of XML-RPC: it ran the call, so {_READ_BACK}"
+            "Odoo answered the call with a value JSON cannot write, such as NaN, "
+            f"or a dateTime or base64 of XML-RPC: it ran the call, so {_READ_BACK}"
         )
     print(printed)
