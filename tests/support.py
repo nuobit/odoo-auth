@@ -11,6 +11,7 @@ import http.server
 import json
 import os
 import socket
+import struct
 import tempfile
 import threading
 import xmlrpc.client
@@ -333,14 +334,15 @@ class KeepAliveOdoo:
     - "answer", what it does when the plan says nothing: a 200, UID to the
       login and ANSWER to a call over XML-RPC, ANSWER as JSON over JSON-2;
       the connection stays open.
-    - "answer, then close": that 200, saying Connection: close; then the
-      server closes the connection.
     - "answer, then close idle": that 200; then the server closes its side
       of the connection and sets ``idle_closed``, reads the connection to
       its end, recording in ``after_close`` what each request that still
       comes on it is, and sets ``idle_read``.
+    - "answer a head that cannot be read": a status line whose status is
+      not a number; then the server closes the connection.
     - "drop": the server closes the connection unanswered, as one that ran
       the call and broke off before its answer.
+    - "reset": the server resets the connection unanswered.
     """
 
     ANSWER = 3
@@ -386,18 +388,29 @@ class KeepAliveOdoo:
                     nth = 1 + [done for _, done in self.requests].count(what)
                     self.requests.append((number, what))
                 action = self.plan.get((what, nth), "answer")
-                if action == "drop":
-                    break
-                connection.sendall(self._answer(path, close=action == "answer, then close"))
-                if action == "answer, then close":
-                    break
-                if action == "answer, then close idle":
+                if action == "answer":
+                    connection.sendall(self._answer(path))
+                elif action == "answer, then close idle":
+                    connection.sendall(self._answer(path))
                     connection.shutdown(socket.SHUT_WR)
                     self.idle_closed.set()
                     while (late := self._path_read(reader)) is not None:
                         self.after_close.append(self._what(late))
                     self.idle_read.set()
                     break
+                elif action == "answer a head that cannot be read":
+                    connection.sendall(b"HTTP/1.1 two-hundred OK\r\n\r\n")
+                    break
+                elif action == "drop":
+                    break
+                elif action == "reset":
+                    # Closed with a linger of 0 seconds, it sends a reset.
+                    connection.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                    break
+                else:
+                    raise ValueError(f"KeepAliveOdoo has no action {action!r}")
         except OSError:
             # stop() shut the connection down.
             pass
@@ -424,7 +437,7 @@ class KeepAliveOdoo:
     def _what(path):
         return "login" if path == "/xmlrpc/2/common" else "call"
 
-    def _answer(self, path, close):
+    def _answer(self, path):
         if path.startswith("/xmlrpc/"):
             value = UID if self._what(path) == "login" else self.ANSWER
             body = xmlrpc.client.dumps((value,), methodresponse=True).encode()
@@ -433,8 +446,6 @@ class KeepAliveOdoo:
             body = json.dumps(self.ANSWER).encode()
             kind = "application/json"
         head = f"HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {len(body)}\r\n"
-        if close:
-            head += "Connection: close\r\n"
         return f"{head}\r\n".encode() + body
 
     def stop(self):
