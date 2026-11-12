@@ -1001,6 +1001,42 @@ class Json2ClientTest(StubTestCase):
         self.assertEqual(str(caught.exception), "Authentication failed for profile 'other'")
         self.assertNeverShows(caught.exception, other_key)
 
+    def test_a_401_whose_body_cannot_be_read_is_an_auth_error(self):
+        # Odoo's refusal of the key, whatever its body, which is not read: one
+        # cut short or not the gzip it says changes nothing, and the answer's
+        # connection is closed. Each answer is held, as a traceback or a
+        # debugger can hold one, so that only its close lets its socket go,
+        # not the garbage collector.
+        answers = {
+            "cut short": b"Content-Length: 400\r\n\r\n{",
+            "not the gzip it says": b"Content-Encoding: gzip\r\nContent-Length: 3\r\n\r\n[3]",
+        }
+        held = []
+        send = requests.Session.send
+
+        def holding(session, request, **kwargs):
+            held.append(send(session, request, **kwargs))
+            return held[-1]
+
+        patcher = mock.patch.object(requests.Session, "send", holding)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        opened = self.record_sockets(urllib3.util.connection)
+        for case, rest in answers.items():
+            with self.subTest(case=case):
+                self.odoo.answers[("res.partner", "read")] = RawAnswer(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n"
+                    + rest
+                )
+                error = self.raised(
+                    AuthError, lambda: self.client.call("res.partner", "read", [7])
+                )
+                self.assertEqual(str(error), "Authentication failed for profile 'erp'")
+                self.assertNeverShows(error, KEY)
+                self.assertNoFrameHolds(error, KEY)
+                self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+        self.assertEqual((len(held), len(opened)), (2, 2))
+
     def test_an_error_status_without_an_odoo_error_is_a_request_error(self):
         # A proxy's page, or Odoo's own when the db header names no database.
         self.odoo.answers[("res.partner", "read")] = Answer(
@@ -1113,11 +1149,13 @@ class Json2ClientTest(StubTestCase):
                     self.client.call("res.partner", "read", [7])
                 self.assertIsInstance(caught.exception, RedirectError)
                 self.assertEqual(caught.exception.code, status)
-                # The call went out, and the server answered: no connection
-                # failed.
+                # The call went out, and the redirect, no answer of Odoo's
+                # own, answered it.
                 self.assertEqual(
                     str(caught.exception),
                     f"A request of profile 'erp' failed: RedirectError, code {status}. "
+                    "It failed after the call started to go out: the server may have "
+                    "run the call, so do not repeat it before reading back what it did. "
                     "Its message is not shown, as it can quote the profile's values.",
                 )
                 self.assertIsNone(caught.exception.request)
@@ -1530,18 +1568,18 @@ class Json2ClientTest(StubTestCase):
         self.assertEqual(
             str(error),
             "A request of profile 'erp' failed: ChunkedEncodingError, code 303. It "
-            "failed after the call started to go out, before its answer was read "
-            "whole: the server may have run the call, so do not repeat it before "
-            "reading back what it did. Its message is not shown, as it can quote the "
-            "profile's values.",
+            "failed after the call started to go out: the server may have run the "
+            "call, so do not repeat it before reading back what it did. Its message is "
+            "not shown, as it can quote the profile's values.",
         )
         self.assertEqual([request["method"] for request in self.odoo.requests], ["POST"])
         self.assertNeverShows(error, KEY)
         self.assertNoFrameHolds(error, KEY)
 
-    def test_a_redirects_body_in_bad_chunks_is_an_error_with_no_note(self):
-        # As the body of any answer: the connection brought it whole. A
-        # redirect whose body cannot be read is not followed.
+    def test_a_redirects_body_in_bad_chunks_says_the_call_may_have_run(self):
+        # As the body of any answer that is not Odoo's: the connection
+        # brought it whole. A redirect whose body cannot be read is not
+        # followed.
         self.redirect_with_body(
             b"Transfer-Encoding: chunked\r\n", b"zz\r\n3\r\n0\r\n\r\n"
         )
@@ -1551,11 +1589,65 @@ class Json2ClientTest(StubTestCase):
         self.assertIsInstance(error, requests.exceptions.ChunkedEncodingError)
         self.assertEqual(
             str(error),
-            "A request of profile 'erp' failed: ChunkedEncodingError, code 303. Its "
-            "message is not shown, as it can quote the profile's values.",
+            "A request of profile 'erp' failed: ChunkedEncodingError, code 303. It "
+            "failed after the call started to go out: the server may have run the "
+            "call, so do not repeat it before reading back what it did. Its message "
+            "is not shown, as it can quote the profile's values.",
         )
         self.assertEqual([request["method"] for request in self.odoo.requests], ["POST"])
         self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_a_redirect_followed_too_many_times_says_the_call_may_have_run(self):
+        # A redirect to the call itself, within the origin: requests sends
+        # the call again at each, 30 times, then raises TooManyRedirects.
+        self.odoo.answers[("res.partner", "write")] = Answer(
+            307, b"", {"Location": "/json/2/res.partner/write"}
+        )
+        error = self.raised(
+            RequestError, lambda: self.client.call("res.partner", "write", [7], vals={})
+        )
+        self.assertIsInstance(error, requests.TooManyRedirects)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: TooManyRedirects, code 307. It failed "
+            "after the call started to go out: the server may have run the call, so "
+            "do not repeat it before reading back what it did. Its message is not "
+            "shown, as it can quote the profile's values.",
+        )
+        self.assertEqual(len(self.odoo.requests), 31)
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_an_error_of_urllib3_after_the_call_went_out_says_it_may_have_run(self):
+        # As urllib3 2.3.0 raises, under requests 2.34.2, for a redirect to
+        # <origin>//x:y: here urllib3's pool sends the call's request, which
+        # a 303 answers, then raises it for the redirect's request.
+        self.odoo.answers[("res.partner", "write")] = Answer(
+            303, b"", {"Location": "/json/2/res.partner/search_count"}
+        )
+        urlopen = urllib3.HTTPConnectionPool.urlopen
+        opened = []
+
+        def opening(pool, *args, **kwargs):
+            opened.append(args)
+            if len(opened) > 1:
+                raise urllib3.exceptions.LocationParseError("//x:y")
+            return urlopen(pool, *args, **kwargs)
+
+        with mock.patch.object(urllib3.HTTPConnectionPool, "urlopen", opening):
+            error = self.raised(
+                RequestError, lambda: self.client.call("res.partner", "write", [7], vals={})
+            )
+        self.assertIsInstance(error, urllib3.exceptions.LocationParseError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: LocationParseError. It failed after "
+            "the call started to go out: the server may have run the call, so do not "
+            "repeat it before reading back what it did. Its message is not shown, as "
+            "it can quote the profile's values.",
+        )
+        self.assertEqual([request["method"] for request in self.odoo.requests], ["POST"])
         self.assertNoFrameHolds(error, KEY)
 
     def test_a_request_for_another_origin_gets_no_key_and_is_not_sent(self):
@@ -2319,11 +2411,7 @@ class KeptConnectionTest(StubTestCase):
                     self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
                     self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
                 self.assertIsInstance(error, xmlrpc.client.ProtocolError)
-                self.assertEqual(
-                    str(error),
-                    "A request of profile 'erp' failed: ProtocolError, code 500. Its "
-                    "message is not shown, as it can quote the profile's values.",
-                )
+                self.assertEqual(error.code, 500)
                 self.assertEqual(odoo.requests, [(1, "login"), (2, "call"), (3, "call")])
 
     def test_an_interrupted_request_closes_its_connection(self):
@@ -2508,10 +2596,10 @@ class CutOffTest(StubTestCase):
     (Transport.request), and a server that ran the call would run it
     twice. ServerProxy keeps that second sending.
 
-    When the connection of a call fails after the call started to go out,
-    the RequestError says that the server may have run it, on both APIs. A
-    failure before anything was sent says nothing of it, nor does the
-    login's.
+    When a call fails after it started to go out, its connection or an
+    answer that is not Odoo's own, the RequestError says that the server
+    may have run it, on both APIs. A failure before anything was sent says
+    nothing of it, nor does the login's.
 
     The server here reads the request, then closes the connection without
     answering ("drop"), as one that ran the call and broke off before its
@@ -2576,9 +2664,9 @@ class CutOffTest(StubTestCase):
         self.assertEqual(
             str(error),
             "A request of profile 'erp' failed: RemoteDisconnected. It failed after "
-            "the call started to go out, before its answer was read whole: the server "
-            "may have run the call, so do not repeat it before reading back what it "
-            "did. Its message is not shown, as it can quote the profile's values.",
+            "the call started to go out: the server may have run the call, so do not "
+            "repeat it before reading back what it did. Its message is not shown, as "
+            "it can quote the profile's values.",
         )
         self.assertEqual(odoo.requests, [(1, "login"), (2, "call")])
         self.assertNeverShows(error, PASSWORD)
@@ -2595,9 +2683,9 @@ class CutOffTest(StubTestCase):
         self.assertEqual(
             str(error),
             "A request of profile 'erp' failed: RemoteDisconnected. It failed after "
-            "the call started to go out, before its answer was read whole: the server "
-            "may have run the call, so do not repeat it before reading back what it "
-            "did. Its message is not shown, as it can quote the profile's values.",
+            "the call started to go out: the server may have run the call, so do not "
+            "repeat it before reading back what it did. Its message is not shown, as "
+            "it can quote the profile's values.",
         )
         self.assertEqual(odoo.requests, [(1, "login"), (2, "call"), (2, "call")])
         self.assertNeverShows(error, PASSWORD)
@@ -2613,9 +2701,9 @@ class CutOffTest(StubTestCase):
         self.assertEqual(
             str(error),
             "A request of profile 'erp' failed: ConnectionError. It failed after the "
-            "call started to go out, before its answer was read whole: the server may "
-            "have run the call, so do not repeat it before reading back what it did. "
-            "Its message is not shown, as it can quote the profile's values.",
+            "call started to go out: the server may have run the call, so do not "
+            "repeat it before reading back what it did. Its message is not shown, as "
+            "it can quote the profile's values.",
         )
         self.assertEqual(odoo.requests, [(1, "call")])
         self.assertNeverShows(error, KEY)
@@ -2632,9 +2720,9 @@ class CutOffTest(StubTestCase):
         self.assertEqual(
             str(error),
             "A request of profile 'erp' failed: ConnectionError. It failed after the "
-            "call started to go out, before its answer was read whole: the server may "
-            "have run the call, so do not repeat it before reading back what it did. "
-            "Its message is not shown, as it can quote the profile's values.",
+            "call started to go out: the server may have run the call, so do not "
+            "repeat it before reading back what it did. Its message is not shown, as "
+            "it can quote the profile's values.",
         )
         self.assertEqual(odoo.requests, [(1, "call"), (1, "call")])
         self.assertNeverShows(error, KEY)
@@ -2783,11 +2871,10 @@ class CutOffTest(StubTestCase):
         self.assertEqual(
             str(error),
             "A request of profile 'erp' failed: ConnectionResetError, code "
-            f"{errno.ECONNRESET}. It "
-            "failed after the call started to go out, before its answer was read "
-            "whole: the server may have run the call, so do not repeat it before "
-            "reading back what it did. Its message is not shown, as it can quote the "
-            "profile's values.",
+            f"{errno.ECONNRESET}. It failed after the call started to go out: the "
+            "server may have run the call, so do not repeat it before reading back "
+            "what it did. Its message is not shown, as it can quote the profile's "
+            "values.",
         )
         self.assertEqual(odoo.requests, [(1, "login"), (2, "call")])
 
@@ -2816,11 +2903,10 @@ class CutOffTest(StubTestCase):
         self.assertEqual(
             str(error),
             "A request of profile 'erp' failed: ConnectionResetError, code "
-            f"{errno.ECONNRESET}. It "
-            "failed after the call started to go out, before its answer was read "
-            "whole: the server may have run the call, so do not repeat it before "
-            "reading back what it did. Its message is not shown, as it can quote the "
-            "profile's values.",
+            f"{errno.ECONNRESET}. It failed after the call started to go out: the "
+            "server may have run the call, so do not repeat it before reading back "
+            "what it did. Its message is not shown, as it can quote the profile's "
+            "values.",
         )
         self.assertEqual(
             [request["path"] for request in odoo.requests],
@@ -2876,10 +2962,9 @@ class CutOffTest(StubTestCase):
                 self.assertEqual(
                     str(error),
                     f"A request of profile 'erp-{api}' failed: {name}. It failed after "
-                    "the call started to go out, before its answer was read whole: the "
-                    "server may have run the call, so do not repeat it before reading "
-                    "back what it did. Its message is not shown, as it can quote the "
-                    "profile's values.",
+                    "the call started to go out: the server may have run the call, so "
+                    "do not repeat it before reading back what it did. Its message is "
+                    "not shown, as it can quote the profile's values.",
                 )
                 self.assertEqual(odoo.requests, received)
 
@@ -2918,9 +3003,9 @@ class CutOffTest(StubTestCase):
         self.assertEqual(
             str(error),
             "A request of profile 'erp' failed: SSLError. It failed after the call "
-            "started to go out, before its answer was read whole: the server may have "
-            "run the call, so do not repeat it before reading back what it did. Its "
-            "message is not shown, as it can quote the profile's values.",
+            "started to go out: the server may have run the call, so do not repeat it "
+            "before reading back what it did. Its message is not shown, as it can "
+            "quote the profile's values.",
         )
         tls_socket.sendall.assert_called_once()
         self.assertNeverShows(error, KEY)
@@ -2946,9 +3031,9 @@ class CutOffTest(StubTestCase):
         self.assertEqual(
             str(error),
             "A request of profile 'erp' failed: ConnectionError. It failed after the "
-            "call started to go out, before its answer was read whole: the server may "
-            "have run the call, so do not repeat it before reading back what it did. "
-            "Its message is not shown, as it can quote the profile's values.",
+            "call started to go out: the server may have run the call, so do not "
+            "repeat it before reading back what it did. Its message is not shown, as "
+            "it can quote the profile's values.",
         )
         tcp_socket.sendall.assert_called_once()
 
@@ -2964,9 +3049,9 @@ class CutOffTest(StubTestCase):
         self.assertEqual(
             str(error),
             "A request of profile 'erp' failed: SSLError. It failed after the call "
-            "started to go out, before its answer was read whole: the server may have "
-            "run the call, so do not repeat it before reading back what it did. Its "
-            "message is not shown, as it can quote the profile's values.",
+            "started to go out: the server may have run the call, so do not repeat it "
+            "before reading back what it did. Its message is not shown, as it can "
+            "quote the profile's values.",
         )
         self.assertTrue(sent(tls_socket).endswith(b'{"domain": []}'))
         self.assertNeverShows(error, KEY)
@@ -2994,10 +3079,9 @@ class CutOffTest(StubTestCase):
                 self.assertEqual(
                     str(error),
                     "A request of profile 'erp' failed: SSLError. It failed after the "
-                    "call started to go out, before its answer was read whole: the "
-                    "server may have run the call, so do not repeat it before reading "
-                    "back what it did. Its message is not shown, as it can quote the "
-                    "profile's values.",
+                    "call started to go out: the server may have run the call, so do "
+                    "not repeat it before reading back what it did. Its message is not "
+                    "shown, as it can quote the profile's values.",
                 )
                 self.assertEqual(
                     sent(redirecting).count(
@@ -3074,10 +3158,9 @@ class CutOffTest(StubTestCase):
             [str(error) for error in first_errors],
             [
                 "A request of profile 'erp-first' failed: ConnectionError. It failed "
-                "after the call started to go out, before its answer was read whole: "
-                "the server may have run the call, so do not repeat it before reading "
-                "back what it did. Its message is not shown, as it can quote the "
-                "profile's values."
+                "after the call started to go out: the server may have run the call, "
+                "so do not repeat it before reading back what it did. Its message is "
+                "not shown, as it can quote the profile's values."
             ],
         )
         self.assertEqual(
@@ -3100,18 +3183,18 @@ class CutOffTest(StubTestCase):
         self.assertEqual(
             str(error),
             "A request of profile 'erp' failed: ChunkedEncodingError, code 500. It "
-            "failed after the call started to go out, before its answer was read "
-            "whole: the server may have run the call, so do not repeat it before "
-            "reading back what it did. Its message is not shown, as it can quote the "
-            "profile's values.",
+            "failed after the call started to go out: the server may have run the "
+            "call, so do not repeat it before reading back what it did. Its message is "
+            "not shown, as it can quote the profile's values.",
         )
         self.assertNeverShows(error, KEY)
         self.assertNoFrameHolds(error, KEY)
 
-    def test_a_json2_body_the_connection_brought_whole_has_no_note(self):
+    def test_a_json2_body_the_connection_brought_whole_says_the_call_may_have_run(self):
         # After an error status, a body sent in bad chunks, which requests
         # raises as it raises a body cut short, or one that is not the gzip it
-        # says: the connection did not fail.
+        # says: the connection did not fail, and the answer is no error body
+        # of Odoo's.
         answers = {
             "sent in bad chunks": (
                 "ChunkedEncodingError",
@@ -3135,9 +3218,231 @@ class CutOffTest(StubTestCase):
                 )
                 self.assertEqual(
                     str(error),
-                    f"A request of profile 'erp' failed: {error_class}, code 500. Its "
+                    f"A request of profile 'erp' failed: {error_class}, code 500. It "
+                    "failed after the call started to go out: the server may have run "
+                    "the call, so do not repeat it before reading back what it did. Its "
                     "message is not shown, as it can quote the profile's values.",
                 )
+
+    def test_an_xmlrpc_answer_that_is_not_odoos_says_the_call_may_have_run(self):
+        # A gateway's or a proxy's answer to the call, whose status is not
+        # 200: the call may have run, or, for a page no server ran it for,
+        # not, which the library cannot tell. Odoo answers at 200 (a Fault
+        # is an OdooError). The login is not the call: its error has no note.
+        odoo = self.start(RawXmlRpc())
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        for status in (404, 500, 504):
+            with self.subTest(status=status):
+                odoo.call_answer = Answer(
+                    status, b"<html>Not Odoo</html>", {"Content-Type": "text/html"}
+                )
+                error = self.raised(
+                    RequestError, lambda: client.call("res.partner", "write", [7], vals={})
+                )
+                self.assertIsInstance(error, xmlrpc.client.ProtocolError)
+                self.assertEqual(
+                    str(error),
+                    f"A request of profile 'erp' failed: ProtocolError, code {status}. It "
+                    "failed after the call started to go out: the server may have run "
+                    "the call, so do not repeat it before reading back what it did. Its "
+                    "message is not shown, as it can quote the profile's values.",
+                )
+                self.assertNeverShows(error, PASSWORD)
+                self.assertNoFrameHolds(error, PASSWORD)
+        odoo.login_answer = Answer(504, b"<html>Not Odoo</html>", {"Content-Type": "text/html"})
+        login_client = self.make_client(odoo.url, "xmlrpc", PASSWORD, "erp-login")
+        error = self.raised(
+            RequestError, lambda: login_client.call("res.partner", "write", [7], vals={})
+        )
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp-login' failed: ProtocolError, code 504. Its "
+            "message is not shown, as it can quote the profile's values.",
+        )
+
+    def test_a_json2_answer_that_is_not_odoos_says_the_call_may_have_run(self):
+        # A gateway's or a proxy's answer, whose status is not 200 and whose
+        # body is no error of Odoo's: the call may have run, or, for a page
+        # no server ran it for, not, which the library cannot tell. Odoo's
+        # error body is an OdooError.
+        odoo = self.start(Json2Odoo())
+        client = self.make_client(odoo.url, "json2", KEY)
+        for status in (404, 500, 504):
+            with self.subTest(status=status):
+                odoo.answers[("res.partner", "write")] = Answer(
+                    status, b"<html>Not Odoo</html>", {"Content-Type": "text/html"}
+                )
+                error = self.raised(
+                    RequestError, lambda: client.call("res.partner", "write", [7], vals={})
+                )
+                self.assertIsInstance(error, requests.HTTPError)
+                self.assertEqual(
+                    str(error),
+                    f"A request of profile 'erp' failed: HTTPError, code {status}. It "
+                    "failed after the call started to go out: the server may have run "
+                    "the call, so do not repeat it before reading back what it did. Its "
+                    "message is not shown, as it can quote the profile's values.",
+                )
+                self.assertNeverShows(error, KEY)
+                self.assertNoFrameHolds(error, KEY)
+
+    def test_a_gateways_json_error_says_the_call_may_have_run(self):
+        # A gateway's error can be JSON with a message, as AWS API Gateway's
+        # 504 and Kong's 502 are. Odoo's JSON-2 dispatcher answers each error
+        # with serialize_exception's object, whose name and message are
+        # strings and whose arguments are a list: only that is Odoo's own
+        # answer, an OdooError, which says nothing of a call that may have
+        # run. An object without one of those three, or with one of another
+        # type, is not.
+        odoo = self.start(Json2Odoo())
+        client = self.make_client(odoo.url, "json2", KEY)
+        answers = {
+            "AWS API Gateway's 504": (504, {"message": "Endpoint request timed out"}),
+            "Kong's 502": (
+                502,
+                {"message": "An invalid response was received from the upstream server"},
+            ),
+            "a name and a message, no arguments": (
+                504,
+                {"name": "GatewayTimeout", "message": "The upstream timed out"},
+            ),
+            "a message and arguments, no name": (
+                504,
+                {"message": "The upstream timed out", "arguments": ["timed out"]},
+            ),
+            "a name and arguments, no message": (
+                504,
+                {"name": "GatewayTimeout", "arguments": ["The upstream timed out"]},
+            ),
+            "arguments that are not a list": (
+                504,
+                {"name": "GatewayTimeout", "message": "Timed out", "arguments": "504"},
+            ),
+            "a name that is not a string": (
+                504,
+                {"name": 504, "message": "Timed out", "arguments": ["Timed out"]},
+            ),
+            "a message that is not a string": (
+                504,
+                {"name": "GatewayTimeout", "message": {"en": "Timed out"}, "arguments": []},
+            ),
+        }
+        for case, (status, body) in answers.items():
+            with self.subTest(case=case):
+                odoo.answers[("res.partner", "write")] = Answer(status, body)
+                error = self.raised(
+                    RequestError, lambda: client.call("res.partner", "write", [7], vals={})
+                )
+                self.assertIsInstance(error, requests.HTTPError)
+                self.assertEqual(
+                    str(error),
+                    f"A request of profile 'erp' failed: HTTPError, code {status}. It "
+                    "failed after the call started to go out: the server may have run "
+                    "the call, so do not repeat it before reading back what it did. Its "
+                    "message is not shown, as it can quote the profile's values.",
+                )
+                self.assertNeverShows(error, KEY)
+                self.assertNoFrameHolds(error, KEY)
+        odoo.answers[("res.partner", "write")] = Answer(
+            500, odoo_error("builtins.ZeroDivisionError", "division by zero")
+        )
+        error = self.raised(
+            OdooError, lambda: client.call("res.partner", "write", [7], vals={})
+        )
+        self.assertEqual(
+            str(error),
+            "Odoo answered a call of profile 'erp' with an error (code 500): division "
+            "by zero",
+        )
+
+    def test_no_error_outside_a_json2_call_reads_its_mark(self):
+        # A call over JSON-2 goes out and is answered; then, in the same
+        # thread, the login of a call over XML-RPC is refused, before
+        # anything was sent: the mark of the first call is gone.
+        json2_odoo = self.start(Json2Odoo())
+        json2_odoo.answers[("res.partner", "search_count")] = 3
+        json2_client = self.make_client(json2_odoo.url, "json2", KEY, "erp-json2")
+        self.assertEqual(json2_client.call("res.partner", "search_count", domain=[]), 3)
+        xmlrpc_client = self.make_client(
+            f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD, "erp-xmlrpc"
+        )
+        error = self.raised(
+            RequestError,
+            lambda: xmlrpc_client.call("res.partner", "search_count", domain=[]),
+        )
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp-xmlrpc' failed: ConnectionRefusedError, code "
+            f"{errno.ECONNREFUSED}. Its message is not shown, as it can quote the "
+            "profile's values.",
+        )
+
+    def test_a_call_made_in_the_middle_of_a_json2_call_reads_its_own_mark(self):
+        # Once the request of a call over JSON-2 went out, a signal handler or
+        # a finalizer can make a call over XML-RPC, here as the call waits for
+        # its answer: through Client and through ServerProxy, its login, and a
+        # call of a ServerProxy logged in before its server stopped, are
+        # refused before anything was sent, and say nothing of a call that
+        # may have run. Then the call over JSON-2 has its mark back: its
+        # answer, a gateway's, says that the call may have run.
+        json2_odoo = self.start(Json2Odoo())
+        json2_odoo.answers[("res.partner", "write")] = Answer(504, b"Gateway Timeout")
+        json2_client = self.make_client(json2_odoo.url, "json2", KEY, "erp-json2")
+        xmlrpc_client = self.make_client(
+            f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD, "erp-xmlrpc"
+        )
+        stopped_odoo = self.start(KeepAliveOdoo())
+        self.make_profile(stopped_odoo.url, "xmlrpc", PASSWORD, "erp-stopped")
+        proxy = ServerProxy(profile="erp-stopped")
+        self.addCleanup(proxy("close"))
+        stopped_odoo.stop()
+        made_in_the_middle = {}
+        getresponse = http.client.HTTPConnection.getresponse
+
+        def in_the_middle(connection):
+            if not made_in_the_middle:
+                made_in_the_middle["Client"] = self.raised(
+                    RequestError,
+                    lambda: xmlrpc_client.call("res.partner", "search_count", domain=[]),
+                )
+                made_in_the_middle["ServerProxy's login"] = self.raised(
+                    RequestError, lambda: ServerProxy(profile="erp-xmlrpc")
+                )
+                made_in_the_middle["ServerProxy's execute_kw"] = self.raised(
+                    RequestError,
+                    lambda: proxy.execute_kw("res.partner", "search_count", [[]]),
+                )
+            return getresponse(connection)
+
+        with mock.patch.object(http.client.HTTPConnection, "getresponse", in_the_middle):
+            error = self.raised(
+                RequestError,
+                lambda: json2_client.call("res.partner", "write", [7], vals={}),
+            )
+        refused = (
+            "A request of profile 'erp-xmlrpc' failed: ConnectionRefusedError, code "
+            f"{errno.ECONNREFUSED}. Its message is not shown, as it can quote the "
+            "profile's values."
+        )
+        self.assertEqual(
+            {entry: str(made) for entry, made in made_in_the_middle.items()},
+            {
+                "Client": refused,
+                "ServerProxy's login": refused,
+                "ServerProxy's execute_kw": (
+                    "A request of profile 'erp-stopped' failed: ConnectionRefusedError, "
+                    f"code {errno.ECONNREFUSED}. Its message is not shown, as it can "
+                    "quote the profile's values."
+                ),
+            },
+        )
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp-json2' failed: HTTPError, code 504. It failed "
+            "after the call started to go out: the server may have run the call, so "
+            "do not repeat it before reading back what it did. Its message is not "
+            "shown, as it can quote the profile's values.",
+        )
 
     def test_server_proxy_sends_a_call_cut_off_a_second_time(self):
         # A guard of xmlrpc.client's own sending, which ServerProxy keeps.
@@ -3216,8 +3521,9 @@ class TimeoutTest(StubTestCase):
     """Each request of Client, the login's too, has the connect timeout to
     connect, then the read timeout for its answer: 30 s and 600 s, or the
     pair given at its creation. When one fires, the RequestError says which,
-    and after the read timeout that the call may still complete. ServerProxy
-    sets none, as before 2.0."""
+    and after the read timeout that the call may still complete, or, at the
+    XML-RPC login, that the call was not sent. ServerProxy sets none, as
+    before 2.0."""
 
     def held(self, receive_buffer=None):
         """The url of a server whose system takes each connection, and which
@@ -3392,7 +3698,6 @@ class TimeoutTest(StubTestCase):
         self.addCleanup(held_call.released.set)
         held = self.held()
         cases = {
-            "the xmlrpc login": (held, "xmlrpc", PASSWORD, socket.timeout, "TimeoutError"),
             "an xmlrpc call": (held_call.url, "xmlrpc", PASSWORD, socket.timeout, "TimeoutError"),
             "a json2 call": (held, "json2", KEY, requests.ReadTimeout, "ReadTimeout"),
         }
@@ -3419,6 +3724,26 @@ class TimeoutTest(StubTestCase):
             [request["path"] for request in held_call.requests],
             ["/xmlrpc/2/common", "/xmlrpc/2/object"],
         )
+
+    def test_a_read_timeout_at_the_xmlrpc_login_says_the_call_was_not_sent(self):
+        # The login is not the call, which goes out only once the login
+        # answered: nothing of the call was sent, and the server cannot
+        # complete it.
+        self.make_profile(self.held(), "xmlrpc", PASSWORD)
+        with Client("erp", timeout=(5, 0.2)) as client:
+            error = self.raised(
+                RequestError, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        self.assertIsInstance(error, socket.timeout)
+        self.assertEqual(error.timeout_fired, "read")
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: TimeoutError. The read timeout "
+            "fired at the login: the call was not sent. Its message is not shown, "
+            "as it can quote the profile's values.",
+        )
+        self.assertNeverShows(error, PASSWORD)
+        self.assertNoFrameHolds(error, PASSWORD)
 
     def test_a_json2_answer_whose_body_stops_coming_is_a_read_timeout(self):
         half = self.start(HalfAnswer())

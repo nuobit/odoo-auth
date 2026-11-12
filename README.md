@@ -324,28 +324,37 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   request once, the XML-RPC login's too, and never again by itself after a
   failure, where `xmlrpc.client`, and so `ServerProxy`, sends a request a
   second time after its connection was closed or reset before the answer:
-  a call the server ran would run twice. When a request of a call fails
-  after the call started to go out, even in part, before its answer was
-  read whole (its connection reset, closed or failing in TLS, or an answer
-  whose head cannot be read), the message says: «It failed after the call
-  started to go out, before its answer was read whole: the server may have
-  run the call, so do not repeat it before reading back what it did.» Over
-  JSON-2 that holds for a redirect's new connection too, even one that
-  fails to open, and for a redirect's body: a redirect, such as a 303, can
-  answer a request the server processed. `Client` reads a redirect's body
-  as it comes, undecoded, and drops it; one that cannot be read whole
-  (stopping, breaking off, in bad chunks) ends the call as the body of any
-  answer does, with the redirect's status as its `code`, but after the read
-  timeout, which leaves it `None`, and the redirect is not followed. A
-  failure before anything of the call was sent says nothing of it (a name
-  that does not resolve, a connection refused, the connect timeout, a TLS
-  handshake that fails or is reset), nor does one of the XML-RPC login,
-  which is not the call, nor one over JSON-2 that is not a connection's (a
-  redirect refused, a body sent in bad chunks after a status other than
-  200). Over JSON-2, where `urllib3` raises the same errors before and
-  after a request starts to go out, the library's connections mark the
-  call as started just before the first byte of one of its requests is
-  sent. When one of
+  a call the server ran would run twice. Once the call started to go out,
+  even in part, every `RequestError` of it says, on both APIs, but a
+  timeout's (below) and that of an answer at status 200 that cannot be
+  read (above): «It failed after the call started to go out: the server
+  may have run the call, so do not repeat it before reading back what it
+  did.» That covers its
+  connection reset, closed or failing in TLS, an answer whose head cannot
+  be read, and every answer that is not Odoo's own: a status other than
+  200 without Odoo's error body (a gateway's 504, even in JSON with a
+  `message`, as AWS API Gateway's is, a proxy's 500 or 404, among them
+  pages no server ran the call for, which the library cannot tell apart),
+  a body that cannot be read after such a status, a redirect
+  refused or followed too many times, an error of `urllib3` for a
+  redirect. Odoo's own answers raise no `RequestError`: an `OdooError` (an
+  XML-RPC `Fault`, a JSON-2 error body of Odoo's), or an `AuthError` (a
+  401 over JSON-2, whatever its body, which is not read). Over JSON-2 that
+  holds for a redirect's new connection
+  too, even one that fails to open, and for a redirect's body: a redirect,
+  such as a 303, can answer a request the server processed. `Client`
+  reads a redirect's body as it comes, undecoded, and drops it; one that
+  cannot be read whole (stopping, breaking off, in bad chunks) ends the
+  call as the body of any answer does, with the redirect's status as its
+  `code`, but after the read timeout, which leaves it `None`, and the
+  redirect is not followed. A failure before anything
+  of the call was sent says nothing of it (a name that does not resolve, a
+  connection refused, the connect timeout, a TLS handshake that fails or
+  is reset), nor does one of the XML-RPC login, which is not the call.
+  Over JSON-2, where `urllib3` raises the same errors before and after a
+  request starts to go out, the library's connections mark the call as
+  started just before the first byte of one of its requests is sent, and
+  the mark ends with the call. When one of
   `Client`'s timeouts fires, `timeout_fired` says which, `"connect"` or
   `"read"` (`None` otherwise), and so does the message, and its `code` is
   `None`. After the connect timeout nothing was sent, unless it fired over
@@ -355,14 +364,18 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   call started to go out: the server may have run the call, so do not
   repeat it before reading back what it did.» After the read
   timeout the server may still complete the call, so do not repeat it
-  before reading back what it did. It is then an
+  before reading back what it did; after the read timeout of the XML-RPC
+  login, which is not the call, the message says instead: «The read
+  timeout fired at the login: the call was not sent.» It is then an
   instance of `socket.timeout` (`TimeoutError`) over XML-RPC, and of
   `requests.ConnectTimeout`, `requests.ReadTimeout` or
   `requests.ConnectionError` over JSON-2, where `requests` reports a TLS
   handshake that times out as a `ReadTimeout`, which counts as read.
 - `OdooError`: Odoo answers the call with an error, an XML-RPC `Fault`
   (the login's too, such as Odoo's for a `db` it does not hold) or a JSON-2
-  error body. It carries the profile (`profile`), Odoo's code for it
+  error body: the object Odoo's JSON-2 dispatcher answers, whose `name`
+  and `message` are strings and whose `arguments` are a list. It carries
+  the profile (`profile`), Odoo's code for it
   (`code`: the Fault's `faultCode`, an int as Odoo's are, or else its text,
   masked as the message, a base64 value read as UTF-8 as Odoo writes its
   texts, the message's too, and a value `str()` cannot write, nested deeper
@@ -421,12 +434,16 @@ closes the connection of the request one of them ends, as it does after
 any failure: it keeps a connection only after an answer read whole, a
 result or Odoo's `Fault`. (Raised while `Client` encodes a
 call's values, a `RecursionError` is an `ArgumentError`, above, even when
-the caller's deep stack caused it. Raised while it reads an answer's JSON,
-it is an answer that is not JSON, a `RequestError` with `code` 200, even
-when the caller's deep stack caused it and the answer was good: the server
-ran the call. Their class cannot tell the two causes apart.) The CLI lets
-them through too:
-Python prints their traceback, which shows no frame's locals.
+the caller's deep stack caused it. Raised while it reads the JSON of an
+answer over JSON-2, it makes the answer one that is not JSON, even when
+the caller's deep stack caused it and the answer was good. A 200 is then
+a `RequestError` with `code` 200, though the server ran the call. Any
+other status but a 401, whose body is not read, is then the
+`RequestError` of that status, which says that the server may have run
+the call, even when the answer was Odoo's own error, which would have
+been an `OdooError`. Their class cannot tell the two causes apart.) The
+CLI lets them through too: Python prints their traceback, which shows no
+frame's locals.
 
 ## Configure a profile
 

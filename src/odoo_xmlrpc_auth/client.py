@@ -1,4 +1,5 @@
 import configparser
+import contextlib
 import contextvars
 import decimal
 import functools
@@ -36,6 +37,9 @@ _TIMEOUT_NOTES = {
         f"{_READ_BACK}. "
     ),
 }
+# What it adds when the read timeout fired at the XML-RPC login, which is
+# not the call: the call goes out only once the login answered.
+_LOGIN_READ_TIMEOUT_NOTE = "The read timeout fired at the login: the call was not sent. "
 # What it adds when the connect timeout fired after the call started to go
 # out (_cut_off): over JSON-2, on a redirect's new connection, or as a
 # request goes out, which requests sends under the connect timeout.
@@ -46,12 +50,12 @@ _LATE_CONNECT_TIMEOUT_NOTE = (
 # What it adds for an answer to a call that came with status 200 and could
 # not be read (code 200).
 _ANSWERED_NOTE = f"The server answered: it may have run the call, so {_READ_BACK}. "
-# What it adds for a request of a call that failed after the call started
-# to go out, before its answer was read whole (_cut_off): its connection
-# failed, or the answer's head could not be read.
+# What it adds for any other failure of a call after the call started to go
+# out (_cut_off): its connection failed, the answer's head could not be
+# read, or the answer was not Odoo's own, such as a gateway's.
 _CUT_OFF_NOTE = (
-    "It failed after the call started to go out, before its answer was read "
-    f"whole: the server may have run the call, so {_READ_BACK}. "
+    "It failed after the call started to go out: the server may have run "
+    f"the call, so {_READ_BACK}. "
 )
 _SECTION = "odoo"
 _REQUIRED_KEYS = ("url", "db", "user", "password")
@@ -118,17 +122,28 @@ class _ConnectTimeout(socket.timeout):
 
 class _ReadTimeout(socket.timeout):
     """Raised by Client's XML-RPC transports when the read timeout fires:
-    a RequestError stands for it as the socket's timeout it replaces."""
+    a RequestError stands for it as the socket's timeout it replaces.
+    ``call`` is True for a call's request, whose RequestError says that the
+    server may still complete the call (_XmlRpc._request), and False for
+    the login's, which is not the call: its RequestError says that the call
+    was not sent."""
+
+    def __init__(self, call=False):
+        super().__init__()
+        self.call = call
 
 
 class _CutOff(Exception):
-    """Raised by Client's XML-RPC transports when the connection fails once
-    open, after the request started to go out, but for the read timeout
-    (_ReadTimeout): a RequestError stands for it as the error it replaces,
-    ``stands_for``, with that error's errno, ``code``, and keeps neither its
-    text nor its frames. ``call`` is True for a call's request, whose
-    RequestError says that the server may have run the call
-    (_XmlRpc._request), and False for the login's, which is not the call."""
+    """Raised by Client's XML-RPC transports for a failure once the
+    connection is open, after the request started to go out, but for the
+    read timeout (_ReadTimeout) and an answer at status 200 that cannot be
+    read (_InvalidAnswer): a connection that fails, or an answer whose
+    status is not 200 (xmlrpc.client's ProtocolError). A RequestError stands
+    for it as the error it replaces, ``stands_for``, with that error's errno
+    or status, ``code``, and keeps neither its text nor its frames. ``call``
+    is True for a call's request, whose RequestError says that the server
+    may have run the call (_XmlRpc._request), and False for the login's,
+    which is not the call."""
 
     def __init__(self, stands_for, code, call=False):
         super().__init__()
@@ -142,8 +157,8 @@ class _CutOff(Exception):
 # requests, which are OSErrors, every error of urllib3, which requests
 # raises as it is when its adapter does not know it (HTTPAdapter.send: under
 # requests 2.34.2 and urllib3 2.3.0, the LocationParseError of a redirect
-# to <origin>//x:y), an answer that is not XML-RPC, and a connection of
-# Client's XML-RPC that failed after the request started to go out. An Odoo
+# to <origin>//x:y), an answer that is not XML-RPC, and a failure of
+# Client's XML-RPC after the request started to go out (_CutOff). An Odoo
 # Fault is the server's answer, not one of them. IDNA's refusal of the host,
 # a UnicodeError over XML-RPC, is not either: the load refuses such a host
 # with the same codec (_idna_refuses).
@@ -216,42 +231,55 @@ class RequestError(Exception):
     the message says that the server may have run the call, so that a
     retry would run it again.
 
-    When a request of a call failed after the call started to go out, even
-    in part, before its answer was read whole, on either API, the message
-    says so, and that the server may have run the call: its connection
-    reset, closed or failing in TLS, or the head of its answer that cannot
-    be read. Over JSON-2 that holds for a redirect too, for its new
-    connection, even one that fails to open, and for its body, which
-    Client reads and drops (_drained_redirect): a redirect, such as a 303,
-    can answer a request the server processed. A failure before anything
-    of the call was sent says nothing of it (a name that does not resolve, a
-    connection refused, the connect timeout, a TLS handshake that fails or
-    is reset), nor does one of the XML-RPC login, which is not the call,
-    nor one over JSON-2 that is not a connection's: a redirect refused or
-    one to a location urllib3 cannot parse, a body sent in bad chunks after
-    a status other than 200 (_cut_off).
+    When a call failed after it started to go out, even in part, on either
+    API, the message says so, and that the server may have run the call,
+    whatever failed, as no RequestError stands for Odoo's own answer (an
+    OdooError or an AuthError does): its connection reset, closed or failing
+    in TLS, the head of its answer that cannot be read, or an answer that is
+    not Odoo's, such as a status other than 200 without Odoo's error body
+    (a gateway's 504, a proxy's 500 or 404, where the call may not have run
+    at all), or a redirect refused or followed too many times. Over JSON-2
+    that holds for a redirect too, for its new connection, even one that
+    fails to open, and for its body, which Client reads and drops
+    (_drained_redirect): a redirect, such as a 303, can answer a request
+    the server processed. A failure before anything of the call was sent
+    says nothing of it (a name that does not resolve, a connection refused,
+    the connect timeout, a TLS handshake that fails or is reset), nor does
+    one of the XML-RPC login, which is not the call (_cut_off).
 
     When one of Client's timeouts fired, ``timeout_fired`` says which,
     "connect" or "read" (None otherwise), and so does the message, in place
     of the note above: after a read timeout the server may still complete
-    the call. After the connect timeout the message says that nothing was
-    sent, unless it fired over JSON-2 after the call started to go out, on
-    a redirect's new connection or as a request goes out, which requests
+    the call, but for the read timeout of the XML-RPC login, which is not
+    the call, after which the message says that the call was not sent.
+    After the connect timeout the message says that nothing was sent,
+    unless it fired over JSON-2 after the call started to go out, on a
+    redirect's new connection or as a request goes out, which requests
     sends under the connect timeout: it then says that the server may have
     run the call. Its ``code`` is None, wherever the timeout fired.
     """
 
     def __init__(
-        self, profile, error_class, code=None, timeout_fired=None, *, cut_off=False
+        self,
+        profile,
+        error_class,
+        code=None,
+        timeout_fired=None,
+        *,
+        cut_off=False,
+        at_login=False,
     ):
         self.profile = profile
         self.error_class = error_class
         self.code = code
         self.timeout_fired = timeout_fired
-        # Whether a request of a call failed after the call started to go
-        # out, before its answer was read whole (_cut_off): the message says
-        # so, unless a timeout fired, whose note it gives instead.
+        # Whether the call failed after it started to go out (_cut_off): the
+        # message says so, unless a timeout fired or an answer at status 200
+        # could not be read, whose notes it gives instead.
         self._cut_off = cut_off
+        # Whether it stands for the read timeout of the XML-RPC login
+        # (_ReadTimeout), which is not the call.
+        self._at_login = at_login
         if isinstance(self, xmlrpc.client.ProtocolError):
             # Its own fields, the status kept, without the url and the
             # server's text.
@@ -277,11 +305,16 @@ class RequestError(Exception):
 
     def __str__(self):
         code = f", code {_one_line(self.code)}" if self.code is not None else ""
-        if self.timeout_fired == "connect" and self._cut_off:
+        if self.timeout_fired == "connect":
             # The connect timeout's own note says that nothing was sent.
-            note = _LATE_CONNECT_TIMEOUT_NOTE
-        elif self.timeout_fired is not None:
-            note = _TIMEOUT_NOTES[self.timeout_fired]
+            note = (
+                _LATE_CONNECT_TIMEOUT_NOTE if self._cut_off else _TIMEOUT_NOTES["connect"]
+            )
+        elif self.timeout_fired == "read":
+            # The read timeout's own note speaks of the call.
+            note = (
+                _LOGIN_READ_TIMEOUT_NOTE if self._at_login else _TIMEOUT_NOTES["read"]
+            )
         elif self.code == 200:
             note = _ANSWERED_NOTE
         elif self._cut_off:
@@ -383,7 +416,8 @@ def _request_error(profile, error, status=None):
     """The RequestError raised instead of ``error``, one of _TRANSPORT_ERRORS.
 
     ``status`` is given when ``error`` was raised reading the body of an
-    answer to a call, and is that answer's status: its code, as the server
+    answer to a call, or stands for an answer the library refuses
+    (_Json2._outcome), and is that answer's status: its code, as the server
     answered (an answer of XML-RPC that cannot be read gives its own,
     _InvalidAnswer). A timeout keeps its code None, wherever it fired:
     timeout_fired reports it."""
@@ -411,7 +445,14 @@ def _request_error(profile, error, status=None):
     else:
         stands_for = type(error)
     return _error_class(RequestError, stands_for)(
-        profile, stands_for.__name__, code, fired, cut_off=_cut_off(error)
+        profile,
+        stands_for.__name__,
+        code,
+        fired,
+        cut_off=_cut_off(error),
+        # Client's XML-RPC transports raise the login's read timeout as it
+        # is, and _XmlRpc._request the call's as the call's.
+        at_login=isinstance(error, _ReadTimeout) and not error.call,
     )
 
 
@@ -433,37 +474,34 @@ def _error_code(error):
 
 
 def _cut_off(error):
-    """Whether ``error``, one of _TRANSPORT_ERRORS, stands for a request of
-    a call that failed after the call started to go out, before its answer
-    was read whole: its connection failed, or the answer's head could not
-    be read, which http.client and urllib3 raise as they raise a connection
-    that failed.
+    """Whether ``error``, one of _TRANSPORT_ERRORS, came after the call's
+    request started to go out, even in part: the server may then have run
+    the call. Whatever the error is counts, as none of the transport's is
+    Odoo's own answer (OdooError, AuthError): a connection that failed, an
+    answer whose head cannot be read, and an answer that is not Odoo's,
+    such as a status other than 200 without Odoo's error body, a gateway's
+    or a proxy's, or a redirect refused or followed too many times.
 
     Over XML-RPC, Client's transports open the connection before a request
     goes out (_Sending): a failure to open it raises as it is, before
-    anything was sent, and a failure of the open connection raises
-    _CutOff, a call's in the call's request (_XmlRpc._request). Over JSON-2,
-    the error does not say it: urllib3 2.3.0 and 2.8.0 raise a TLS
-    handshake whose connection is reset as they raise a call cut off, a
-    ConnectionError over their ProtocolError "Connection aborted.", and a
-    TLS error once connected as a handshake that fails, an SSLError over a
-    MaxRetryError. The library's connections mark the call as started
-    instead, just before the first byte of one of its requests is sent
-    (_MarkedSending). Once it is, a failure of any connection of the call
-    counts, the new one of a redirect included: the ConnectionError of
-    requests, its SSLError among them, and, as an answer's body comes, a
-    redirect's included (_drained_redirect), its ChunkedEncodingError, but
-    for a body sent in bad chunks (urllib3's InvalidChunkLength), which the
-    connection brought whole. An error that is not a connection's, such as
-    a redirect refused, does not count.
+    anything was sent, and any failure once it is open raises _CutOff, the
+    call's in the call's request (_XmlRpc._request), not in the login's,
+    which is not the call. Over JSON-2, the error does not say it: urllib3
+    2.3.0 and 2.8.0 raise a TLS handshake whose connection is reset as they
+    raise a call cut off, a ConnectionError over their ProtocolError
+    "Connection aborted.", and a TLS error once connected as a handshake
+    that fails, an SSLError over a MaxRetryError. The library's connections
+    mark the call as started instead, just before the first byte of one of
+    its requests is sent, a redirect's included (_MarkedSending). Only a
+    call over JSON-2 sets the mark, and each call has its own, from its
+    start to its end (_own_mark): any other error reads it unset, that of
+    a call over XML-RPC made in the middle of a call over JSON-2 included.
     """
-    return (isinstance(error, _CutOff) and error.call) or (
-        isinstance(
-            error, (requests.ConnectionError, requests.exceptions.ChunkedEncodingError)
-        )
-        and not _over(error, urllib3.exceptions.InvalidChunkLength)
-        and _REQUEST_STARTED.get()
-    )
+    if isinstance(error, _CutOff):
+        after_sending = error.call
+    else:
+        after_sending = _REQUEST_STARTED.get()
+    return after_sending
 
 
 def _timeout_fired(error):
@@ -1238,11 +1276,12 @@ class _Sending:
     to open it (a name that does not resolve, a connection refused, the
     connect timeout, a TLS handshake that fails) raises as it is, before
     anything was sent, and a failure of the open connection, but for the
-    read timeout, raises _CutOff: the server may have read the request.
-    After any failure, whatever it raises, an interrupt such as Ctrl-C
-    among them, the connection is closed before the error goes on,
-    unchanged, and no socket of it is left open. A Fault, Odoo's own
-    answer, read whole, keeps it, as any answer does.
+    read timeout, or an answer whose status is not 200 raises _CutOff: the
+    server may have read the request. After any failure, whatever it
+    raises, an interrupt such as Ctrl-C among them, the connection is
+    closed before the error goes on, unchanged, and no socket of it is left
+    open. A Fault, Odoo's own answer, read whole, keeps it, as any answer
+    does.
 
     ServerProxy keeps xmlrpc.client's own sending: it writes a request on
     its kept connection unchecked, and sends it again after those errors."""
@@ -1290,16 +1329,23 @@ class _Sending:
 
     def _answer(self, host, handler, request_body, verbose):
         """The answer to a request on the connection, open: a failure of
-        the connection, but for the read timeout, raises _CutOff."""
+        the connection, but for the read timeout, and an answer whose status
+        is not 200 raise _CutOff."""
         failure = None
         try:
             answer = self.single_request(host, handler, request_body, verbose)
         except socket.timeout as timeout:
             # _ReadTimeout (_Timeouts), which says so itself.
             failure = timeout
-        except (OSError, http.client.HTTPException) as error:
-            # Its text can quote the url, and its frames hold the request:
-            # _CutOff, raised after this block, keeps neither.
+        except (
+            OSError,
+            http.client.HTTPException,
+            xmlrpc.client.ProtocolError,
+        ) as error:
+            # xmlrpc.client raises its ProtocolError for an answer whose
+            # status is not 200, after the request went out. Its text can
+            # quote the url, and its frames hold the request: _CutOff,
+            # raised after this block, keeps neither.
             failure = _CutOff(type(error), _error_code(error))
         if failure is not None:
             raise failure
@@ -1520,8 +1566,12 @@ class ServerProxy(xmlrpc.client.ServerProxy):
                 )
             self._profile = profile
             self._db = config["db"]
-            # The login's, with every argument at its default, as in 1.x.
-            self._uid = _log_in(profile, config, _proxy_transport(config["url"], {}))
+            # The login's, with every argument at its default, as in 1.x, and
+            # a mark of its own (_own_mark), as each execute_kw has.
+            with _own_mark():
+                self._uid = _log_in(
+                    profile, config, _proxy_transport(config["url"], {})
+                )
             # Readable as in 1.x: scripts that log in to Odoo's web
             # themselves read it. An attribute, not a local, so no local
             # shows it; but a frame that holds the proxy, as each of its
@@ -1548,10 +1598,13 @@ class ServerProxy(xmlrpc.client.ServerProxy):
         execute_kw = super().__getattr__("execute_kw")
         if self._profile is None:
             return execute_kw(*args, **kwargs)
-        return _send(
-            self._profile,
-            lambda: execute_kw(self._db, self._uid, self._password, *args, **kwargs),
-        )
+        with _own_mark():
+            return _send(
+                self._profile,
+                lambda: execute_kw(
+                    self._db, self._uid, self._password, *args, **kwargs
+                ),
+            )
 
 
 def _origin(url):
@@ -1581,6 +1634,23 @@ def _loaded(content):
         # already close to the recursion limit: one class, RecursionError,
         # for both causes (README, § Errors).
         return _NOT_JSON
+
+
+def _is_odoo_error(answer):
+    """Whether ``answer``, an answer's body as _loaded gives it, is the
+    body of an error of Odoo's JSON-2 dispatcher, which answers each error
+    it handles with the object of serialize_exception (Odoo 19,
+    odoo/http.py, Json2Dispatcher.handle_error): its name and its message
+    are strings, and its arguments a list, beside its context and debug.
+    A gateway's error in JSON, such as AWS API Gateway's 504, {"message":
+    "Endpoint request timed out"}, is none: an answer that is not Odoo's
+    own."""
+    return (
+        isinstance(answer, dict)
+        and isinstance(answer.get("name"), str)
+        and isinstance(answer.get("message"), str)
+        and isinstance(answer.get("arguments"), list)
+    )
 
 
 class _BearerKey(requests.auth.AuthBase):
@@ -1616,18 +1686,34 @@ class _BearerKey(requests.auth.AuthBase):
 
 # Whether a request of the JSON-2 call this thread or task runs, a redirect's
 # included, started to go out on an open connection (_MarkedSending), for
-# _cut_off. It is the call's: only a call clears it, as it starts
-# (_Json2.call), so that it reads no earlier call's.
+# _cut_off. It is the call's: each call, over either API, clears it as it
+# starts and gives it back its value as it ends (_own_mark), so that no
+# other call, and no error raised outside a call over JSON-2, reads it set.
 _REQUEST_STARTED = contextvars.ContextVar("_REQUEST_STARTED", default=False)
+
+
+@contextlib.contextmanager
+def _own_mark():
+    """Give the call that runs in the block a mark of its own
+    (_REQUEST_STARTED): unset as the block starts, and given back its value
+    as the block ends, also when it raises. A call made in the middle of a
+    call over JSON-2 once its request went out, as a signal handler or a
+    finalizer can make one, reads its own mark, and the call over JSON-2
+    has its own back afterwards."""
+    started = _REQUEST_STARTED.set(False)
+    try:
+        yield
+    finally:
+        _REQUEST_STARTED.reset(started)
 
 
 class _MarkedSending:
     """For the library's urllib3 connections: marks the call as started
     (_REQUEST_STARTED) just before the first byte of one of its requests is
-    sent, on an open connection. The mark stays until the next call clears
-    it: once a request of the call went out, the server may have run the
-    call, also when it answered with a redirect, such as a 303, which is the
-    answer to a request the server processed (RFC 9110, § 15.4.4)."""
+    sent, on an open connection. The mark stays until the call ends: once a
+    request of the call went out, the server may have run the call, also
+    when it answered with a redirect, such as a 303, which is the answer to
+    a request the server processed (RFC 9110, § 15.4.4)."""
 
     def send(self, data):
         # http.client's send opens a closed connection itself (urllib3 opens
@@ -1856,19 +1942,21 @@ class _XmlRpc:
         failure = None
         try:
             # The login's Fault too, such as a db the server does not hold,
-            # is an error Odoo answers.
-            self._log_in_once()
-            result = _send(
-                self._profile,
-                lambda: self._request(
-                    _execute_kw_request(
-                        self._config["db"],
-                        self._uid,
-                        self._config["password"].reveal(),
-                        params,
-                    )
-                ),
-            )
+            # is an error Odoo answers. The call, its login included, has a
+            # mark of its own (_own_mark), which nothing over XML-RPC sets.
+            with _own_mark():
+                self._log_in_once()
+                result = _send(
+                    self._profile,
+                    lambda: self._request(
+                        _execute_kw_request(
+                            self._config["db"],
+                            self._uid,
+                            self._config["password"].reveal(),
+                            params,
+                        )
+                    ),
+                )
         except xmlrpc.client.Fault as fault:
             password = self._config["password"]
             failure = OdooError(
@@ -1924,14 +2012,17 @@ class _XmlRpc:
         """The answer to ``body``, a request of execute_kw, as ServerProxy
         gives it (Python 3.11, ServerProxy.__request): its one value, or
         the tuple of them when it holds another number. An answer it cannot
-        read raises _InvalidAnswer at status 200, and a connection that
-        failed after the request started to go out, the call's _CutOff: the
-        call's own, which the login's are not."""
+        read raises _InvalidAnswer at status 200, the read timeout the call's
+        _ReadTimeout, and any other failure after the request started to go
+        out, an answer whose status is not 200 among them, the call's
+        _CutOff: the call's own, which the login's are not."""
         failure = None
         try:
             answer = self._transport.request(self._host, self._handler, body)
         except _InvalidAnswer:
             failure = _InvalidAnswer(200)
+        except _ReadTimeout:
+            failure = _ReadTimeout(call=True)
         except _CutOff as cut_off:
             failure = _CutOff(cut_off.stands_for, cut_off.code, call=True)
         if failure is not None:
@@ -1998,51 +2089,64 @@ class _Json2:
         if failure is not None:
             raise failure
         path = "/".join(urllib.parse.quote(name, safe="") for name in (model, method))
-        # Nothing of this call has gone out yet, whatever an earlier call
-        # left in the mark (_MarkedSending).
-        _REQUEST_STARTED.set(False)
-        # No logger of urllib3 logs a record of the call (_Json2CallRecords).
-        _filter_urllib3_loggers()
-        in_call = _IN_JSON2_CALL.set(True)
-        try:
-            failure, result = _send(
-                self._profile,
-                lambda: self._outcome(
-                    self._session.post(
-                        f"{self._url}/json/2/{path}",
-                        data=body.encode("ascii"),
-                        headers={
-                            "Content-Type": "application/json",
-                            # Without a session, Odoo takes the database from
-                            # this header when the server holds several
-                            # (odoo/http.py, Request._get_session_and_dbname).
-                            "X-Odoo-Database": self._db,
-                        },
-                        timeout=self._timeout,
-                        # The body is read in _outcome, where its status is
-                        # known.
-                        stream=True,
-                    )
-                ),
-            )
-        finally:
-            _IN_JSON2_CALL.reset(in_call)
+        # Nothing of this call has gone out yet: its mark is its own
+        # (_own_mark), which its connections set (_MarkedSending).
+        with _own_mark():
+            # No logger of urllib3 logs a record of the call (_Json2CallRecords).
+            _filter_urllib3_loggers()
+            in_call = _IN_JSON2_CALL.set(True)
+            try:
+                failure, result = _send(
+                    self._profile,
+                    lambda: self._outcome(
+                        self._session.post(
+                            f"{self._url}/json/2/{path}",
+                            data=body.encode("ascii"),
+                            headers={
+                                "Content-Type": "application/json",
+                                # Without a session, Odoo takes the database
+                                # from this header when the server holds
+                                # several (odoo/http.py,
+                                # Request._get_session_and_dbname).
+                                "X-Odoo-Database": self._db,
+                            },
+                            timeout=self._timeout,
+                            # The body is read in _outcome, where its status
+                            # is known.
+                            stream=True,
+                        )
+                    ),
+                )
+            finally:
+                _IN_JSON2_CALL.reset(in_call)
         if failure is not None:
             raise failure
         return result
 
     def _outcome(self, response):
-        """The outcome of ``response``, the answer to a call, whose body it
-        reads: (None, the result it carries), or (the error it stands for,
-        None). A body that cannot be read, cut short, sent in bad chunks, not
-        the gzip it says or broken off, is the error of its transport with
-        the answer's status as its code (_request_error).
+        """The outcome of ``response``, the answer to a call: (None, the
+        result it carries), or (the error it stands for, None). A 401 is an
+        AuthError, whatever its body, which is not read. The body of any
+        other answer is read, and one that cannot be read, cut short, sent in
+        bad chunks, not the gzip it says or broken off, is the error of its
+        transport with the answer's status as its code (_request_error).
 
         Returned, not raised: the frame that raises the error holds neither
         the answer, whose request carries the key in its headers, nor its
         body, which can echo the key, unmasked.
         """
         status = response.status_code
+        if status == 401:
+            # Odoo's answer to a key it does not take (Odoo 19,
+            # odoo/addons/base/models/ir_http.py, _auth_method_bearer). Its
+            # body adds nothing to the refusal and is not read, so that one
+            # that cannot be read does not stand for it. An answer left unread
+            # keeps its connection until it is closed (requests' stream=True).
+            response.close()
+            return (
+                AuthError(f"Authentication failed for profile {self._profile!r}"),
+                None,
+            )
         failure = None
         try:
             content = response.content
@@ -2054,28 +2158,24 @@ class _Json2:
             response.close()
             return failure, None
         answer = _loaded(content)
+        # An answer the library refuses is the error of requests it stands
+        # for, which _request_error reads as it reads any error of the
+        # transport: it keeps only its class, with the answer's status.
         if status == 200:
             if answer is _NOT_JSON:
                 outcome = (
-                    _error_class(RequestError, requests.JSONDecodeError)(
-                        self._profile, "JSONDecodeError", status
+                    _request_error(
+                        self._profile, requests.JSONDecodeError("", "", 0), status
                     ),
                     None,
                 )
             else:
                 outcome = (None, answer)
-        elif status == 401:
-            # Odoo's answer to a key it does not take (Odoo 19,
-            # odoo/addons/base/models/ir_http.py, _auth_method_bearer).
-            outcome = (
-                AuthError(f"Authentication failed for profile {self._profile!r}"),
-                None,
-            )
         else:
-            # The error body of Odoo's JSON-2 dispatcher is an object with
-            # the message among its keys (odoo/http.py, serialize_exception);
-            # any other answer is the transport's.
-            if isinstance(answer, dict) and isinstance(answer.get("message"), str):
+            # Odoo's own error, recognized by the keys of the object its
+            # JSON-2 dispatcher answers (_is_odoo_error); any other answer,
+            # a gateway's JSON with a message among them, is the transport's.
+            if _is_odoo_error(answer):
                 outcome = (
                     OdooError(
                         self._profile, status, self._key.hidden(answer["message"])
@@ -2084,9 +2184,7 @@ class _Json2:
                 )
             else:
                 outcome = (
-                    _error_class(RequestError, requests.HTTPError)(
-                        self._profile, "HTTPError", status
-                    ),
+                    _request_error(self._profile, requests.HTTPError(), status),
                     None,
                 )
         return outcome
@@ -2175,8 +2273,9 @@ class Client:
     Each request, the login's too, has 30 seconds to connect and then 600
     to get its answer. ``timeout``, a (connect, read) tuple of seconds,
     changes both: ``Client(profile, timeout=(10, 1800))``. When one fires,
-    the RequestError says which; after the read timeout the server may still
-    complete the call.
+    the RequestError says which, and what it means for the call: after the
+    read timeout of a request of the call the server may still complete the
+    call, and after that of the XML-RPC login the call was not sent.
 
     Usage::
 
