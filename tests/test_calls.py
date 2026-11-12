@@ -13,6 +13,7 @@ import datetime
 import errno
 import gc
 import gzip
+import hashlib
 import http.client
 import io
 import json
@@ -27,6 +28,7 @@ import time
 import unittest
 import warnings
 import xmlrpc.client
+import zlib
 from unittest import mock
 
 import requests
@@ -1154,6 +1156,118 @@ class Json2ClientTest(StubTestCase):
         self.assertEqual(followed["path"], "/json/2/res.partner/search_read")
         self.assertEqual(followed["headers"]["authorization"], f"Bearer {KEY}")
         self.assertEqual(self.sent_body(1), {"ids": [7]})
+
+    def redirect_with_body(self, head, body, after=None):
+        """Answer the call with a 303 within the origin, on a connection
+        that closes after it, whose head ends with ``head``, its last
+        headers, and whose body is ``body``, then as RawAnswer does with
+        ``after``. The redirect's target answers 3."""
+        self.odoo.answers[("res.partner", "write")] = RawAnswer(
+            b"HTTP/1.1 303 See Other\r\nLocation: /json/2/res.partner/search_count\r\n"
+            b"Connection: close\r\n" + head + b"\r\n" + body,
+            after=after,
+        )
+        self.odoo.answers[("res.partner", "search_count")] = 3
+
+    def test_a_redirects_body_is_read_undecoded(self):
+        # Said to be gzip, it decodes for more than the first chunk requests
+        # reads, then fails at a block of the reserved type, and more body
+        # comes after it. requests read it decoded, then, after the decoding
+        # error, the rest undecoded, which urllib3 refused with a RuntimeError
+        # that left the call raw, from frames holding the key. Read undecoded
+        # first, it is never decoded, and the redirect is followed.
+        digits = b"".join(
+            hashlib.sha256(str(n).encode()).hexdigest().encode() for n in range(500)
+        )
+        deflate = zlib.compressobj(9, zlib.DEFLATED, -15)
+        body = (
+            b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03"
+            + deflate.compress(digits)
+            + deflate.flush(zlib.Z_FULL_FLUSH)
+            + b"\x07"
+            + b"x" * 2000
+        )
+        self.redirect_with_body(
+            b"Content-Encoding: gzip\r\n" + f"Content-Length: {len(body)}\r\n".encode(), body
+        )
+        self.assertEqual(self.client.call("res.partner", "write", [7], vals={}), 3)
+        self.assertEqual([request["method"] for request in self.odoo.requests], ["POST", "GET"])
+
+    def test_a_redirects_body_that_stops_coming_is_a_read_timeout(self):
+        # Said to be gzip, its first chunk is not, and the rest stops coming:
+        # requests read that rest undecoded, and urllib3's ReadTimeoutError
+        # reached the call as it is, saying nothing of a timeout, though the
+        # call's request went out, answered by the redirect. The read timeout
+        # waits for the redirect's head (wait_for_heads): it fires for the
+        # body alone.
+        self.fail_on_resource_warnings()
+        self.wait_for_heads()
+        released = threading.Event()
+        self.addCleanup(released.set)
+        self.redirect_with_body(
+            b"Content-Encoding: gzip\r\nContent-Length: 100000\r\n",
+            b"this is not gzip " * 800,
+            after=lambda: released.wait(HOLD),
+        )
+        with Client("erp", timeout=(5, 0.2)) as client:
+            error = self.raised(
+                RequestError, lambda: client.call("res.partner", "write", [7], vals={})
+            )
+        self.assertIsInstance(error, requests.ConnectionError)
+        self.assertEqual((error.timeout_fired, error.code), ("read", None))
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ConnectionError. The read timeout "
+            "fired: the server may still complete the call, so do not repeat it "
+            "before reading back what it did. Its message is not shown, as it can "
+            "quote the profile's values.",
+        )
+        self.assertEqual([request["method"] for request in self.odoo.requests], ["POST"])
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_a_redirects_body_that_breaks_off_says_the_call_may_have_run(self):
+        # Said to be gzip, its first chunk is not, and the connection ends
+        # before the rest: urllib3's ProtocolError reached the call as it is,
+        # saying nothing of a call cut off.
+        self.fail_on_resource_warnings()
+        self.redirect_with_body(
+            b"Content-Encoding: gzip\r\nContent-Length: 100000\r\n", b"this is not gzip " * 800
+        )
+        error = self.raised(
+            RequestError, lambda: self.client.call("res.partner", "write", [7], vals={})
+        )
+        self.assertIsInstance(error, requests.exceptions.ChunkedEncodingError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ChunkedEncodingError, code 303. It "
+            "failed after the call started to go out, before its answer was read "
+            "whole: the server may have run the call, so do not repeat it before "
+            "reading back what it did. Its message is not shown, as it can quote the "
+            "profile's values.",
+        )
+        self.assertEqual([request["method"] for request in self.odoo.requests], ["POST"])
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+
+    def test_a_redirects_body_in_bad_chunks_is_an_error_with_no_note(self):
+        # As the body of any answer: the connection brought it whole. A
+        # redirect whose body cannot be read is not followed.
+        self.redirect_with_body(
+            b"Transfer-Encoding: chunked\r\n", b"zz\r\n3\r\n0\r\n\r\n"
+        )
+        error = self.raised(
+            RequestError, lambda: self.client.call("res.partner", "write", [7], vals={})
+        )
+        self.assertIsInstance(error, requests.exceptions.ChunkedEncodingError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ChunkedEncodingError, code 303. Its "
+            "message is not shown, as it can quote the profile's values.",
+        )
+        self.assertEqual([request["method"] for request in self.odoo.requests], ["POST"])
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
 
     def test_a_request_for_another_origin_gets_no_key_and_is_not_sent(self):
         elsewhere = self.start(HttpRecorder())

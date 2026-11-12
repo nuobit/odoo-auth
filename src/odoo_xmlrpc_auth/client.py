@@ -218,10 +218,11 @@ class RequestError(Exception):
     in part, before its answer was read whole, on either API, the message
     says so, and that the server may have run the call: its connection
     reset, closed or failing in TLS, or the head of its answer that cannot
-    be read. Over JSON-2 that holds for a redirect's new connection too,
-    even one that fails to open: a redirect, such as a 303, can answer a
-    request the server processed. A failure before anything of the call
-    was sent says nothing of it (a name that does not resolve, a
+    be read. Over JSON-2 that holds for a redirect too, for its new
+    connection, even one that fails to open, and for its body, which
+    Client reads and drops (_drained_redirect): a redirect, such as a 303,
+    can answer a request the server processed. A failure before anything
+    of the call was sent says nothing of it (a name that does not resolve, a
     connection refused, the connect timeout, a TLS handshake that fails or
     is reset), nor does one of the XML-RPC login, which is not the call,
     nor one over JSON-2 that is not a connection's: a redirect refused or
@@ -386,7 +387,14 @@ def _request_error(profile, error, status=None):
     timeout_fired reports it."""
     answered = error.status if isinstance(error, _InvalidAnswer) else status
     fired = _timeout_fired(error)
-    code = answered if answered is not None and fired is None else _error_code(error)
+    if fired is not None:
+        # Also one raised with the answer whose body stopped coming, such as
+        # a redirect's (_drained_redirect).
+        code = None
+    elif answered is not None:
+        code = answered
+    else:
+        code = _error_code(error)
     # The library's own signals stand for the public class they are: an
     # answer that is not XML-RPC for xmlrpc.client's own error for it, as
     # its parser's errors are no class a caller catches; a timeout of
@@ -441,10 +449,11 @@ def _cut_off(error):
     instead, just before the first byte of one of its requests is sent
     (_MarkedSending). Once it is, a failure of any connection of the call
     counts, the new one of a redirect included: the ConnectionError of
-    requests, its SSLError among them, and, as the answer's body comes, its
-    ChunkedEncodingError, but for a body sent in bad chunks (urllib3's
-    InvalidChunkLength), which the connection brought whole. An error that
-    is not a connection's, such as a redirect refused, does not count.
+    requests, its SSLError among them, and, as an answer's body comes, a
+    redirect's included (_drained_redirect), its ChunkedEncodingError, but
+    for a body sent in bad chunks (urllib3's InvalidChunkLength), which the
+    connection brought whole. An error that is not a connection's, such as
+    a redirect refused, does not count.
     """
     return (isinstance(error, _CutOff) and error.call) or (
         isinstance(
@@ -464,17 +473,17 @@ def _timeout_fired(error):
     _ReadTimeout, and a request goes out under the read timeout. Over
     JSON-2, requests raises ConnectTimeout and ReadTimeout, and a
     ConnectionError over the socket's timeout in two more cases. Over
-    urllib3's ReadTimeoutError, when the answer's body stops coming
-    (requests' Response.iter_content): the read timeout's. Over urllib3's
-    ProtocolError "Connection aborted.", with no ReadTimeoutError, when the
-    request stops going out: the connect timeout's, under which requests
-    sends a request, giving the socket the read timeout only once it went
-    out whole (urllib3's HTTPConnectionPool._make_request). After the call
-    started to go out, the connect timeout's message says so (_cut_off),
-    and that the server may have run the call. requests also reports a
-    TLS handshake that times out as a ReadTimeout (urllib3 2.8's
-    HTTPConnectionPool._make_request), which counts as read: its note says
-    what is safe, not what is sure.
+    urllib3's ReadTimeoutError, when an answer's body stops coming
+    (requests' Response.iter_content; a redirect's, _drained_redirect): the
+    read timeout's. Over urllib3's ProtocolError "Connection aborted.",
+    with no ReadTimeoutError, when the request stops going out: the connect
+    timeout's, under which requests sends a request, giving the socket the
+    read timeout only once it went out whole (urllib3's
+    HTTPConnectionPool._make_request). After the call started to go out,
+    the connect timeout's message says so (_cut_off), and that the server
+    may have run the call. requests also reports a TLS handshake that times
+    out as a ReadTimeout (urllib3 2.8's HTTPConnectionPool._make_request),
+    which counts as read: its note says what is safe, not what is sure.
     """
     if isinstance(error, (_ConnectTimeout, requests.ConnectTimeout)):
         fired = "connect"
@@ -1625,11 +1634,66 @@ class _Json2Adapter(requests.adapters.HTTPAdapter):
         }
 
 
+# How much of a redirect's body _drained_redirect reads at a time: what
+# requests reads of an answer's (models.py, CONTENT_CHUNK_SIZE).
+_DRAIN_CHUNK = 10 * 1024
+# The error of requests that Response.iter_content raises for each error of
+# urllib3 as it reads an answer's body (requests 2.32.3 and 2.34.2,
+# models.py), but for urllib3's DecodeError, which a body read undecoded
+# cannot raise.
+_BODY_ERRORS = {
+    urllib3.exceptions.ProtocolError: requests.exceptions.ChunkedEncodingError,
+    urllib3.exceptions.ReadTimeoutError: requests.ConnectionError,
+    urllib3.exceptions.SSLError: requests.exceptions.SSLError,
+}
+
+
+def _drained_redirect(response, **kwargs):
+    """For the session's response hook, which requests calls with each
+    answer as it comes, a redirect's included, before it follows it
+    (Session.send): read a redirect's body to its end, undecoded, and drop
+    it. The library has no use for it.
+
+    requests reads that body decoded as it follows the redirect
+    (SessionRedirectMixin.resolve_redirects). After a decoding error it
+    reads the rest undecoded, which urllib3 refuses with a RuntimeError
+    once part of the body was decoded, and the error of urllib3 that
+    reading raises, such as a body that stops coming, reaches the call as
+    urllib3 raises it. Read here first, the body leaves nothing for
+    requests to decode or read.
+
+    An error of urllib3 as it reads is raised as the error of requests
+    Response.iter_content raises for it (_BODY_ERRORS), with the redirect
+    as its response: the call reports it as an error of the body of any
+    answer, a body that stops coming as the read timeout's, one cut off as
+    the connection's that failed after the call started to go out.
+    """
+    if response.is_redirect:
+        cause = None
+        try:
+            for _ in response.raw.stream(_DRAIN_CHUNK, decode_content=False):
+                pass
+        except tuple(_BODY_ERRORS) as error:
+            cause = error
+        if cause is not None:
+            stands_for = next(
+                instead
+                for raised, instead in _BODY_ERRORS.items()
+                if isinstance(cause, raised)
+            )
+            # Raised over urllib3's error, as requests raises its own, so
+            # that _timeout_fired and _cut_off read its chain as they read
+            # theirs. The RequestError raised for it keeps none of it (_send).
+            raise stands_for(cause, response=response) from cause
+    # Any other answer is the call's: _Json2._outcome reads its body.
+
+
 class _OriginSession(requests.Session):
     """A requests session whose auth sends the API key only to the origin
     of ``url``, and which follows a redirect only within that origin: a
     request or a redirect for any other raises before anything is sent
-    there.
+    there. A redirect's body is read undecoded and dropped as it comes
+    (_drained_redirect).
 
     It takes no proxy from the environment, which for an http url would
     receive the key (xmlrpc.client, the other transport, uses none), no
@@ -1643,6 +1707,7 @@ class _OriginSession(requests.Session):
         super().__init__()
         self.trust_env = False
         self.auth = _BearerKey(key, url)
+        self.hooks["response"].append(_drained_redirect)
         for prefix in ("http://", "https://"):
             self.mount(prefix, _Json2Adapter())
 
@@ -1664,10 +1729,8 @@ class _OriginSession(requests.Session):
                 response=resp,
             )
         if failure is not None:
-            # requests reads and closes a redirect's answer only once it
-            # follows it, after this method: the answer refused here is
-            # closed before the error is raised, or its socket stays open.
-            resp.close()
+            # The answer refused here was read to its end as it came, and its
+            # connection went back to the pool (_drained_redirect).
             raise failure
         return target
 
