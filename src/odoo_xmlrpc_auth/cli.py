@@ -27,36 +27,51 @@ def die(msg):
     sys.exit(1)
 
 
-def _payload(text):
-    """The call ``text`` describes, as a dict, once checked as a payload,
-    before the profile is read: a JSON object of the keys above, with a
-    model and a method, not both ids and args, and without args, kwargs
-    that are an object, or null, and hold no ids: the records go in ids,
-    Client.call's own parameter. What the call holds, the library checks
-    as it sends it."""
+def _refuse(profile, reason):
+    """End the CLI on a payload it refuses, for ``reason``, as a call of
+    ``profile`` it cannot send: the command line gives the profile's name,
+    so the message names it before the store is read."""
+    die(f"A call of profile {profile!r} cannot be sent: {reason}")
+
+
+def _payload(text, profile):
+    """The call ``text`` describes for ``profile``, as a dict, once checked
+    as a payload, before the profile is read: a JSON object of the keys
+    above, with a model and a method, not both ids and args, and without
+    args, kwargs that are an object, or null, and hold no ids: the records
+    go in ids, Client.call's own parameter. What the call holds, the
+    library checks as it sends it."""
     try:
         call = json.loads(text)
     except (ValueError, RecursionError) as e:
         # A JSONDecodeError is a ValueError, and so is an int longer than
         # Python converts (4300 digits by default); a RecursionError, an
         # array or an object nested deeper than the parser follows.
-        die(f"invalid JSON: {e}")
+        _refuse(profile, f"invalid JSON: {e}")
     if not isinstance(call, dict):
-        die("the JSON payload must be an object")
+        _refuse(profile, "the JSON payload must be an object")
     unknown = sorted(set(call) - set(_PAYLOAD_KEYS))
     if unknown:
-        die(f"unknown keys in the JSON payload: {', '.join(map(_one_line, unknown))}")
+        _refuse(
+            profile,
+            f"unknown keys in the JSON payload: {', '.join(map(_one_line, unknown))}",
+        )
     for key in ("model", "method"):
         if key not in call:
-            die(f"missing '{key}' in JSON payload")
+            _refuse(profile, f"missing '{key}' in the JSON payload")
     if "ids" in call and "args" in call:
-        die("give 'ids' or 'args' in the JSON payload, not both")
+        _refuse(profile, "give 'ids' or 'args' in the JSON payload, not both")
     # With args, kwargs are execute_kw's named arguments, as they are.
     if "args" not in call and call.get("kwargs") is not None:
-        if not isinstance(call["kwargs"], dict):
-            die("'kwargs' in the JSON payload must be an object")
-        elif "ids" in call["kwargs"]:
-            die("'ids' goes at the top of the JSON payload, not in 'kwargs'")
+        if isinstance(call["kwargs"], dict):
+            if "ids" in call["kwargs"]:
+                _refuse(
+                    profile,
+                    "'ids' goes at the top of the JSON payload, not in 'kwargs'",
+                )
+            # Without ids, kwargs are the method's own parameters.
+        else:
+            _refuse(profile, "'kwargs' in the JSON payload must be an object")
     return call
 
 
@@ -98,7 +113,7 @@ def main():
         "`api = xmlrpc` profile",
     )
     args = parser.parse_args()
-    call = _payload(args.payload)
+    call = _payload(args.payload, args.profile)
 
     try:
         with Client(profile=args.profile) as odoo:
