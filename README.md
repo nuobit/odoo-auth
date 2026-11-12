@@ -318,9 +318,13 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   whose head cannot be read), the message says: «It failed after the call
   started to go out, before its answer was read whole: the server may have
   run the call, so do not repeat it before reading back what it did.» Over
-  JSON-2 that
-  holds for a redirect's new connection too, even one that fails to open:
-  a redirect, such as a 303, can answer a request the server processed. A
+  JSON-2 that holds for a redirect's new connection too, even one that
+  fails to open, and for a redirect's body: a redirect, such as a 303, can
+  answer a request the server processed. `Client` reads a redirect's body
+  as it comes, undecoded, and drops it; one that cannot be read whole
+  (stopping, breaking off, in bad chunks) ends the call as the body of any
+  answer does, with the redirect's status as its `code`, but after the read
+  timeout, which leaves it `None`, and the redirect is not followed. A
   failure before anything of the call was sent says nothing of it (a name
   that does not resolve, a connection refused, the connect timeout, a TLS
   handshake that fails or is reset), nor does one of the XML-RPC login,
