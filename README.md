@@ -44,8 +44,8 @@ What else a 1.x caller meets:
   `ValueError`; a `Client` relies on it to leave no socket open when a
   handshake fails or is interrupted.
 - A profile is refused too when its `url` holds a backslash, port 0, a
-  query or a fragment, or when its `url`, `db`, `user` or `api` holds its
-  `password` (§ Configure a profile).
+  query or a fragment, or a host IDNA refuses, or when its `url`, `db`,
+  `user` or `api` holds its `password` (§ Configure a profile).
 - `ServerProxy` with a profile refuses `verbose=True`, and the library's
   connections print nothing at `http.client`'s debug level, where 1.x
   printed the password with each request (§ Security model).
@@ -154,8 +154,10 @@ with Client(profile="customer1") as odoo:
     partners = odoo.call("res.partner", "read", [7, 8], fields=["name"])
 ```
 
-`call(model, method, ids=None, **named)`:
+`call(model, method, /, ids=None, **named)`:
 
+- `model` and `method` go by position only (the `/`), so that a method's
+  own parameter named `model` or `method` can go by name with the others.
 - `ids` is `None` for a method of the model (`search_read`,
   `search_count`, `create`), or the list of the ids of the records a method
   of records works on (`read`, `write`, `unlink`).
@@ -460,8 +462,11 @@ group or others (like `ssh` does with `~/.ssh/`), or if `url` is not an http
 or https URL that names a host, with a port from 1 to 65535 if it has one,
 on one line of printable ASCII without spaces, or has a user or password
 before its host, or holds a backslash, or a query or a fragment, even an
-empty one (a lone `?` or `#`). The url is not shown, not even its
-scheme: xmlrpc.client would quote it, user info included, in its errors. A
+empty one (a lone `?` or `#`), or names a host IDNA refuses, with an empty
+label between its dots or one longer than 63 characters. The url is not
+shown, not even its scheme: xmlrpc.client would quote it, user info
+included, in its errors. Both APIs encode the host with Python's IDNA
+codec before they look it up, and its refusal would quote the host. A
 backslash is refused because RFC 3986 allows one in a URL only as `%5C`,
 and `requests`, which JSON-2 goes through, would end the host at a
 backslash in it. Port 0 is refused because no connection goes to it:
