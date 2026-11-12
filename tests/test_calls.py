@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import unittest
+import uuid
 import warnings
 import xmlrpc.client
 import zlib
@@ -216,6 +217,21 @@ class StubTestCase(StoreMixin, unittest.TestCase):
             self.assertEqual(warned, [])
 
         self.addCleanup(check)
+
+    @contextlib.contextmanager
+    def json2_https_client(self, *handshakes):
+        """A Client over JSON-2 to https://127.0.0.1, offline, for the with
+        block: each connection's TCP socket is a fake, and its TLS handshake
+        gives the next of ``handshakes``, a fake TLS socket, or raises it, an
+        error. Every connection stops at its fake TCP socket, none looks a
+        name up, and the block uses every handshake."""
+        tcp_sockets = [mock.create_autospec(socket.socket, instance=True) for _ in handshakes]
+        with mock.patch(
+            "urllib3.util.connection.create_connection", side_effect=tcp_sockets
+        ) as connect:
+            with mock.patch.object(ssl.SSLContext, "wrap_socket", side_effect=handshakes):
+                yield self.make_client("https://127.0.0.1", "json2", KEY)
+        self.assertEqual(connect.call_count, len(handshakes))
 
 
 class XmlRpcClientTest(StubTestCase):
@@ -825,6 +841,39 @@ class Json2ClientTest(StubTestCase):
     def sent_body(self, request=0):
         return json.loads(self.odoo.requests[request]["body"])
 
+    def made_logger(self, name, logger_class=logging.Logger):
+        """The new logger ``name``, of ``logger_class``, a subclass of
+        logging.Logger, made as logging makes any logger. Once the test ends,
+        whatever its outcome, what the making added to logging's loggers is
+        taken out: each name it added, the logger's and the placeholder of
+        each parent name that had none, and the logger from the placeholder
+        of each parent name that had one. Every logger a test makes is made
+        here."""
+        manager = logging.Logger.manager
+        before = dict(manager.loggerDict)
+        previous = manager.loggerClass
+        manager.setLoggerClass(logger_class)
+        try:
+            logger = logging.getLogger(name)
+        finally:
+            manager.loggerClass = previous
+        added = [key for key in manager.loggerDict if key not in before]
+        holders = [
+            holder
+            for holder in before.values()
+            if isinstance(holder, logging.PlaceHolder) and logger in holder.loggerMap
+        ]
+
+        def take_out():
+            # A test may have dropped the logger itself.
+            for key in added:
+                manager.loggerDict.pop(key, None)
+            for holder in holders:
+                del holder.loggerMap[logger]
+
+        self.addCleanup(take_out)
+        return logger
+
     def test_a_method_of_records_gets_the_ids_by_name(self):
         self.odoo.answers[("res.partner", "read")] = [{"id": 7, "name": "Example"}]
         result = self.client.call("res.partner", "read", [7], fields=["name"])
@@ -1110,6 +1159,236 @@ class Json2ClientTest(StubTestCase):
                 headers={"Authorization": f"Bearer {KEY}"},
             )
         self.assertIn("Failed to parse headers", logged.getvalue())
+
+    def test_no_logger_of_urllib3_logs_a_record_of_a_call(self):
+        # At DEBUG, urllib3's pool logs each request line: here, that of a
+        # redirect within the origin whose location echoes the key. A filter
+        # set on urllib3's own logger sees none of its children's records.
+        # The records of another connection still reach the application.
+        logged = io.StringIO()
+        handler = logging.StreamHandler(logged)
+        logging.getLogger().addHandler(handler)
+        self.addCleanup(logging.getLogger().removeHandler, handler)
+        urllib3_logger = logging.getLogger("urllib3")
+        self.addCleanup(urllib3_logger.setLevel, urllib3_logger.level)
+        urllib3_logger.setLevel(logging.DEBUG)
+        self.odoo.answers[("res.partner", "read")] = Answer(
+            307, b"", {"Location": f"/json/2/res.partner/{KEY}"}
+        )
+        self.odoo.answers[("res.partner", KEY)] = [{"id": 7}]
+        self.assertEqual(self.client.call("res.partner", "read", [7]), [{"id": 7}])
+        self.assertEqual(self.odoo.requests[1]["path"], f"/json/2/res.partner/{KEY}")
+        self.assertEqual(logged.getvalue(), "")
+        with urllib3.HTTPConnectionPool("127.0.0.1", self.odoo.server.server_address[1]) as pool:
+            pool.request(
+                "POST", f"/json/2/res.partner/{KEY}", headers={"Authorization": f"Bearer {KEY}"}
+            )
+        self.assertIn(f'"POST /json/2/res.partner/{KEY} HTTP/1.1" 200', logged.getvalue())
+
+    def test_a_logger_urllib3_makes_once_the_library_loaded_logs_nothing_of_a_call(self):
+        # Such as the logger of a module of urllib3's contrib imported later:
+        # here, one made by the test, through which urllib3's pool logs.
+        logged = io.StringIO()
+        handler = logging.StreamHandler(logged)
+        logging.getLogger().addHandler(handler)
+        self.addCleanup(logging.getLogger().removeHandler, handler)
+        later = self.made_logger("urllib3.contrib.made_by_a_test")
+        self.addCleanup(later.setLevel, later.level)
+        later.setLevel(logging.DEBUG)
+        self.odoo.answers[("res.partner", "search_count")] = 3
+        with mock.patch.object(urllib3.connectionpool, "log", later):
+            self.assertEqual(self.client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertEqual(logged.getvalue(), "")
+        later.debug("a record of no call")
+        self.assertEqual(logged.getvalue(), "a record of no call\n")
+
+    def test_what_making_a_logger_adds_goes_as_the_test_ends_whatever_its_outcome(self):
+        # The helper every logger of a test is made through (made_logger), in
+        # a test that fails. Before it, a logger whose name made placeholders
+        # for its parents, family and family.kept. In it, a logger whose name
+        # needs a placeholder of its parent, family.new, and one that the
+        # placeholder of family.kept holds too, as does family's.
+        manager = logging.Logger.manager
+        family = f"made_by_a_test_{uuid.uuid4().hex}"
+        self.made_logger(f"{family}.kept.before")
+        before = dict(manager.loggerDict)
+        held_before = {
+            name: dict(holder.loggerMap)
+            for name, holder in before.items()
+            if isinstance(holder, logging.PlaceHolder)
+        }
+
+        class FailingTest(unittest.TestCase):
+            made_logger = Json2ClientTest.made_logger
+
+            def test_it(self):
+                self.made_logger(f"{family}.new.one")
+                self.made_logger(f"{family}.kept.two")
+                self.fail("a test that fails")
+
+        outcome = unittest.TestResult()
+        FailingTest("test_it").run(outcome)
+        self.assertEqual(len(outcome.failures), 1)
+        self.assertEqual(manager.loggerDict, before)
+        self.assertEqual(
+            {
+                name: dict(holder.loggerMap)
+                for name, holder in manager.loggerDict.items()
+                if isinstance(holder, logging.PlaceHolder)
+            },
+            held_before,
+        )
+
+    def test_a_logger_made_between_two_steps_of_the_walk_breaks_nothing(self):
+        # Each call over JSON-2 first walks logging's loggers. Code that runs
+        # meanwhile, a thread or a signal's handler, can make a logger
+        # between two steps of the walk: walking logging's dict itself, the
+        # walk then raised RuntimeError on any Python, the dict having grown
+        # under it. Here a logger of urllib3 makes one as the walk gives it
+        # the filter, and the walk goes on to the logger of urllib3 made
+        # after it.
+        made = []
+        test = self
+
+        class MakesALogger(logging.Logger):
+            def addFilter(self, filter):
+                super().addFilter(filter)
+                made.append(test.made_logger(f"made_by_a_test.{uuid.uuid4().hex}"))
+
+        self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}", MakesALogger)
+        after = self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}")
+        odoo_xmlrpc_auth.client._filter_urllib3_loggers()
+        self.assertEqual(len(made), 1)
+        self.assertEqual(after.filters, [odoo_xmlrpc_auth.client._JSON2_CALL_RECORDS])
+
+    def test_a_logger_dropped_between_two_steps_of_the_walk_breaks_nothing(self):
+        # The test above, for a logger dropped: walking logging's dict
+        # itself, the walk raised RuntimeError on any Python, the dict having
+        # shrunk under it.
+        doomed = self.made_logger(f"made_by_a_test.{uuid.uuid4().hex}")
+        dropped = []
+
+        class DropsALogger(logging.Logger):
+            def addFilter(self, filter):
+                super().addFilter(filter)
+                dropped.append(logging.Logger.manager.loggerDict.pop(doomed.name))
+
+        self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}", DropsALogger)
+        after = self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}")
+        odoo_xmlrpc_auth.client._filter_urllib3_loggers()
+        self.assertEqual(dropped, [doomed])
+        self.assertEqual(after.filters, [odoo_xmlrpc_auth.client._JSON2_CALL_RECORDS])
+
+    @unittest.skipIf(
+        sys.version_info >= (3, 12),
+        "from Python 3.12, no collection runs inside a call of C such as the walk's",
+    )
+    def test_a_logger_made_during_the_walk_over_the_loggers_breaks_nothing(self):
+        # Python 3.11 can collect garbage as an object is made inside a call
+        # of C, and run a finalizer there, which can make a logger, as a
+        # thread that runs meanwhile can. Each call over JSON-2 walks
+        # logging's loggers first: taken one by one from logging's dict, which
+        # then changed size, the walk raised RuntimeError. Here each object
+        # made runs a collection, and each collection the finalizer of an
+        # object in a cycle, which makes a logger and the next such object.
+        made = []
+        armed = threading.Event()
+        test = self
+
+        class MakesALogger:
+            def __del__(self):
+                if armed.is_set():
+                    # A name no logger has yet: logging's dict grows.
+                    made.append(test.made_logger(f"made_by_a_test.{uuid.uuid4().hex}"))
+                    plant()
+
+        def plant():
+            garbage = MakesALogger()
+            garbage.itself = garbage
+
+        unfiltered = self.made_logger("urllib3.contrib.made_by_a_test_before_the_walk")
+        threshold = gc.get_threshold()
+        gc.collect()
+        armed.set()
+        gc.set_threshold(1)
+        plant()
+        try:
+            odoo_xmlrpc_auth.client._filter_urllib3_loggers()
+        finally:
+            gc.set_threshold(*threshold)
+            armed.clear()
+        self.assertNotEqual(made, [])
+        self.assertEqual(unfiltered.filters, [odoo_xmlrpc_auth.client._JSON2_CALL_RECORDS])
+
+    @unittest.skipIf(
+        sys.version_info >= (3, 12),
+        "from Python 3.12, no collection runs inside a call of C such as the copy's",
+    )
+    def test_a_logger_dropped_as_the_loggers_are_copied_breaks_nothing(self):
+        # Python 3.11's dict.copy makes the new dict after it took the
+        # entries of logging's dict and before it reads their count: a
+        # collection of garbage that the allocation runs there, whose
+        # finalizer drops a logger, as a thread that runs meanwhile can, gave
+        # a copy whose count was one entry short, and its walk raised
+        # RuntimeError. Here objects in cycles, each of whose finalizers
+        # drops a logger the test made, wait in the youngest generation of
+        # garbage for the first collection once the walk starts: on Python
+        # 3.11 the first object made then runs it.
+        names = [f"made_by_a_test.{uuid.uuid4().hex}" for _ in range(200)]
+        for name in names:
+            self.made_logger(name)
+        dropped = []
+
+        class DropsALogger:
+            def __init__(self, name):
+                self.name = name
+                self.itself = self
+
+            def __del__(self):
+                dropped.append(logging.Logger.manager.loggerDict.pop(self.name))
+
+        unfiltered = self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}")
+        threshold = gc.get_threshold()
+        gc.collect()
+        for name in names:
+            DropsALogger(name)
+        gc.set_threshold(1)
+        try:
+            odoo_xmlrpc_auth.client._filter_urllib3_loggers()
+            # Counted before the collection below, which runs every finalizer
+            # still waiting: each logger was dropped inside the walk.
+            self.assertEqual(len(dropped), 200)
+        finally:
+            gc.set_threshold(*threshold)
+            gc.collect()
+        self.assertEqual(unfiltered.filters, [odoo_xmlrpc_auth.client._JSON2_CALL_RECORDS])
+
+    def test_urllib3_logs_nothing_of_an_https_call(self):
+        # Offline, the TLS sockets fakes: an answer whose header's name
+        # holds the key, read at DEBUG over the call's connection, then over
+        # a connection of urllib3's own, which still logs.
+        logged = io.StringIO()
+        handler = logging.StreamHandler(logged)
+        logging.getLogger().addHandler(handler)
+        self.addCleanup(logging.getLogger().removeHandler, handler)
+        urllib3_logger = logging.getLogger("urllib3")
+        self.addCleanup(urllib3_logger.setLevel, urllib3_logger.level)
+        urllib3_logger.setLevel(logging.DEBUG)
+        answer = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            + f"X-Echo {KEY}: echo\r\n".encode()
+            + b"Content-Length: 1\r\n\r\n3"
+        )
+        tls_sockets = [mock.create_autospec(ssl.SSLSocket, instance=True) for _ in range(2)]
+        for tls_socket in tls_sockets:
+            tls_socket.makefile.return_value = io.BytesIO(answer)
+        with self.json2_https_client(*tls_sockets) as client:
+            self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+            self.assertEqual(logged.getvalue(), "")
+            with urllib3.HTTPSConnectionPool("127.0.0.1") as pool:
+                pool.request("POST", "/json/2/res.partner/search_count")
+        self.assertIn("Failed to parse headers", logged.getvalue())
+        self.assertIn(KEY, logged.getvalue())
 
     def test_a_redirect_to_a_url_that_names_no_origin_is_refused(self):
         self.odoo.answers[("res.partner", "read")] = Answer(
@@ -2250,21 +2529,6 @@ class CutOffTest(StubTestCase):
         thread.start()
         self.addCleanup(thread.join, 5)
         return f"https://127.0.0.1:{listener.getsockname()[1]}"
-
-    @contextlib.contextmanager
-    def json2_https_client(self, *handshakes):
-        """A Client over JSON-2 to https://127.0.0.1, offline, for the with
-        block: each connection's TCP socket is a fake, and its TLS handshake
-        gives the next of ``handshakes``, a fake TLS socket, or raises it, an
-        error. Every connection stops at its fake TCP socket, none looks a
-        name up, and the block uses every handshake."""
-        tcp_sockets = [mock.create_autospec(socket.socket, instance=True) for _ in handshakes]
-        with mock.patch(
-            "urllib3.util.connection.create_connection", side_effect=tcp_sockets
-        ) as connect:
-            with mock.patch.object(ssl.SSLContext, "wrap_socket", side_effect=handshakes):
-                yield self.make_client("https://127.0.0.1", "json2", KEY)
-        self.assertEqual(connect.call_count, len(handshakes))
 
     def json2_https_call(self, *handshakes):
         """The RequestError of a call of json2_https_client(*handshakes)."""
