@@ -79,9 +79,11 @@ _API_KEY = re.compile(r"[0-9a-f]{40}")
 # value, a fault without one (IndexError, a LookupError); XML that names an
 # encoding Python does not know (LookupError, from expat's handler of
 # unknown encodings); a bigdecimal that is not a number; a gzip body cut
-# short or corrupt. Reading the body raises the others _AnswerParsing
-# takes: http.client's IncompleteRead (an HTTPException) for a body cut
-# short or sent in bad chunks, gzip's BadGzipFile (an OSError) for one that
+# short or corrupt; a body cut short of its Content-Length (ExpatError),
+# which http.client hands over short, without raising, to xmlrpc.client's
+# reads in pieces. Reading the body raises the others _AnswerParsing takes:
+# http.client's IncompleteRead (an HTTPException) for a body sent in bad
+# chunks or cut short in them, gzip's BadGzipFile (an OSError) for one that
 # is not the gzip it says, and a socket's OSError for a connection that
 # breaks off as it comes.
 _PARSE_ERRORS = (
