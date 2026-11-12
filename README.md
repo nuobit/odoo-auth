@@ -111,20 +111,30 @@ odoo-xmlrpc-auth --profile customer1 \
 An `api = json2` profile refuses `args`, a payload cannot hold both `ids`
 and `args`, and without `args` it cannot hold `ids` inside `kwargs`: the
 records go in `ids`. An error is printed on stderr after `Error:`, and
-the CLI exits with status 1, never with a traceback: one of the errors of
-`Client` below, in both forms of the payload, a call `Client` refuses
-(`ArgumentError`, such as an empty model, or NaN over JSON-2) among them,
-or a payload Python's json cannot read (`invalid JSON: …`, also for an int
-longer than it converts or nesting deeper than it follows), or an answer
-JSON cannot write (NaN or an infinity, on either API; over XML-RPC, a
-`dateTime`, `base64` or `bigdecimal` value), which Odoo sends after it ran
-the call. The library's
-own messages are one line each; an `OdooError` ends with Odoo's message,
-printed as it came, which can span lines (a traceback of the server's,
-for one). A value a message quotes, such as a path, the name of a type,
-an error's code or a payload's key, shows quoted and escaped as Python's
-`repr` writes it when it holds a line break or another character that
-does not print, as a profile's name always does.
+the CLI exits with status 1, never with a traceback. The error is one of
+three kinds:
+
+- one of the errors of `Client` below, in both forms of the payload, a
+  call `Client` refuses (`ArgumentError`, such as an empty model, or NaN
+  over JSON-2) among them;
+- a payload the CLI refuses before it reads the profile, whose message
+  also names the profile, the command line's: `A call of profile 'x'
+  cannot be sent: …`, then what is wrong with the payload, such as
+  `invalid JSON: …` for one Python's json cannot read (also an int longer
+  than it converts or nesting deeper than it follows);
+- an answer JSON cannot write (NaN or an infinity, on either API; over
+  XML-RPC, a `dateTime`, `base64` or `bigdecimal` value; or one nested
+  deeper than Python's json follows, which `xmlrpc.client` reads at any
+  depth), which Odoo sends after it ran the call: `Odoo answered a call of
+  profile 'x' with a value JSON cannot write, …: it ran the call, so do
+  not repeat it before reading back what it did`.
+
+The library's own messages are one line each; an `OdooError` ends with
+Odoo's message, printed as it came, which can span lines (a traceback of
+the server's, for one). A value a message quotes, such as a path, the
+name of a type, an error's code or a payload's key, shows quoted and
+escaped as Python's `repr` writes it when it holds a line break or
+another character that does not print, as a profile's name always does.
 
 ## Library usage
 

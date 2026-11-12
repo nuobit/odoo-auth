@@ -1313,7 +1313,12 @@ class CliTest(StoreTestCase):
             "erp", '{"model": "res.partner", "method": "search", "kw\\narg": 1}'
         )
         self.assertEqual(
-            (code, err), (1, "Error: unknown keys in the JSON payload: 'kw\\narg'\n")
+            (code, err),
+            (
+                1,
+                "Error: A call of profile 'erp' cannot be sent: unknown keys in the JSON "
+                "payload: 'kw\\narg'\n",
+            ),
         )
 
 

@@ -3663,7 +3663,12 @@ class CliTest(StubTestCase):
                 code, out, err = self.run_cli(profile, payload)
                 self.assertEqual(
                     (code, out, err),
-                    (1, "", "Error: 'ids' goes at the top of the JSON payload, not in 'kwargs'\n"),
+                    (
+                        1,
+                        "",
+                        f"Error: A call of profile '{profile}' cannot be sent: 'ids' goes at "
+                        "the top of the JSON payload, not in 'kwargs'\n",
+                    ),
                 )
         self.assertEqual((self.xmlrpc_odoo.logins, self.json2_odoo.requests), (0, []))
 
@@ -3714,11 +3719,13 @@ class CliTest(StubTestCase):
         )
 
     def test_a_payload_that_is_not_a_call_is_refused_before_its_profile_is_read(self):
-        # The payload's message, also for a profile that does not exist.
+        # The payload's message, which names the profile, the command line's,
+        # also one that does not exist, on one line whatever its name holds.
         call = {"model": "res.partner", "method": "read"}
         refused = {
             "[]": "the JSON payload must be an object",
-            json.dumps({"model": "res.partner"}): "missing 'method' in JSON payload",
+            json.dumps({"method": "read"}): "missing 'model' in the JSON payload",
+            json.dumps({"model": "res.partner"}): "missing 'method' in the JSON payload",
             json.dumps({**call, "kwarg": {}}): "unknown keys in the JSON payload: kwarg",
             json.dumps({**call, "ids": [7], "args": [[7]]}): (
                 "give 'ids' or 'args' in the JSON payload, not both"
@@ -3728,11 +3735,20 @@ class CliTest(StubTestCase):
                 "'ids' goes at the top of the JSON payload, not in 'kwargs'"
             ),
         }
+        profiles = {
+            "erp-xmlrpc": "'erp-xmlrpc'",
+            "erp-json2": "'erp-json2'",
+            "no-such-profile": "'no-such-profile'",
+            "no\nsuch": "'no\\nsuch'",
+        }
         for payload, message in refused.items():
             with self.subTest(payload=payload):
-                for profile in ("erp-xmlrpc", "erp-json2", "no-such-profile"):
+                for profile, quoted in profiles.items():
                     code, out, err = self.run_cli(profile, payload)
-                    self.assertEqual((code, out, err), (1, "", f"Error: {message}\n"))
+                    self.assertEqual(
+                        (code, out, err),
+                        (1, "", f"Error: A call of profile {quoted} cannot be sent: {message}\n"),
+                    )
         self.assertEqual((self.xmlrpc_odoo.logins, self.json2_odoo.requests), (0, []))
 
     def test_json_python_cannot_read_ends_as_one_message(self):
@@ -3753,15 +3769,18 @@ class CliTest(StubTestCase):
             (
                 1,
                 "",
-                "Error: invalid JSON: Exceeds the limit (4300 digits) for integer "
-                "string conversion: value has 5000 digits; use "
-                "sys.set_int_max_str_digits() to increase the limit\n",
+                "Error: A call of profile 'erp-xmlrpc' cannot be sent: invalid JSON: "
+                "Exceeds the limit (4300 digits) for integer string conversion: value "
+                "has 5000 digits; use sys.set_int_max_str_digits() to increase the "
+                "limit\n",
             ),
         )
         # An array nested deeper than json's parser follows, on any version.
         code, out, err = self.run_cli("erp-xmlrpc", "[" * 100000 + "]" * 100000)
         self.assertEqual((code, out), (1, ""))
-        self.assertTrue(err.startswith("Error: invalid JSON: "))
+        self.assertTrue(
+            err.startswith("Error: A call of profile 'erp-xmlrpc' cannot be sent: invalid JSON: ")
+        )
         self.assertEqual(err.count("\n"), 1)
         self.assertEqual(self.xmlrpc_odoo.logins, 0)
 
