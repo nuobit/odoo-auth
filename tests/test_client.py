@@ -9,16 +9,17 @@ A call after the authentication is stopped at its transport's request,
 which raises what the test gives it: xmlrpc.client's Transport.request for
 ServerProxy, Client's own (_Sending.request) for Client, which never goes
 through xmlrpc.client's. A refused connection is the
-ConnectionRefusedError(111, 'Connection refused') that xmlrpc.client raised
-for 127.0.0.1 port 1 on 2026-10-28; a ProtocolError is what xmlrpc.client
-raises for an HTTP status other than 200, its url being the host and the
-path it called.
+ConnectionRefusedError(errno.ECONNREFUSED, 'Connection refused') that
+xmlrpc.client raised for 127.0.0.1 port 1 on 2026-10-28; a ProtocolError
+is what xmlrpc.client raises for an HTTP status other than 200, its url
+being the host and the path it called.
 
 Run from the repository root:
     PYTHONPATH=src python3 -m unittest discover -s tests
 """
 
 import contextlib
+import errno
 import io
 import itertools
 import json
@@ -928,13 +929,14 @@ class CallTest(StoreTestCase):
 
     def test_a_refused_connection_is_a_request_error_with_its_errno(self):
         self.common.authenticate.side_effect = ConnectionRefusedError(
-            111, "Connection refused"
+            errno.ECONNREFUSED, "Connection refused"
         )
         with self.assertRaises(RequestError) as caught:
             ServerProxy(profile="erp")
         self.assertEqual(
             str(caught.exception),
-            "A request of profile 'erp' failed: ConnectionRefusedError, code 111. "
+            "A request of profile 'erp' failed: ConnectionRefusedError, code "
+            f"{errno.ECONNREFUSED}. "
             "Its message is not shown, as it can quote the profile's values.",
         )
         self.assertIsInstance(caught.exception, ConnectionRefusedError)

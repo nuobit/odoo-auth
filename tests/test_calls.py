@@ -701,7 +701,10 @@ class NotXmlRpcTest(StubTestCase):
         "zlib.error: a gzip body corrupt": Answer(
             200, _gzip_corrupt(), {"Content-Encoding": "gzip"}
         ),
-        "IncompleteRead: a body cut short": RawAnswer(
+        # xmlrpc.client reads the body in pieces, and http.client hands over
+        # one cut short of its Content-Length without raising: the parser
+        # raises for the XML cut short.
+        "ExpatError: a body cut short": RawAnswer(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: 400\r\n\r\n"
             b"<?xml version='1.0'?><methodResponse>"
         ),
@@ -762,6 +765,13 @@ class NotXmlRpcTest(StubTestCase):
             )
         self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
         self.assertIsAnswerError(error, 200)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ResponseError, code 200. The server "
+            "answered: it may have run the call, so do not repeat it before reading "
+            "back what it did. Its message is not shown, as it can quote the profile's "
+            "values.",
+        )
         self.assertEqual(
             [request["path"] for request in odoo.requests],
             ["/xmlrpc/2/common", "/xmlrpc/2/object", "/xmlrpc/2/object"],
@@ -2517,7 +2527,11 @@ class CutOffTest(StubTestCase):
         listener.listen(1)
 
         def reset():
-            connection, _ = listener.accept()
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                # The test ended before a client came (below).
+                return
             with connection:
                 connection.recv(65536)
                 # Closed with a linger of 0 seconds, it sends a reset.
@@ -2525,9 +2539,22 @@ class CutOffTest(StubTestCase):
                     socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
                 )
 
+        def shut_down():
+            try:
+                listener.shutdown(socket.SHUT_RDWR)
+            except OSError as error:
+                if error.errno != errno.ENOTCONN:
+                    raise
+
         thread = threading.Thread(target=reset, daemon=True)
         thread.start()
+        # Cleanups run last in, first out: the listener is shut down before
+        # the thread is joined. A shutdown ends an accept still waiting, in
+        # a test that fails before it connects; on Linux a close does not.
+        # BSD and macOS refuse to shut down a listening socket, ENOTCONN,
+        # which passes there.
         self.addCleanup(thread.join, 5)
+        self.addCleanup(shut_down)
         return f"https://127.0.0.1:{listener.getsockname()[1]}"
 
     def json2_https_call(self, *handshakes):
@@ -2637,7 +2664,7 @@ class CutOffTest(StubTestCase):
                 PASSWORD,
                 socket,
                 ConnectionRefusedError,
-                "ConnectionRefusedError, code 111",
+                f"ConnectionRefusedError, code {errno.ECONNREFUSED}",
                 [(1, "login"), (2, "call")],
             ),
             "json2": (
@@ -2691,7 +2718,8 @@ class CutOffTest(StubTestCase):
         self.assertIsInstance(error, ConnectionResetError)
         self.assertEqual(
             str(error),
-            "A request of profile 'erp' failed: ConnectionResetError, code 104. Its "
+            "A request of profile 'erp' failed: ConnectionResetError, code "
+            f"{errno.ECONNRESET}. Its "
             "message is not shown, as it can quote the profile's values.",
         )
         wrap.assert_called_once()
@@ -2754,7 +2782,8 @@ class CutOffTest(StubTestCase):
         self.assertIsInstance(error, ConnectionResetError)
         self.assertEqual(
             str(error),
-            "A request of profile 'erp' failed: ConnectionResetError, code 104. It "
+            "A request of profile 'erp' failed: ConnectionResetError, code "
+            f"{errno.ECONNRESET}. It "
             "failed after the call started to go out, before its answer was read "
             "whole: the server may have run the call, so do not repeat it before "
             "reading back what it did. Its message is not shown, as it can quote the "
@@ -2786,7 +2815,8 @@ class CutOffTest(StubTestCase):
         self.assertIsInstance(error, ConnectionResetError)
         self.assertEqual(
             str(error),
-            "A request of profile 'erp' failed: ConnectionResetError, code 104. It "
+            "A request of profile 'erp' failed: ConnectionResetError, code "
+            f"{errno.ECONNRESET}. It "
             "failed after the call started to go out, before its answer was read "
             "whole: the server may have run the call, so do not repeat it before "
             "reading back what it did. Its message is not shown, as it can quote the "
