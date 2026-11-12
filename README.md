@@ -501,11 +501,18 @@ to see the wire, would print each request's headers and body, the API key
 or the password among them. A `transport` the caller gives `ServerProxy`
 is not the library's, and prints them at that level (§ ServerProxy: the
 XML-RPC drop-in). To see what a call sends, use a local stub.
-While one of them reads an answer, `urllib3` logs nothing either: its
-warning for headers it cannot parse quotes them as the server sent them,
-the API key among them when the server echoes it, and an application that
-configured logging (`logging.basicConfig()`) would print it. Every other
-record of the process is logged as before.
+While `Client` handles a call over JSON-2, no logger of `urllib3` logs a
+record either: at DEBUG, its pool's line for each request names the
+location of a redirect, and its warning for headers it cannot parse quotes
+them as the server sent them, either of which can carry the API key when
+the server echoes it, and an application that configured logging
+(`logging.basicConfig()`) would print it. The records that `urllib3` logs
+in the call's thread or task while the call runs are dropped, whoever
+logs them: code that runs there meanwhile, such as a signal handler or a
+finalizer, loses those of another connection of `urllib3` too, as a
+record does not carry what would tell the library's apart. Every other
+record of the process is logged as before, those of `urllib3` logged
+outside a call or in another thread or task among them.
 
 What the transports take from the environment, and what they do not:
 

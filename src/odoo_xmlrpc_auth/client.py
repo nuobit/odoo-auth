@@ -1084,42 +1084,77 @@ class _AnswerClosing:
             self._answer = None
 
 
-# Whether one of the library's connections is reading an answer, in this
-# thread or task (_Quiet.getresponse).
-_READING_OWN_ANSWER = contextvars.ContextVar("_READING_OWN_ANSWER", default=False)
+# Whether the library handles a call over JSON-2 in this thread or task,
+# from its first request to its answer read (_Json2.call).
+_IN_JSON2_CALL = contextvars.ContextVar("_IN_JSON2_CALL", default=False)
 
 
-class _OwnAnswerRecords(logging.Filter):
-    """For urllib3.connection's logger: drops the records it logs while one
-    of the library's connections reads an answer, and lets every other
-    through as it is. Its warning for headers it cannot parse quotes them as
-    the server sent them, the API key among them when the server echoes it,
-    and any application that configured logging would print it."""
+class _Json2CallRecords(logging.Filter):
+    """For urllib3's loggers: drops each record they log in the thread or
+    task of a call over JSON-2 while the library handles it
+    (_IN_JSON2_CALL), whoever logs it, such as a signal handler or a
+    finalizer that runs there meanwhile for another connection, as a record
+    does not carry what would tell the library's apart; lets every other
+    through as it is. Such a record of the call can carry the API key, which
+    any application that configured logging would print: the pool's request
+    line, at DEBUG, names a redirect's location, which can echo it, and the
+    connection's warning for headers it cannot parse quotes them as the
+    server sent them."""
 
     def filter(self, record):
-        return not _READING_OWN_ANSWER.get()
+        return not _IN_JSON2_CALL.get()
 
 
-logging.getLogger(urllib3.connection.__name__).addFilter(_OwnAnswerRecords())
+_JSON2_CALL_RECORDS = _Json2CallRecords()
+
+
+def _filter_urllib3_loggers():
+    """Give each of urllib3's loggers _JSON2_CALL_RECORDS, once. A logger's
+    filter sees only the records the logger itself logs, not those of its
+    children: urllib3's own would let theirs through. Each call over JSON-2
+    runs it first, for a logger that a module of urllib3 imported since
+    made, such as one of its contrib.
+
+    It walks a copy of logging's dict of loggers that dict() makes, which
+    holds the dict's entries as they were at one moment, and its count is
+    theirs: walking it raises nothing. dict() makes the new dict, then
+    copies the entries into it in C, where no code of Python runs. A
+    collection of garbage, which the new dict's allocation can start, can
+    run a finalizer that makes or drops a logger, as another thread may:
+    before the entries are copied or after, never in the middle. dict.copy
+    is not so on Python 3.11, for a dict with few deleted entries such as
+    logging's: it makes the new dict after it takes the entries and before
+    it reads their count, and a finalizer that drops a logger there gives
+    a copy whose count is one entry short, whose walk raises RuntimeError;
+    one that makes a logger, a copy whose count holds an entry the copy
+    does not. Taken one by one, as a list of the dict's items takes them,
+    a collection of garbage can run on the way, and with it a finalizer
+    that makes a logger, as a thread that runs meanwhile can: the dict
+    changes size as it is walked, and Python 3.11 raises RuntimeError.
+
+    A logger made after dict() copied the entries misses that walk, and
+    gets the filter at the next call over JSON-2. No logger through which
+    urllib3 logs a call is one of them: each of its modules that logs makes
+    its logger as it is imported (logging.getLogger(__name__)), the import
+    of urllib3 imports every module a call goes through, its pool manager,
+    pools, connections, answers and retries, before the library's first
+    call, and no step of a call imports a module of urllib3 anew."""
+    for name, logger in dict(logging.Logger.manager.loggerDict).items():
+        of_urllib3 = name == "urllib3" or name.startswith("urllib3.")
+        # A name that only names a parent holds a placeholder, no logger.
+        if of_urllib3 and isinstance(logger, logging.Logger):
+            logger.addFilter(_JSON2_CALL_RECORDS)
 
 
 class _Quiet:
     """For every connection of http.client the library makes, Client's
     over both APIs and ServerProxy's with a profile: it prints nothing,
-    whatever the process's debug level, and while it reads an answer
-    urllib3 logs nothing (_OwnAnswerRecords). At http.client.HTTPConnection's
+    whatever the process's debug level. At http.client.HTTPConnection's
     debuglevel 1, as requests' docs set it to see the wire, a connection
     prints each request's headers and body, the API key or the password
     among them."""
 
     debuglevel = 0
-
-    def getresponse(self):
-        reading = _READING_OWN_ANSWER.set(True)
-        try:
-            return super().getresponse()
-        finally:
-            _READING_OWN_ANSWER.reset(reading)
 
 
 class _HTTPConnection(
@@ -1964,25 +1999,32 @@ class _Json2:
         # Nothing of this call has gone out yet, whatever an earlier call
         # left in the mark (_MarkedSending).
         _REQUEST_STARTED.set(False)
-        failure, result = _send(
-            self._profile,
-            lambda: self._outcome(
-                self._session.post(
-                    f"{self._url}/json/2/{path}",
-                    data=body.encode("ascii"),
-                    headers={
-                        "Content-Type": "application/json",
-                        # Without a session, Odoo takes the database from
-                        # this header when the server holds several
-                        # (odoo/http.py, Request._get_session_and_dbname).
-                        "X-Odoo-Database": self._db,
-                    },
-                    timeout=self._timeout,
-                    # The body is read in _outcome, where its status is known.
-                    stream=True,
-                )
-            ),
-        )
+        # No logger of urllib3 logs a record of the call (_Json2CallRecords).
+        _filter_urllib3_loggers()
+        in_call = _IN_JSON2_CALL.set(True)
+        try:
+            failure, result = _send(
+                self._profile,
+                lambda: self._outcome(
+                    self._session.post(
+                        f"{self._url}/json/2/{path}",
+                        data=body.encode("ascii"),
+                        headers={
+                            "Content-Type": "application/json",
+                            # Without a session, Odoo takes the database from
+                            # this header when the server holds several
+                            # (odoo/http.py, Request._get_session_and_dbname).
+                            "X-Odoo-Database": self._db,
+                        },
+                        timeout=self._timeout,
+                        # The body is read in _outcome, where its status is
+                        # known.
+                        stream=True,
+                    )
+                ),
+            )
+        finally:
+            _IN_JSON2_CALL.reset(in_call)
         if failure is not None:
             raise failure
         return result
