@@ -1777,10 +1777,13 @@ class _Json2Adapter(requests.adapters.HTTPAdapter):
 _DRAIN_CHUNK = 10 * 1024
 # The error of requests that Response.iter_content raises for each error of
 # urllib3 as it reads an answer's body (requests 2.32.3 and 2.34.2,
-# models.py), but for urllib3's DecodeError, which a body read undecoded
-# cannot raise.
+# models.py). A body read undecoded can raise DecodeError too: urllib3 sets
+# up the decoder its head names before it reads, decoding or not, and
+# refuses a head that names more content encodings than it chains, five
+# from 2.6.0, the library's floor (CVE-2025-66418).
 _BODY_ERRORS = {
     urllib3.exceptions.ProtocolError: requests.exceptions.ChunkedEncodingError,
+    urllib3.exceptions.DecodeError: requests.exceptions.ContentDecodingError,
     urllib3.exceptions.ReadTimeoutError: requests.ConnectionError,
     urllib3.exceptions.SSLError: requests.exceptions.SSLError,
 }
@@ -1800,7 +1803,9 @@ def _drained_redirect(response, **kwargs):
     urllib3 raises it. Read here first, the body leaves nothing for
     requests to decode or read.
 
-    An error of urllib3 as it reads is raised as the error of requests
+    After an error of urllib3 as it reads, the refusal of the content
+    encodings its head names included, the redirect is closed, its
+    connection with it, and the error is raised as the error of requests
     Response.iter_content raises for it (_BODY_ERRORS), with the redirect
     as its response: the call reports it as an error of the body of any
     answer, a body that stops coming as the read timeout's, one cut off as
@@ -1814,6 +1819,11 @@ def _drained_redirect(response, **kwargs):
         except tuple(_BODY_ERRORS) as error:
             cause = error
         if cause is not None:
+            # urllib3 closes the connection after an error as it reads, but
+            # not after its refusal of the content encodings, which comes
+            # before the read: closed here, after any of them, the redirect
+            # leaves no socket to the garbage collector.
+            response.close()
             stands_for = next(
                 instead
                 for raised, instead in _BODY_ERRORS.items()
