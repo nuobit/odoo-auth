@@ -3782,18 +3782,15 @@ class CliTest(StubTestCase):
         self.assertEqual((self.xmlrpc_odoo.logins, self.json2_odoo.requests), (0, []))
 
     def test_json_python_cannot_read_ends_as_one_message(self):
-        # Errors of json other than a JSONDecodeError. Python refuses an int
-        # longer than 4300 digits from 3.10.7 on and converts it before, so
-        # json's ValueError for it, as 3.11 words it, is raised here.
-        too_long = ValueError(
-            "Exceeds the limit (4300 digits) for integer string conversion: value "
-            "has 5000 digits; use sys.set_int_max_str_digits() to increase the limit"
+        # Errors of json other than a JSONDecodeError. An int longer than the
+        # interpreter converts, under its default limit, set here as the
+        # environment can change it, and given back after the test.
+        self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
+        sys.set_int_max_str_digits(4300)
+        result = self.run_cli(
+            "erp-xmlrpc",
+            '{"model": "res.partner", "method": "read", "ids": [' + "1" * 5000 + "]}",
         )
-        with mock.patch("json.loads", side_effect=too_long):
-            result = self.run_cli(
-                "erp-xmlrpc",
-                '{"model": "res.partner", "method": "read", "ids": [' + "1" * 5000 + "]}",
-            )
         self.assertEqual(
             result,
             (
