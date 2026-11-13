@@ -32,18 +32,22 @@ installing 2.0. `api = xmlrpc` keeps a profile working as before.
 What else a 1.x caller meets:
 
 - Python 3.11.8 or later, but not 3.12.0 or 3.12.1, and `requests`
-  2.32.3 and `urllib3` 2.3.0 or later, which must be importable whatever
+  2.32.3 and `urllib3` 2.6.0 or later, which must be importable whatever
   the profile's API: the client imports them when it is imported.
   `pip install` brings them; a script that puts the source checkout on
-  `sys.path` or `PYTHONPATH` needs them in its own environment. The suite
-  runs on Python 3.11.13 with requests 2.34.2 and urllib3 2.8.0, and on
-  Python 3.13.5 with requests 2.32.3 and urllib3 2.3.0. From 3.11.8 and
-  3.12.2, `ssl.SSLContext.wrap_socket` closes the TLS socket it makes
-  after anything its handshake raises, an interrupt such as Ctrl-C among
-  them, where earlier releases close it only after an `OSError` or a
-  `ValueError`; a `Client` relies on it to leave no socket open when a
-  handshake fails or is interrupted (an interrupt in the few steps of
-  `ssl` before the handshake starts is another matter: § Library usage).
+  `sys.path` or `PYTHONPATH` needs them in its own environment. From
+  Python 3.11.8 and 3.12.2, `ssl.SSLContext.wrap_socket` closes the TLS
+  socket it makes after anything its handshake raises, an interrupt such
+  as Ctrl-C among them, where earlier releases close it only after an
+  `OSError` or a `ValueError`; a `Client` relies on it to leave no socket
+  open when a handshake fails or is interrupted (an interrupt in the few
+  steps of `ssl` before the handshake starts is another matter: § Library
+  usage). From 2.6.0, `urllib3` refuses an answer whose head chains more
+  than five content encodings (CVE-2025-66418), which a `Client` relies on
+  too (§ Errors). The suite runs on Python 3.11.13 with requests 2.34.2
+  and urllib3 2.8.0 or 2.6.0, and on Python 3.13.5 with requests 2.32.3
+  or 2.34.2 and Debian's urllib3 2.3.0, whose `2.3.0-3+deb13u1` and later
+  carry that refusal as a backport.
 - A profile is refused too when its `url` holds a backslash, port 0, a
   query or a fragment, or a host IDNA refuses, or when its `url`, `db`,
   `user` or `api` holds its `password` (§ Configure a profile).
@@ -371,7 +375,9 @@ down, in `_password`, which stays readable as in 1.x. The errors:
   too, even one that fails to open, and for a redirect's body: a redirect,
   such as a 303, can answer a request the server processed. `Client`
   reads a redirect's body as it comes, undecoded, and drops it; one that
-  cannot be read whole (stopping, breaking off, in bad chunks) ends the
+  cannot be read whole (stopping, breaking off, in bad chunks, or under a
+  head naming more content encodings than `urllib3` chains, five from
+  2.6.0, which it refuses before it reads) ends the
   call as the body of any answer does, with the redirect's status as its
   `code`, but after the read timeout, which leaves it `None`, and the
   redirect is not followed. A failure before anything
@@ -600,8 +606,8 @@ anything is sent, which refuses any other origin.
 
 - **python3 >= 3.11.8**, other than 3.12.0 and 3.12.1 (§ Upgrading to 2.0
   says why)
-- **requests >= 2.32.3** and **urllib3 >= 2.3.0**, which the client imports
-  whatever the profile's API
+- **requests >= 2.32.3** and **urllib3 >= 2.6.0**, which the client imports
+  whatever the profile's API (§ Upgrading to 2.0 says why that urllib3)
 
 ## License
 

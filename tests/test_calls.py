@@ -1605,6 +1605,52 @@ class Json2ClientTest(StubTestCase):
         self.assertNeverShows(error, KEY)
         self.assertNoFrameHolds(error, KEY)
 
+    def test_a_redirects_body_under_too_many_encodings_says_the_call_may_have_run(self):
+        # Its head names more content encodings than urllib3 chains, five from
+        # 2.6.0, the library's floor, and in Debian's 2.3.0 from its
+        # 2.3.0-3+deb13u1: urllib3 refuses them as it sets up its decoder,
+        # before it reads the body, undecoded too, and its DecodeError
+        # reached the call as it is, without the redirect's status. As
+        # requests raises it for the body of any answer, it is a
+        # ContentDecodingError. urllib3 does not close the connection after
+        # that refusal: the redirect is closed as the call ends, its socket
+        # with it. It is held as requests' adapter returns it, before the
+        # session's hook reads it, as a traceback or a debugger can hold it,
+        # so that only its close lets its socket go, not the garbage
+        # collector.
+        held = []
+        send = requests.adapters.HTTPAdapter.send
+
+        def holding(adapter, request, **kwargs):
+            held.append(send(adapter, request, **kwargs))
+            return held[-1]
+
+        patcher = mock.patch.object(requests.adapters.HTTPAdapter, "send", holding)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        opened = self.record_sockets(urllib3.util.connection)
+        self.redirect_with_body(
+            b"Content-Encoding: gzip, gzip, gzip, gzip, gzip, gzip\r\n"
+            b"Content-Length: 4\r\n",
+            b"abcd",
+        )
+        error = self.raised(
+            RequestError, lambda: self.client.call("res.partner", "write", [7], vals={})
+        )
+        self.assertIsInstance(error, requests.exceptions.ContentDecodingError)
+        self.assertEqual(
+            str(error),
+            "A request of profile 'erp' failed: ContentDecodingError, code 303. It "
+            "failed after the call started to go out: the server may have run the "
+            "call, so do not repeat it before reading back what it did. Its message "
+            "is not shown, as it can quote the profile's values.",
+        )
+        self.assertEqual([request["method"] for request in self.odoo.requests], ["POST"])
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
+        self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+        self.assertEqual((len(held), len(opened)), (1, 1))
+
     def test_a_redirects_body_in_bad_chunks_says_the_call_may_have_run(self):
         # As the body of any answer that is not Odoo's: the connection
         # brought it whole. A redirect whose body cannot be read is not
