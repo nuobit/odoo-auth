@@ -1174,22 +1174,24 @@ class Json2ClientTest(StubTestCase):
                 self.odoo.answers[("res.partner", "read")] = Answer(
                     status, b"", {"Location": target}
                 )
-                with self.assertRaises(RequestError) as caught:
-                    self.client.call("res.partner", "read", [7])
-                self.assertIsInstance(caught.exception, RedirectError)
-                self.assertEqual(caught.exception.code, status)
+                error = self.raised(
+                    RequestError, lambda: self.client.call("res.partner", "read", [7])
+                )
+                self.assertIsInstance(error, RedirectError)
+                self.assertEqual(error.code, status)
                 # The call went out, and the redirect, no answer of Odoo's
                 # own, answered it.
                 self.assertEqual(
-                    str(caught.exception),
+                    str(error),
                     f"A request of profile 'erp' failed: RedirectError, code {status}. "
                     "It failed after the call started to go out: the server may have "
                     "run the call, so do not repeat it before reading back what it did. "
                     "Its message is not shown, as it can quote the profile's values.",
                 )
-                self.assertIsNone(caught.exception.request)
-                self.assertIsNone(caught.exception.response)
-                self.assertNeverShows(caught.exception, KEY)
+                self.assertIsNone(error.request)
+                self.assertIsNone(error.response)
+                self.assertNeverShows(error, KEY)
+                self.assertNoFrameHolds(error, KEY)
         self.assertEqual(elsewhere.requests, [])
 
     def test_an_error_of_urllib3_that_requests_lets_through_is_a_request_error(self):
@@ -1471,8 +1473,11 @@ class Json2ClientTest(StubTestCase):
         self.odoo.answers[("res.partner", "read")] = Answer(
             307, b"", {"Location": "http://127.0.0.1:notaport/json/2/res.partner/read"}
         )
-        with self.assertRaises(RedirectError):
-            self.client.call("res.partner", "read", [7])
+        error = self.raised(
+            RedirectError, lambda: self.client.call("res.partner", "read", [7])
+        )
+        self.assertNeverShows(error, KEY)
+        self.assertNoFrameHolds(error, KEY)
 
     def test_a_redirect_to_a_location_that_is_not_a_url_is_refused(self):
         # The answer of a redirect it refuses is closed, its socket with it.
