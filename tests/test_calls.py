@@ -2691,6 +2691,30 @@ class KeptConnectionTest(StubTestCase):
                 odoo.stop()
                 self.assertCountEqual(odoo.requests, received)
 
+    def test_an_interrupted_answer_that_closes_its_connection_closes_its_socket(self):
+        # The test above on an answer that closes its connection, as each of
+        # RawXmlRpc's does (HTTP/1.0): http.client hands the answer its socket,
+        # which the connection's close does not reach. An interrupt as
+        # xmlrpc.client reads the call's answer, the second it reads after
+        # the login's, leaves no socket open, the login's and the call's,
+        # while the interrupt is held with the frames of its traceback, which
+        # hold the answer. The next call works.
+        stub = self.start(RawXmlRpc())
+        stub.call_answer = Answer(
+            200,
+            xmlrpc.client.dumps(([1, 2, 3],), methodresponse=True).encode(),
+            {"Content-Type": "text/xml"},
+        )
+        opened = self.record_sockets(socket)
+        client = self.make_client(stub.url, "xmlrpc", PASSWORD)
+        interrupt = KeyboardInterrupt()
+        with self.interrupted_at(xmlrpc.client.Transport, "parse_response", 2, interrupt):
+            error = self.raised(KeyboardInterrupt, lambda: client.call("res.partner", "read", [7]))
+        self.assertIs(error, interrupt)
+        self.assertEqual(len(opened), 2)
+        self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+        self.assertEqual(client.call("res.partner", "read", [7]), [1, 2, 3])
+
     def test_an_interrupted_json2_call_closes_what_it_opened(self):
         # The test above over JSON-2, at each step of a call, on an answer
         # that keeps its connection and on one that closes it, whose socket
