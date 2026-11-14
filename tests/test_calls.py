@@ -3892,16 +3892,20 @@ def close_after_hold(test, closable):
 
 class HeldXmlRpcCall(RawXmlRpc):
     """RawXmlRpc that answers the login and holds the call, unanswered,
-    until the test releases it, or HOLD seconds have passed."""
+    until the test releases it, or HOLD seconds have passed. ``holding`` is
+    set once the call it holds is recorded in ``requests``."""
 
     def __init__(self):
         self.released = threading.Event()
+        self.holding = threading.Event()
         super().__init__()
 
     def answer(self, request):
         if request["path"] == "/xmlrpc/2/common":
             answer = self.login_answer
         else:
+            # HttpRecorder records each request before it asks for its answer.
+            self.holding.set()
             self.released.wait(HOLD)
             answer = None
         return answer
@@ -4121,28 +4125,34 @@ class TimeoutTest(StubTestCase):
             "an xmlrpc call": (held_call.url, "xmlrpc", PASSWORD, socket.timeout, "TimeoutError"),
             "a json2 call": (held, "json2", KEY, requests.ReadTimeout, "ReadTimeout"),
         }
-        for case, (url, api, secret, original, name) in cases.items():
-            with self.subTest(case=case):
-                self.make_profile(url, api, secret)
-                with Client("erp", timeout=(5, 0.2)) as client:
-                    error = self.raised(
-                        RequestError,
-                        lambda: client.call("res.partner", "search_count", domain=[]),
+        # The XML-RPC login is replaced: it goes out under the same read
+        # timeout, and its answer, should it come later than that on a loaded
+        # machine, would make the timeout fire at the login. JSON-2 has none.
+        with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", return_value=UID):
+            for case, (url, api, secret, original, name) in cases.items():
+                with self.subTest(case=case):
+                    self.make_profile(url, api, secret)
+                    with Client("erp", timeout=(5, 0.2)) as client:
+                        error = self.raised(
+                            RequestError,
+                            lambda: client.call("res.partner", "search_count", domain=[]),
+                        )
+                    self.assertIsInstance(error, original)
+                    self.assertEqual(error.timeout_fired, "read")
+                    self.assertEqual(
+                        str(error),
+                        f"A request of profile 'erp' failed: {name}. The read timeout "
+                        "fired: the server may still complete the call, so do not "
+                        "repeat it before reading back what it did. Its message is "
+                        "not shown, as it can quote the profile's values.",
                     )
-                self.assertIsInstance(error, original)
-                self.assertEqual(error.timeout_fired, "read")
-                self.assertEqual(
-                    str(error),
-                    f"A request of profile 'erp' failed: {name}. The read timeout "
-                    "fired: the server may still complete the call, so do not "
-                    "repeat it before reading back what it did. Its message is "
-                    "not shown, as it can quote the profile's values.",
-                )
-                self.assertNeverShows(error, secret)
-                self.assertNoFrameHolds(error, secret)
+                    self.assertNeverShows(error, secret)
+                    self.assertNoFrameHolds(error, secret)
+        # The stub's thread records the call it holds: the client's timeout
+        # can fire before that thread ran.
+        self.assertTrue(held_call.holding.wait(HOLD))
         self.assertEqual(
-            [request["path"] for request in held_call.requests],
-            ["/xmlrpc/2/common", "/xmlrpc/2/object"],
+            [request["path"] for request in held_call.requests], ["/xmlrpc/2/object"]
         )
 
     def test_a_read_timeout_at_the_xmlrpc_login_says_the_call_was_not_sent(self):
@@ -4166,6 +4176,11 @@ class TimeoutTest(StubTestCase):
         self.assertNoFrameHolds(error, PASSWORD)
 
     def test_a_json2_answer_whose_body_stops_coming_is_a_read_timeout(self):
+        # The read timeout waits for the answer's head (wait_for_heads): it
+        # fires for the body alone, which stops, however late the head comes
+        # on a loaded machine. A head that came after it was requests'
+        # ReadTimeout, no error of the body.
+        self.wait_for_heads()
         half = self.start(HalfAnswer())
         self.make_profile(half.url, "json2", KEY)
         with Client("erp", timeout=(5, 0.2)) as client:
