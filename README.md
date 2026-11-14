@@ -40,14 +40,15 @@ What else a 1.x caller meets:
   socket it makes after anything its handshake raises, an interrupt such
   as Ctrl-C among them, where earlier releases close it only after an
   `OSError` or a `ValueError`; a `Client` relies on it to leave no socket
-  open when a handshake fails or is interrupted (an interrupt in the few
-  steps of `ssl` before the handshake starts is another matter: § Library
-  usage). From 2.6.0, `urllib3` refuses an answer whose head chains more
-  than five content encodings (CVE-2025-66418), which a `Client` relies on
-  too (§ Errors). The suite runs on Python 3.11.13 with requests 2.34.2
-  and urllib3 2.8.0 or 2.6.0, and on Python 3.13.5 with requests 2.32.3
-  or 2.34.2 and Debian's urllib3 2.3.0, whose `2.3.0-3+deb13u1` and later
-  carry that refusal as a backport.
+  open when a handshake fails or is interrupted (an interrupt, a
+  `MemoryError` or a `RecursionError` in the few steps of `ssl` before the
+  handshake starts is another matter: § Library usage). From 2.6.0,
+  `urllib3` refuses an answer whose head chains more than five content
+  encodings (CVE-2025-66418), which a `Client` relies on too (§ Errors).
+  The suite runs on Python 3.11.13 with requests 2.34.2 and urllib3 2.8.0
+  or 2.6.0, and on Python 3.13.5 with requests 2.32.3 or 2.34.2 and
+  Debian's urllib3 2.3.0, whose `2.3.0-3+deb13u1` and later carry that
+  refusal as a backport.
 - A profile is refused too when its `url` holds a backslash, port 0, a
   query or a fragment, or a host IDNA refuses, or when its `url`, `db`,
   `user` or `api` holds its `password` (§ Configure a profile).
@@ -243,31 +244,67 @@ A `Client` keeps its connection open from one call to the next, over both
 APIs, and checks it before a request goes out on it, as `urllib3` checks a
 connection of its pool: when the server has closed it since its last
 answer, the request goes out on a new connection. After a failure of the
-connection it keeps none, and leaves no socket open, but for two cases,
-each in a few steps of the code that opens the connection, before the
-connection holds what that code makes:
+connection it keeps none, nor after a close of it that one of the three
+errors below cut short, and leaves no socket open, but for four cases,
+each where one of the three errors the library lets through as they are
+(an interrupt such as Ctrl-C, a `MemoryError`, or a `RecursionError` from
+the caller's own deep stack, § Errors) comes in a few steps of the code of
+Python or `urllib3` that the library runs unchanged. Each leaves the same
+state, whichever of the three it is:
 
 - The TCP connect. `socket.create_connection` (XML-RPC) and `urllib3`'s
   (JSON-2) close the socket they make only after an `OSError`, and the
   connection holds that socket only once it comes back to the
-  connection's `connect`. An interrupt such as Ctrl-C that lands from the
-  socket's creation to that moment, in the TCP connect above all, leaves
-  the socket to Python's garbage collector, which closes it with a
+  connection's `connect`. One of the three that comes from the socket's
+  creation to that moment, an interrupt in the TCP connect above all,
+  leaves the socket to Python's garbage collector, which closes it with a
   `ResourceWarning`. An interrupted connect goes on in the system, so the
   socket may end up connected. Nothing of the request was sent on it: the
-  call raises the same interrupt, and the next call works.
+  call raises the same error, and the next call works.
 - The start of the TLS handshake, over https. Python's `ssl` makes its TLS
   socket on the TCP socket's file descriptor, then detaches the TCP
   socket, and only then enters the `try` whose bare `except` closes the
   TLS socket after anything the handshake raises (`SSLSocket._create`).
-  An interrupt in those few steps leaves the TLS socket to the garbage
+  One of the three in those few steps leaves the TLS socket to the garbage
   collector, which closes its descriptor later, with a `ResourceWarning`.
   Before the detach, the connection's close has closed that descriptor
   already, through the TCP socket: by the time the collector closes it
   again, the process may have given that number to another file or
   socket, a later call's connection among them, and that close fails
   (`EBADF`) or closes the other one under its owner. Nothing of the
-  request was sent: the call raises the same interrupt.
+  request was sent: the call raises the same error.
+- The answer's file, over both APIs. Once the request has gone out,
+  `http.client` makes its answer (`HTTPConnection.getresponse`), which
+  first makes a file on the socket (`socket.makefile`): the socket counts
+  the file before it hands it back, and the socket's close then waits for
+  the file's. One of the three inside `socket.makefile`, once it counted
+  the file and before it hands the file back, such as a `MemoryError` as
+  it makes the file's buffer, comes before anything can close that file:
+  the connection's close leaves the socket open, after `Client.close()`
+  too, until the error's traceback is collected, as its frames hold the
+  file. (Once `socket.makefile` has handed the file back, an error leaves
+  no file open: the file is freed as the frame unwinds, or the answer
+  holds it, and the answer's making closes it.) The socket then closes
+  without a warning when reference counting frees the traceback. When the
+  garbage collector frees the traceback in a reference cycle, the socket
+  closes with a `ResourceWarning` if the same collection takes the socket,
+  and without one if the socket outlived an earlier collection and a
+  younger one frees the cycle. The request went out: the server may have
+  run it. The call raises the same error.
+- The check of a kept connection, over JSON-2. `urllib3` takes a kept
+  connection out of its pool, then checks it before it reuses it
+  (`HTTPConnectionPool._get_conn`, `is_connection_dropped`). One of the
+  three in that check, or in the few steps of `_get_conn` around it, such
+  as a `RecursionError` in the calls that check makes, leaves the
+  connection out of the pool, held at most by the frames of the error's
+  traceback, with its socket open, but for a connection closed before it
+  went back to the pool, as after an answer that closed it, which has no
+  socket, and for one the check found closed by the server, once the
+  check's close of it closed its socket. `Client.close()` closes it, and
+  if nothing holds it any more before then, as once that traceback is
+  collected, Python's garbage collector closes its socket then, if open,
+  with a `ResourceWarning`. Nothing of the request was sent on it: the
+  call raises the same error.
 
 Each request goes out once, never again by itself after a failure
 ([Errors](#errors)).
@@ -488,7 +525,18 @@ result or Odoo's `Fault`. Over JSON-2 it first closes every answer the
 call got, its socket and the connection it still holds with it,
 whichever step of `urllib3`, `requests` or the library the error stopped:
 an answer read whole has given its connection back for the next call.
-(Raised while `Client` encodes a
+These closes do not reach what one of them leaves in the four cases of
+§ Library usage. One of them in `Client.close()` goes on as it is, over
+JSON-2 too, where the client takes the pools of `urllib3` from their pool
+managers, closes the session of `requests`, which drops them from those
+managers, then closes each pool itself, rather than leave its connections
+to the pool's finalizer: `urllib3` 2 closes a dropped pool's connections
+in the pool's finalizer, as the pool is collected, where Python reports
+such an error as ignored («Exception ignored» on stderr) and stops it.
+A closed pool's finalizer still runs as the pool is collected, once
+`Client.close()` has closed everything, and finds nothing left to close:
+one of the three that comes inside it stops there all the same. (Raised
+while `Client` encodes a
 call's values, a `RecursionError` is an `ArgumentError`, above, even when
 the caller's deep stack caused it. Raised while it reads the JSON of an
 answer over JSON-2, it makes the answer one that is not JSON, even when

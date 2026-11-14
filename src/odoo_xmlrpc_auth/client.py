@@ -1104,6 +1104,82 @@ class _TimedConnection:
         self.sock.settimeout(self._read_timeout)
 
 
+class _HTTPResponse(http.client.HTTPResponse):
+    """http.client's answer, for Client's connections over both APIs
+    (_AnswerClosing): one whose making fails in its try is closed, with the
+    file it made on the socket once it holds it, and its close closes that
+    file, whoever forgot it.
+
+    The answer's file holds the socket: the socket's close waits for the
+    file's (socket.makefile). The answer is made before http.client's try
+    that closes it after a failure (HTTPConnection.getresponse), and
+    http.client closes none whose making fails: an error in the making, once
+    the answer holds the file, such as an interrupt (Ctrl-C), a MemoryError
+    or a RecursionError, would leave the half-made answer to the frames of
+    the error's traceback, and the socket open after the connection's close
+    for as long as they live.
+
+    http.client forgets the answer's file, then closes it
+    (HTTPResponse._close_conn), at the end of every body it reads and in the
+    answer's close: an interrupt, a MemoryError or a RecursionError between
+    the two would leave the file open, and the socket with it, held only by
+    the frames of its traceback, after Client.close() too. The answer keeps
+    its file from the end of its making, and its close closes it once
+    http.client's close has run, whatever that did: the connection's close
+    reaches the answer (_AnswerClosing), and so does urllib3's answer after
+    a failure as it reads (HTTPResponse._error_catcher).
+
+    The making sets the answer's file, ``fp``, first, and http.client's
+    close reads it (HTTPResponse.__init__, HTTPResponse.close). Until it is
+    set, the answer reads the class's None, as it does once closed, and so
+    does the file it keeps until its making ends: the close of an answer
+    whose making stopped before it held its file closes nothing and raises
+    nothing, here or in IOBase's finalizer, which closes an answer still
+    open as it is collected, such as one whose making stopped before this
+    try, and reports whatever a close raises through sys.unraisablehook from
+    Python 3.13, and before in Python's development mode (-X dev) and its
+    debug builds ("Exception ignored" on stderr).
+
+    An interrupt, a MemoryError or a RecursionError inside socket.makefile,
+    once the socket counted the file and before makefile hands it back, as
+    the file's buffer is made, comes before the answer holds the file, and
+    nothing here can close it: the socket stays open after the connection's
+    close, Client.close()'s too, until the frames of the error's traceback,
+    which hold the file, are collected. When reference counting frees the
+    traceback, the file's close closes the socket, without a warning. When
+    the garbage collector frees it in a reference cycle, and the same
+    collection takes the socket, the socket's own finalizer comes before
+    the file's close, and closes it with a ResourceWarning; a socket that
+    outlived an earlier collection is left out of a younger one that frees
+    the cycle, and the file's close closes it, without a warning. The
+    request went out by then. It is left so: only reaching under the
+    socket's count of its files would close it, by detaching and closing
+    its descriptor or by clearing those frames."""
+
+    # The answer's file until the making sets it: none (above).
+    fp = None
+    # The answer's file, kept until the answer's close closes it: none until
+    # the making ends (above).
+    _file = None
+
+    def __init__(self, *args, **kwargs):
+        try:
+            super().__init__(*args, **kwargs)
+            self._file = self.fp
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        # http.client's close flushes the file it still holds, and a closed
+        # file refuses that: the file is closed after it.
+        try:
+            super().close()
+        finally:
+            if self._file is not None:
+                self._file.close()
+
+
 class _AnswerClosing(http.client.HTTPConnection):
     """For Client's connections, over both APIs: closing one closes the
     answer http.client gave last on it too. When the connection closes
@@ -1112,12 +1188,22 @@ class _AnswerClosing(http.client.HTTPConnection):
     reaches it. xmlrpc.client does not close an answer it fails to read,
     and urllib3, after a failure before its own answer wraps http.client's,
     closes the connection only (HTTPConnectionPool.urlopen): closed after
-    a failure, a connection then leaves no answer's socket open.
+    a failure, a connection then leaves no answer's socket open, but that
+    of an answer whose making an interrupt, a MemoryError or a
+    RecursionError stopped inside socket.makefile, once the socket counted
+    the answer's file: that socket closes as the error's traceback is
+    collected, with a ResourceWarning only when the garbage collector frees
+    the traceback in a reference cycle and the socket in the same
+    collection (_HTTPResponse). Its answers are _HTTPResponse, through the
+    class http.client makes them of (response_class).
 
     It wraps http.client's own getresponse and close, which urllib3's
     connection calls through super(): a connection of JSON-2 lists it after
-    urllib3's class, so that it comes between the two."""
+    urllib3's class, so that it comes between the two. It keeps the answer
+    until its close has closed it; the connection's socket is closed before,
+    ahead of urllib3's close (_SocketClosing)."""
 
+    response_class = _HTTPResponse
     _answer = None
 
     def getresponse(self):
@@ -1205,18 +1291,51 @@ class _Quiet:
     debuglevel = 0
 
 
+class _SocketClosing:
+    """For Client's connections, over both APIs: the connection's close
+    closes its socket, then forgets it, before the closes it comes before.
+    http.client's forgets the socket, then closes it (HTTPConnection.close),
+    and urllib3's, which calls it, forgets it in a finally whatever that
+    close did (HTTPConnection.close). An interrupt such as Ctrl-C, a
+    MemoryError or a RecursionError between a forget and its close, in the
+    check of a kept connection before reuse, in the close of the login's
+    connection or as http.client closes the connection of an answer that
+    closes it (HTTPConnection.getresponse), would leave the socket open,
+    held only by the frames of the error's traceback, after Client.close()
+    too. The connection keeps its socket until it is closed, so that the
+    next close, Client.close()'s among them, reaches it. Each of Client's
+    connections lists it first: urllib3's close comes before _AnswerClosing
+    in a connection of JSON-2. ServerProxy's connections keep http.client's
+    close: ServerProxy keeps xmlrpc.client's transport, whose close forgets
+    the connection before it closes it (Transport.close)."""
+
+    def close(self):
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
+        super().close()
+
+
 class _HTTPConnection(
-    _Quiet, _AnswerClosing, _TimedConnection, http.client.HTTPConnection
+    _SocketClosing,
+    _Quiet,
+    _AnswerClosing,
+    _TimedConnection,
+    http.client.HTTPConnection,
 ):
-    """http.client's connection for http, with _AnswerClosing and
-    _TimedConnection."""
+    """http.client's connection for http, with _SocketClosing,
+    _AnswerClosing and _TimedConnection."""
 
 
 class _HTTPSConnection(
-    _Quiet, _AnswerClosing, _TimedConnection, http.client.HTTPSConnection
+    _SocketClosing,
+    _Quiet,
+    _AnswerClosing,
+    _TimedConnection,
+    http.client.HTTPSConnection,
 ):
-    """http.client's connection for https, with _AnswerClosing and
-    _TimedConnection."""
+    """http.client's connection for https, with _SocketClosing,
+    _AnswerClosing and _TimedConnection."""
 
 
 class _ProxyHTTPConnection(_Quiet, http.client.HTTPConnection):
@@ -1288,58 +1407,94 @@ class _Sending:
     server may have read the request. After any failure, whatever it
     raises, an interrupt such as Ctrl-C among them, in the check of the
     kept connection too, the connection is closed before the error goes on,
-    unchanged, and no socket of it is left open. A Fault, Odoo's own
-    answer, read whole, keeps it, as any answer does.
+    unchanged, and no socket of it is left open, but in the three cases
+    below. A Fault, Odoo's own answer, read whole, keeps it, as any answer
+    does.
 
     The transport's close closes the kept connection before xmlrpc.client's
     forgets it (Transport.close, which forgets it first, then closes it):
-    in xmlrpc.client's order, an interrupt between the two, as the check
-    finds the connection closed by the server, or as the login's
-    ServerProxy closes it, would leave the connection open, held only by
-    the frames of the interrupt's traceback, after Client.close() too.
+    in xmlrpc.client's order, an interrupt, a MemoryError or a
+    RecursionError between the two, as the check finds the connection
+    closed by the server, or as the login's ServerProxy closes it, would
+    leave the connection open, held only by the frames of the error's
+    traceback, after Client.close() too. The connection's own close closes
+    its socket before it forgets it (_SocketClosing), and the answer's close
+    its file (_HTTPResponse).
 
-    An interrupt from the moment socket.create_connection makes its
-    socket to the moment that function returns it to the connection's
-    connect, in the TCP connect above all, leaves that socket to the
-    garbage collector: that function closes it only after an OSError, and
-    the connection, whose sock http.client sets then, never got it. An
-    interrupted connect goes on in the system, so the socket may end up
-    connected; nothing of the request went out on it, and the next request
-    goes out on a new connection. Over https, the close does not reach the
-    TLS socket ssl makes on the TCP socket's descriptor either, in the few
-    steps before the try that closes it after anything the handshake raises
-    (SSLSocket._create, which detaches the TCP socket on the way): an
-    interrupt there leaves it to the garbage collector, whose close of the
-    descriptor comes later, after the connection's own when the interrupt
-    came before the detach, by then perhaps another file's or socket's.
+    A close that one of those errors cuts short leaves the connection kept,
+    partly closed: its socket closed but not forgotten, which the check
+    before reuse cannot read (wait_for_read raises ValueError for its fileno
+    of -1), or forgotten while http.client still holds the state of an
+    unfinished request or an answer not read. So does a request that fails
+    before the close after it is done. The kept connection carries the next
+    request only once a request on it has ended and no close of it has
+    started since (_reusable): otherwise the next request closes it first,
+    which completes what the close cut short did not do, and goes out on a
+    new connection.
+
+    Each of the three cases below is left by an interrupt such as Ctrl-C,
+    a MemoryError or a RecursionError, the errors the library lets through
+    as they are. One of them from the moment socket.create_connection makes
+    its socket to the moment that function returns it to the connection's
+    connect, an interrupt in the TCP connect above all, leaves that socket
+    to the garbage collector: that function closes it only after an
+    OSError, and the connection, whose sock http.client sets then, never got
+    it. An interrupted connect goes on in the system, so the socket may end
+    up connected; nothing of the request went out on it, and the next
+    request goes out on a new connection. Over https, the close does not
+    reach the TLS socket ssl makes on the TCP socket's descriptor either, in
+    the few steps before the try that closes it after anything the
+    handshake raises (SSLSocket._create, which detaches the TCP socket on
+    the way): one of them there leaves it to the garbage collector, whose
+    close of the descriptor comes later, after the connection's own when
+    the error came before the detach, by then perhaps another file's or
+    socket's. Nor does the close reach the socket of an answer whose making
+    one of them stopped inside socket.makefile, once the socket counted the
+    answer's file (_HTTPResponse): it stays open until the error's
+    traceback is collected, and the request went out on it. It closes then,
+    with a ResourceWarning only when the garbage collector frees the
+    traceback in a reference cycle and the socket in the same collection.
 
     ServerProxy keeps xmlrpc.client's own sending: it writes a request on
     its kept connection unchecked, and sends it again after those errors."""
 
+    # Whether the kept connection may carry the next request (above): a new
+    # transport's first request makes a new connection.
+    _reusable = True
+
     def close(self):
+        # Until the close has run whole, the kept connection carries no
+        # request (_reusable).
+        self._reusable = False
         # xmlrpc.client's close forgets the kept connection, then closes it
         # (Transport.close). Closed here first, it stays kept until it is.
         connection = self._connection[1]
         if connection is not None:
             connection.close()
         super().close()
+        # Forgotten: the next request makes a new connection.
+        self._reusable = True
 
     def request(self, host, handler, request_body, verbose=False):
         try:
             connection = self.make_connection(host)
             # Readable before a request: at its end, or holding what no
             # request asked for. No answer to this request can come on it.
-            if connection.sock is not None and urllib3.util.wait_for_read(
-                connection.sock, timeout=0.0
+            if not self._reusable or (
+                connection.sock is not None
+                and urllib3.util.wait_for_read(connection.sock, timeout=0.0)
             ):
                 self.close()
                 connection = self.make_connection(host)
+            # Until this request ends, the connection carries no other.
+            self._reusable = False
             if connection.sock is None:
                 connection.connect()
             answer = self._answer(host, handler, request_body, verbose)
         except xmlrpc.client.Fault:
             # Read whole, at status 200: the connection is ready for the
             # next request.
+            self._reusable = True
             raise
         except BaseException:
             # Anything else leaves the connection unfit for the next request,
@@ -1358,13 +1513,15 @@ class _Sending:
             # handshake raises, from Python 3.11.8 and 3.12.2
             # (SSLSocket._create): the reason the library requires 3.11.8 or
             # later, but not 3.12.0 or 3.12.1. ssl makes it a few steps before
-            # the try that closes it, and an interrupt in those steps leaves
-            # it to the garbage collector (_Sending). An interrupted send
+            # the try that closes it, and an interrupt, a MemoryError or a
+            # RecursionError in those steps leaves it to the garbage
+            # collector (_Sending). An interrupted send
             # leaves the connection in the middle of a request. The connection
             # is closed here, with the answer it handed its socket to
             # (_AnswerClosing), and the error goes on as it is.
             self.close()
             raise
+        self._reusable = True
         return answer
 
     def _answer(self, host, handler, request_body, verbose):
@@ -1830,11 +1987,17 @@ class _ConnectionRecording:
     urllib3 keeps a connection in its pool from one call to the next, and
     takes it out of the pool to check it before it reuses it
     (HTTPConnectionPool._get_conn, is_connection_dropped): an interrupt
-    there left the connection out of the pool, held only by the frames of
-    the interrupt's traceback, and its socket open after Client.close().
-    A pool that requests' close drops also keeps its connections until it
-    is collected (urllib3 2's PoolManager.clear), which the traceback of an
-    interrupt in urllib3's own steps delays as long as it lives."""
+    such as Ctrl-C, a MemoryError or a RecursionError there leaves the
+    connection out of the pool, held at most by the frames of the error's
+    traceback, with its socket open, but for a connection closed before it
+    went back to the pool, which has no socket, and for one the check found
+    closed by the server, once the check's close of it closed its socket
+    (_SocketClosing). The close of requests' session, which drops the
+    pools, does not reach it: Client.close() closes it through this record,
+    which keeps it only while something else holds it. A client not closed
+    by the time nothing does, as once those frames are collected, leaves
+    it to the garbage collector. Client.close() closes the session's pools
+    themselves too, with the connections they keep (_Json2.close)."""
 
     def connect(self):
         _CLIENT_CONNECTIONS.get().add(self)
@@ -1842,6 +2005,7 @@ class _ConnectionRecording:
 
 
 class _Json2HTTPConnection(
+    _SocketClosing,
     _ConnectionRecording,
     _AnswerRecording,
     _MarkedSending,
@@ -1849,11 +2013,13 @@ class _Json2HTTPConnection(
     urllib3.connection.HTTPConnection,
     _AnswerClosing,
 ):
-    """urllib3's connection for http, for JSON-2, with _ConnectionRecording,
-    _AnswerRecording, _MarkedSending and _AnswerClosing."""
+    """urllib3's connection for http, for JSON-2, with _SocketClosing,
+    _ConnectionRecording, _AnswerRecording, _MarkedSending and
+    _AnswerClosing."""
 
 
 class _Json2HTTPSConnection(
+    _SocketClosing,
     _ConnectionRecording,
     _AnswerRecording,
     _MarkedSending,
@@ -1861,8 +2027,9 @@ class _Json2HTTPSConnection(
     urllib3.connection.HTTPSConnection,
     _AnswerClosing,
 ):
-    """urllib3's connection for https, for JSON-2, with _ConnectionRecording,
-    _AnswerRecording, _MarkedSending and _AnswerClosing."""
+    """urllib3's connection for https, for JSON-2, with _SocketClosing,
+    _ConnectionRecording, _AnswerRecording, _MarkedSending and
+    _AnswerClosing."""
 
 
 class _Json2HTTPConnectionPool(urllib3.HTTPConnectionPool):
@@ -2374,10 +2541,30 @@ class _Json2:
         return outcome
 
     def close(self):
-        # The session's close drops the pools, then each connection of the
-        # client still held is closed, whoever holds it: a pool an error's
-        # frames hold, or such a frame itself (_ConnectionRecording).
+        """Close the pools of the session's adapters and their connections,
+        through urllib3's pool manager and pools, then each connection of
+        the client still held, whoever holds it: a pool an error's frames
+        hold, or such a frame itself (_ConnectionRecording).
+
+        The session's close drops the pools from their managers, and urllib3
+        2 closes a dropped pool's connections in its finalizer, as the pool
+        is collected (HTTPConnectionPool's weakref.finalize), where Python
+        reports an interrupt such as Ctrl-C, a MemoryError or a
+        RecursionError as ignored («Exception ignored» on stderr) and stops
+        it there. Each pool is taken first, and closed here once dropped:
+        one of them in a connection's close goes on as it is, and the
+        session's next call opens a new pool. The finalizer of a closed pool
+        finds no connection left to close as the pool is collected, once
+        this close has run; one of them that comes inside it stops there
+        all the same (README § Errors)."""
+        pools = [
+            adapter.poolmanager.pools[key]
+            for adapter in self._session.adapters.values()
+            for key in adapter.poolmanager.pools.keys()
+        ]
         self._session.close()
+        for pool in pools:
+            pool.close()
         for connection in self._connections:
             connection.close()
 
