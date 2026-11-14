@@ -310,6 +310,25 @@ debug level 1 they print each request, the password among them. It is the
 one exception to the library's connections printing nothing (§ Security
 model), and it holds only for a transport the caller gives.
 
+Each call with a profile, the login's too, runs in a context of its own
+(`contextvars`), which holds every context variable of the caller's but
+those of the library: a variable that a transport the caller gives sets
+during a call reaches the caller's context as the call ends, whatever
+ends it, a result, an error or an interrupt, as in 1.x, and none of the
+library's does. What differs from 1.x:
+
+- A token the caller took before a call cannot be reset during it, and a
+  token taken during a call cannot be reset after it: `ContextVar.reset`
+  raises `ValueError`, as the token belongs to another context. Raised by
+  the transport, that `ValueError` reaches the caller as it is.
+- As the call ends, the library sets the variables the call changed in
+  the caller's context, one by one. An interrupt such as Ctrl-C, a
+  `MemoryError` or a `RecursionError` that comes as they are set leaves
+  those not yet set at the values the caller's context had before the
+  call, for good, whether or not the call's request went out: the call is
+  over by then, and the error is raised instead of its result or its own
+  error.
+
 ## Errors
 
 Every `Client` call raises the same errors, whatever the API. Each names the

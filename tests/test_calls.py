@@ -2330,6 +2330,36 @@ class FramesTest(StubTestCase):
                 )
                 self.assertNoFrameHolds(error, KEY)
 
+    def test_no_frame_of_a_call_made_in_the_middle_of_a_json2_call_reaches_its_answers(self):
+        # A call over XML-RPC made in the middle of a call over JSON-2, as a
+        # signal handler or a finalizer can make one, here once the answer
+        # came, whose headers echo the key, fails before anything is sent.
+        # The context of the call made in the middle, which a frame of its
+        # error holds, was a copy of the other's: it held the other's
+        # answers.
+        json2_odoo = self.start(Json2Odoo())
+        json2_odoo.answers[("res.partner", "search_count")] = Answer(200, 3, {"X-Echo": KEY})
+        json2_client = self.make_client(json2_odoo.url, "json2", KEY, "erp-json2")
+        xmlrpc_client = self.make_client(
+            f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD, "erp-xmlrpc"
+        )
+        made_in_the_middle = []
+        outcome = odoo_xmlrpc_auth.client._Json2._outcome
+
+        def in_the_middle(json2, response):
+            made_in_the_middle.append(
+                self.raised(
+                    RequestError,
+                    lambda: xmlrpc_client.call("res.partner", "search_count", domain=[]),
+                )
+            )
+            return outcome(json2, response)
+
+        with mock.patch.object(odoo_xmlrpc_auth.client._Json2, "_outcome", in_the_middle):
+            self.assertEqual(json2_client.call("res.partner", "search_count", domain=[]), 3)
+        (error,) = made_in_the_middle
+        self.assertNoFrameHolds(error, KEY)
+
 
 class WireDebugTest(StubTestCase):
     """The library's own connections print nothing whatever the process's
@@ -2482,6 +2512,83 @@ class ServerProxyTransportTest(StubTestCase):
             self.assertIs(proxy("transport"), transport)
             self.assertEqual(proxy.execute_kw("res.partner", "search_count", [[]], {}), 3)
         self.assertEqual(handlers, ["/xmlrpc/2/object"])
+
+    def test_what_a_transport_it_is_given_sets_reaches_the_caller_as_the_call_ends(self):
+        # Each call runs in a context of its own (_own_context), which holds
+        # the caller's variables: a transport the caller gives reads them,
+        # and what it sets reaches the caller's context as the call ends, for
+        # a call that returns and for one that fails, as in 1.x, which ran
+        # each call in the caller's context.
+        set_by_the_caller = contextvars.ContextVar("set by the caller")
+        set_by_the_transport = contextvars.ContextVar("set by the transport")
+        read = []
+
+        class Setting(xmlrpc.client.Transport):
+            def request(self, host, handler, request_body, verbose=False):
+                read.append(set_by_the_caller.get())
+                set_by_the_transport.set("set during the call")
+                return super().request(host, handler, request_body, verbose)
+
+        self.odoo.answers[("res.partner", "search_count")] = 3
+        self.odoo.answers[("res.partner", "write")] = xmlrpc.client.Fault(2, "Odoo refused it")
+        returning = contextvars.copy_context()
+        returning.run(set_by_the_caller.set, "the caller's, before a call that returns")
+        failing = contextvars.copy_context()
+        failing.run(set_by_the_caller.set, "the caller's, before a call that fails")
+        with ServerProxy(profile="erp", transport=Setting()) as proxy:
+            self.assertEqual(
+                returning.run(proxy.execute_kw, "res.partner", "search_count", [[]], {}), 3
+            )
+            fault = failing.run(
+                self.raised,
+                xmlrpc.client.Fault,
+                lambda: proxy.execute_kw("res.partner", "write", [[7], {"name": "x"}], {}),
+            )
+        self.assertEqual(fault.faultString, "Odoo refused it")
+        self.assertEqual(
+            read,
+            [
+                "the caller's, before a call that returns",
+                "the caller's, before a call that fails",
+            ],
+        )
+        self.assertEqual(returning.run(set_by_the_transport.get), "set during the call")
+        self.assertEqual(failing.run(set_by_the_transport.get), "set during the call")
+
+    def test_a_token_crosses_no_call(self):
+        # Each call runs in a context of its own (_own_context): a token the
+        # caller took before a call cannot be reset during it, by a transport
+        # the caller gives, nor a token the transport took during a call
+        # after it. ContextVar.reset raises ValueError, which reaches the
+        # caller as it is. Here the first call takes a token, and the second
+        # resets the caller's.
+        variable = contextvars.ContextVar("a variable of the caller")
+        taken = []
+        caller = contextvars.copy_context()
+        before = caller.run(variable.set, "set before the calls")
+
+        class Resetting(xmlrpc.client.Transport):
+            def request(self, host, handler, request_body, verbose=False):
+                if taken:
+                    variable.reset(before)
+                taken.append(variable.set("set during the first call"))
+                return super().request(host, handler, request_body, verbose)
+
+        self.odoo.answers[("res.partner", "search_count")] = 3
+        with ServerProxy(profile="erp", transport=Resetting()) as proxy:
+            self.assertEqual(
+                caller.run(proxy.execute_kw, "res.partner", "search_count", [[]], {}), 3
+            )
+            during = caller.run(
+                self.raised,
+                ValueError,
+                lambda: proxy.execute_kw("res.partner", "search_count", [[]], {}),
+            )
+        after = caller.run(self.raised, ValueError, lambda: variable.reset(taken[0]))
+        for error in (during, after):
+            self.assertRegex(str(error), r" was created in a different Context\Z")
+        self.assertEqual(len(taken), 1)
+        self.assertEqual(caller.run(variable.get), "set during the first call")
 
     def test_its_https_transport_connects_with_the_context_it_is_given(self):
         # The login is replaced: no TLS server is needed, and nothing is
@@ -2733,10 +2840,26 @@ class KeptConnectionTest(StubTestCase):
         # of the call went out.
         at_length = ("answer at length", "answer at length, then close")
         redirect_at_length = ("redirect at length", "redirect at length, then close")
+        # Each point's owner and step, which call of the step is
+        # interrupted, the answers, and the requests the server gets: the
+        # interrupted request goes out whole, but in its send, on the first
+        # call's connection, and the next call on a connection of its own.
         points = {
             # The send of the request's head, its first.
-            "the request's send": (http.client.HTTPConnection, "send", 1, (None,)),
-            "the read of the answer's head": (http.client.HTTPResponse, "begin", 1, at_length),
+            "the request's send": (
+                http.client.HTTPConnection,
+                "send",
+                1,
+                (None,),
+                [(1, "call"), (2, "call")],
+            ),
+            "the read of the answer's head": (
+                http.client.HTTPResponse,
+                "begin",
+                1,
+                at_length,
+                [(1, "call"), (1, "call"), (2, "call")],
+            ),
             # urllib3 makes its answer of http.client's, which holds the
             # socket of an answer that closes its connection.
             "urllib3's answer made of http.client's": (
@@ -2744,50 +2867,53 @@ class KeptConnectionTest(StubTestCase):
                 "assert_header_parsing",
                 1,
                 at_length,
+                [(1, "call"), (1, "call"), (2, "call")],
             ),
             "requests' answer made of urllib3's": (
                 requests.adapters.HTTPAdapter,
                 "build_response",
                 1,
                 at_length,
+                [(1, "call"), (1, "call"), (2, "call")],
             ),
             "requests' steps once its adapter gave the answer": (
                 requests.sessions,
                 "extract_cookies_to_jar",
                 1,
                 at_length,
+                [(1, "call"), (1, "call"), (2, "call")],
             ),
             "urllib3's read of the body, its second piece": (
                 http.client.HTTPResponse,
                 "read",
                 2,
                 at_length,
+                [(1, "call"), (1, "call"), (2, "call")],
             ),
             "the decoding of the body's second piece, after urllib3's read": (
                 urllib3.response.HTTPResponse,
                 "_decode",
                 2,
                 at_length,
+                [(1, "call"), (1, "call"), (2, "call")],
             ),
             "the drain of a redirect's body, its second piece": (
                 urllib3.response.HTTPResponse,
                 "read",
                 2,
                 redirect_at_length,
+                [(1, "call"), (1, "call"), (2, "call")],
             ),
         }
-        for point, (owner, step, number, answers) in points.items():
+        for point, (owner, step, number, answers, received) in points.items():
             for answer in answers:
                 with self.subTest(point=point, answer=answer):
                     plan = {} if answer is None else {("call", 2): answer}
                     odoo = self.start(KeepAliveOdoo(plan))
                     self.make_profile(odoo.url, "json2", KEY)
                     interrupt = KeyboardInterrupt()
-                    # The sockets of this case's calls only: a case before left
-                    # the connection of its last call in its pool, which that
-                    # case's interrupt holds in its traceback, and urllib3
-                    # closes a pool's connections once the pool is collected.
-                    before = len(opened)
+                    # The sockets of the cases before, each closed.
+                    opened_before = len(opened)
                     with Client("erp") as client:
                         self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
                         with self.interrupted_at(owner, step, number, interrupt):
@@ -2796,18 +2922,75 @@ class KeptConnectionTest(StubTestCase):
                                 lambda: client.call("res.partner", "search_read", domain=[]),
                             )
                         self.assertIs(error, interrupt)
-                        self.assertEqual(
-                            [sock for sock in opened[before:] if sock.fileno() != -1], []
-                        )
+                        # The first call's socket, which the interrupted call
+                        # went out on.
+                        self.assertEqual(len(opened[opened_before:]), 1)
+                        self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+                        # The server numbers the requests as it reads them,
+                        # a thread per connection. An interrupt at the read
+                        # of the answer's head can leave the request still
+                        # unread: read after the next call's, it took the
+                        # next call's number, and the next call got the
+                        # answer planned for it. The next call goes out once
+                        # the server read every request before it.
+                        self.assertTrue(odoo.wait_for_requests(len(received) - 1, HOLD))
                         self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                    # The next call's socket too, once the client is closed.
+                    self.assertEqual(len(opened[opened_before:]), 2)
+                    self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
                     odoo.stop()
-                    # The interrupted request went out whole, but in its send.
-                    self.assertCountEqual(
-                        odoo.requests,
-                        [(1, "call"), (2, "call")]
-                        if answer is None
-                        else [(1, "call"), (1, "call"), (2, "call")],
-                    )
+                    self.assertCountEqual(odoo.requests, received)
+
+    def test_a_client_closed_while_an_interrupt_is_held_closes_its_connections(self):
+        # An interrupt in urllib3's own steps, the read of the answer's head,
+        # keeps the pool in the frames of its traceback (urlopen's self).
+        # The call that follows gives its connection back to that pool, and
+        # Client.close() clears the pool manager, which only drops its pools:
+        # urllib3 closes a pool's connections once it is collected, and the
+        # interrupt holds this one. The interrupt is held as the client
+        # closes, as a prompt holds the last error.
+        self.fail_on_resource_warnings()
+        opened = self.record_sockets(urllib3.util.connection)
+        odoo = self.start(KeepAliveOdoo())
+        self.make_profile(odoo.url, "json2", KEY)
+        interrupt = KeyboardInterrupt()
+        client = Client("erp")
+        self.addCleanup(client.close)
+        with self.interrupted_at(http.client.HTTPResponse, "begin", 1, interrupt):
+            error = self.raised(
+                KeyboardInterrupt, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        self.assertIs(error, interrupt)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        client.close()
+        self.assertEqual(len(opened), 2)
+        self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+
+    def test_a_kept_json2_connection_interrupted_in_its_check_closes_with_the_client(self):
+        # urllib3 takes a kept connection out of its pool to check it before
+        # it reuses it (HTTPConnectionPool._get_conn, is_connection_dropped):
+        # an interrupt there left it out of the pool, held only by the frames
+        # of the interrupt's traceback, and Client.close(), which closes the
+        # pools, left its socket open. The interrupt is held as the client
+        # closes, as a prompt holds the last error.
+        self.fail_on_resource_warnings()
+        opened = self.record_sockets(urllib3.util.connection)
+        odoo = self.start(KeepAliveOdoo())
+        self.make_profile(odoo.url, "json2", KEY)
+        interrupt = KeyboardInterrupt()
+        client = Client("erp")
+        self.addCleanup(client.close)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        with mock.patch.object(
+            urllib3.connectionpool, "is_connection_dropped", side_effect=interrupt
+        ):
+            error = self.raised(
+                KeyboardInterrupt, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        self.assertIs(error, interrupt)
+        client.close()
+        self.assertEqual(len(opened), 1)
+        self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
 
     def test_an_interrupted_tcp_connect_sends_nothing_and_the_next_call_works(self):
         # An interrupt, such as Ctrl-C, in the TCP connect itself, the
@@ -3838,6 +4021,126 @@ class CutOffTest(StubTestCase):
             "do not repeat it before reading back what it did. Its message is not "
             "shown, as it can quote the profile's values.",
         )
+
+    def test_a_call_made_in_the_middle_of_a_json2_call_starts_with_none_of_its_variables(self):
+        # A call made in the middle of a call over JSON-2, here once the answer
+        # came, started with the other's flag, answers and connections, and
+        # with its mark unset only. It reads each variable the library owns
+        # as its request is made, in its own context.
+        json2_odoo = self.start(Json2Odoo())
+        json2_odoo.answers[("res.partner", "search_count")] = 3
+        json2_client = self.make_client(json2_odoo.url, "json2", KEY, "erp-json2")
+        xmlrpc_client = self.make_client(
+            f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD, "erp-xmlrpc"
+        )
+        variables = odoo_xmlrpc_auth.client
+        read_in_the_middle = []
+        logged_in_request = variables._XmlRpc._logged_in_request
+
+        def reading(xmlrpc, params):
+            read_in_the_middle.append(
+                [
+                    variable.get("unset")
+                    for variable in (
+                        variables._IN_JSON2_CALL,
+                        variables._REQUEST_STARTED,
+                        variables._CALL_ANSWERS,
+                        variables._CLIENT_CONNECTIONS,
+                    )
+                ]
+            )
+            return logged_in_request(xmlrpc, params)
+
+        outcome = variables._Json2._outcome
+
+        def in_the_middle(json2, response):
+            with mock.patch.object(variables._XmlRpc, "_logged_in_request", reading):
+                self.raised(
+                    RequestError,
+                    lambda: xmlrpc_client.call("res.partner", "search_count", domain=[]),
+                )
+            return outcome(json2, response)
+
+        with mock.patch.object(variables._Json2, "_outcome", in_the_middle):
+            self.assertEqual(json2_client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertEqual(read_in_the_middle, [["unset", "unset", "unset", "unset"]])
+
+    def test_no_variable_of_the_library_reaches_the_callers_context(self):
+        # As a call ends, the variables it changed in its own context are set
+        # in the caller's (_own_context), but those of the library: after a
+        # call over each API, one that returns and one an interrupt stops as
+        # the answer's head is read, none of them is set in the caller's
+        # context, whatever the call set in its own.
+        odoo = self.start(KeepAliveOdoo())
+        variables = odoo_xmlrpc_auth.client
+        cases = {"xmlrpc": PASSWORD, "json2": KEY}
+        for api, secret in cases.items():
+            with self.subTest(api=api):
+                self.make_profile(odoo.url, api, secret, f"erp-{api}")
+                returning = contextvars.copy_context()
+                interrupted = contextvars.copy_context()
+                interrupt = KeyboardInterrupt()
+                with Client(f"erp-{api}") as client:
+                    self.assertEqual(
+                        returning.run(client.call, "res.partner", "search_count", domain=[]), 3
+                    )
+                    with self.interrupted_at(http.client.HTTPResponse, "begin", 1, interrupt):
+                        error = interrupted.run(
+                            self.raised,
+                            KeyboardInterrupt,
+                            lambda: client.call("res.partner", "search_count", domain=[]),
+                        )
+                self.assertIs(error, interrupt)
+                for context in (returning, interrupted):
+                    self.assertEqual(
+                        {variable for variable in context if variable in variables._LIBRARY_VARIABLES},
+                        set(),
+                    )
+
+    def test_what_code_of_the_caller_sets_during_a_call_reaches_it_whatever_ends_it(self):
+        # As a call ends, by a return or by an interrupt, each variable that
+        # code of the caller set in the call's own context is set in the
+        # caller's (_own_context), None too, in a variable the caller had
+        # not set. The caller's code here wraps the socket's connect, as a
+        # library that sends connections through a proxy can: it runs in the
+        # call, as the call opens its connection, a new client's. The
+        # interrupt comes as the answer's head is read.
+        self.fail_on_resource_warnings()
+        odoo = self.start(KeepAliveOdoo())
+        set_to_a_text = contextvars.ContextVar("set to a text during the call")
+        set_to_none = contextvars.ContextVar("set to None during the call")
+        connect = socket.socket.connect
+
+        def connecting(sock, address):
+            set_to_a_text.set("set during the call")
+            set_to_none.set(None)
+            return connect(sock, address)
+
+        cases = {"xmlrpc": PASSWORD, "json2": KEY}
+        for api, secret in cases.items():
+            with self.subTest(api=api):
+                self.make_profile(odoo.url, api, secret, f"erp-{api}")
+                returning = contextvars.copy_context()
+                interrupted = contextvars.copy_context()
+                interrupt = KeyboardInterrupt()
+                with mock.patch.object(socket.socket, "connect", connecting):
+                    with Client(f"erp-{api}") as client:
+                        self.assertEqual(
+                            returning.run(client.call, "res.partner", "search_count", domain=[]), 3
+                        )
+                    with Client(f"erp-{api}") as client:
+                        with self.interrupted_at(http.client.HTTPResponse, "begin", 1, interrupt):
+                            error = interrupted.run(
+                                self.raised,
+                                KeyboardInterrupt,
+                                lambda: client.call("res.partner", "search_count", domain=[]),
+                            )
+                self.assertIs(error, interrupt)
+                for context in (returning, interrupted):
+                    self.assertEqual(
+                        (context.run(set_to_a_text.get, "unset"), context.run(set_to_none.get, "unset")),
+                        ("set during the call", None),
+                    )
 
     def test_an_interrupt_at_any_line_of_a_call_leaves_its_callers_context(self):
         # A call has context variables of its own: its mark, and over JSON-2
