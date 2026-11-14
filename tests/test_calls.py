@@ -4206,9 +4206,11 @@ class CutOffTest(StubTestCase):
         # later record of urllib3 in the thread. The caller here has its mark
         # set, as in the middle of a call over JSON-2 whose request went out,
         # and neither the flag nor the answers, so that a change of any shows.
-        # An interrupt comes at each line of the library's module the call
-        # runs, in turn, until the call runs whole. Each case reads, as the
-        # interrupt comes, a variable the call itself changes.
+        # An interrupt comes at each line of the library's module a client's
+        # first call runs, in turn, a new client each time, until the call
+        # runs whole: a client's later calls skip lines of its first, such as
+        # the login's. Each case reads, as the interrupt comes, a variable the
+        # call itself changes.
         self.fail_on_resource_warnings()
         odoo = self.start(KeepAliveOdoo())
         variables = odoo_xmlrpc_auth.client
@@ -4218,7 +4220,7 @@ class CutOffTest(StubTestCase):
         }
         for api, (secret, read, read_in_the_call) in cases.items():
             with self.subTest(api=api):
-                client = self.make_client(odoo.url, api, secret, f"erp-{api}")
+                self.make_profile(odoo.url, api, secret, f"erp-{api}")
                 caller = contextvars.copy_context()
                 caller.run(variables._REQUEST_STARTED.set, True)
                 results = []
@@ -4227,11 +4229,14 @@ class CutOffTest(StubTestCase):
                 while not results:
                     number += 1
                     interrupt = KeyboardInterrupt()
-                    with self.interrupted_at_line(number, interrupt, read) as read_there:
-                        with contextlib.suppress(KeyboardInterrupt):
-                            results.append(
-                                caller.run(client.call, "res.partner", "search_count", domain=[])
-                            )
+                    with Client(f"erp-{api}") as client:
+                        with self.interrupted_at_line(number, interrupt, read) as read_there:
+                            with contextlib.suppress(KeyboardInterrupt):
+                                results.append(
+                                    caller.run(
+                                        client.call, "res.partner", "search_count", domain=[]
+                                    )
+                                )
                     read_at_the_interrupts += read_there
                     self.assertEqual(
                         (
