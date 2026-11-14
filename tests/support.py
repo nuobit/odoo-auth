@@ -449,6 +449,13 @@ class KeepAliveOdoo:
     - "drop": the server closes the connection unanswered, as one that ran
       the call and broke off before its answer.
     - "reset": the server resets the connection unanswered.
+
+    Each connection has a thread of its own, and the server numbers the
+    requests in the order it reads them: two that come on two connections
+    at once, as when the client sends one on a new connection before the
+    server has read the last one it sent on another, are numbered in either
+    order. ``wait_for_requests`` waits until the server has read a number
+    of them.
     """
 
     ANSWER = 3
@@ -465,6 +472,8 @@ class KeepAliveOdoo:
         self.idle_closed = threading.Event()
         self.idle_read = threading.Event()
         self._lock = threading.Lock()
+        # Notified as each request is recorded (wait_for_requests).
+        self._recorded = threading.Condition(self._lock)
         self._connections = []
         self._stopping = threading.Event()
         self._listener = socket.socket()
@@ -498,6 +507,7 @@ class KeepAliveOdoo:
                 with self._lock:
                     nth = 1 + [done for _, done in self.requests].count(what)
                     self.requests.append((number, what))
+                    self._recorded.notify_all()
                 action = self.plan.get((what, nth), "answer")
                 if action == "answer":
                     connection.sendall(self._answer(path))
@@ -598,6 +608,12 @@ class KeepAliveOdoo:
             kind = "application/json"
         head = f"HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {len(body)}\r\n"
         return f"{head}\r\n".encode() + body
+
+    def wait_for_requests(self, count, timeout):
+        """Whether the server has read and recorded ``count`` requests within
+        ``timeout`` seconds."""
+        with self._recorded:
+            return self._recorded.wait_for(lambda: len(self.requests) >= count, timeout)
 
     def stop(self):
         self._stopping.set()

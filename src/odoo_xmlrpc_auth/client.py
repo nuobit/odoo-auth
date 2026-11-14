@@ -12,6 +12,7 @@ import socket
 import stat
 import threading
 import urllib.parse
+import weakref
 import xml.parsers.expat
 import xmlrpc.client
 import zlib
@@ -1710,23 +1711,69 @@ class _BearerKey(requests.auth.AuthBase):
 # no other call, and no error raised outside a call over JSON-2, reads it set.
 _REQUEST_STARTED = contextvars.ContextVar("_REQUEST_STARTED", default=False)
 
+# The answers urllib3 gave to the requests of the JSON-2 call this thread or
+# task runs, a redirect's included, in order (_AnswerRecording): the call
+# closes them after any failure (_Json2._post). Each call sets its own list
+# in its own context (_own_context), which it leaves behind as it ends.
+_CALL_ANSWERS = contextvars.ContextVar("_CALL_ANSWERS")
+
+# The connections of the client whose JSON-2 call this thread or task runs,
+# in a weak set (_Json2): each of the library's urllib3 connections is
+# recorded there as it connects (_ConnectionRecording), and Client.close()
+# closes each one still held. Set in the call's own context (_Json2._post).
+_CLIENT_CONNECTIONS = contextvars.ContextVar("_CLIENT_CONNECTIONS")
+
+# The context variables the library owns, those of a call: each call runs in
+# a context of its own, in which none of them is set as it starts, and none
+# of them reaches its caller's context (_own_context).
+_LIBRARY_VARIABLES = frozenset(
+    {_IN_JSON2_CALL, _REQUEST_STARTED, _CALL_ANSWERS, _CLIENT_CONNECTIONS}
+)
+# What a context variable reads in a context that does not hold it, for
+# _own_context: no value a variable can hold.
+_UNSET = object()
+
 
 def _own_context(function, *args):
     """``function(*args)``, a call over either API, run in a context of its
-    own: a copy of this thread's or task's, in which the call's mark
-    (_REQUEST_STARTED) is unset as the call starts.
+    own: a new one, which holds each variable of this thread's or task's
+    context with its value, but those the library owns (_LIBRARY_VARIABLES),
+    none of which is set as the call starts. As the call ends, whatever ends
+    it, a return, an error or an interrupt such as Ctrl-C, each other
+    variable whose value in the call's context is not this context's is set
+    here: what code of the caller set during the call, such as a transport
+    of its own under ServerProxy, reaches the caller's context, as when 1.x
+    ran each call in it.
 
-    Each context variable the call sets, its mark and, over JSON-2,
-    _IN_JSON2_CALL and _CALL_ANSWERS, is set in that copy only, which the
-    call leaves behind as it ends, and nothing gives them back their value:
-    whatever ends the call, an interrupt such as Ctrl-C in its setup or its
-    cleanup included, the caller's context is as it was. A call made in the
-    middle of a call over JSON-2 once its request went out, as a signal
-    handler or a finalizer can make one, reads its own mark, and the call
-    over JSON-2 keeps its own."""
-    context = contextvars.copy_context()
-    context.run(_REQUEST_STARTED.set, False)
-    return context.run(function, *args)
+    None of the library's variables reaches the caller's context. Those the
+    call sets, its mark and, over JSON-2, _IN_JSON2_CALL,
+    _CLIENT_CONNECTIONS and _CALL_ANSWERS, stay in the call's context, which
+    the call leaves behind as it ends. A call made in the middle of another,
+    as a signal handler or a finalizer can make one, starts with none of the
+    other's: it reads its own mark, the other keeps its own, and no frame of
+    the error of the call made in the middle reaches, through its context,
+    the other's answers.
+
+    The variables are taken by their keys, the library's skipped by key
+    first, and the value of each other read where it is: no value of a
+    variable the library owns is read here, and no frame of an error raised
+    here holds an answer. As the call runs in a context of its own, a token
+    the caller took before the call cannot be reset during it, nor a token
+    taken during the call after it (ContextVar.reset raises ValueError), and
+    an interrupt such as Ctrl-C, a MemoryError or a RecursionError as the
+    variables are set back may leave part of them unset here."""
+    context = contextvars.Context()
+    for variable in contextvars.copy_context():
+        if variable not in _LIBRARY_VARIABLES:
+            context.run(variable.set, variable.get())
+    try:
+        return context.run(function, *args)
+    finally:
+        for variable in context:
+            if variable not in _LIBRARY_VARIABLES and (
+                variable.get(_UNSET) is not context[variable]
+            ):
+                variable.set(context[variable])
 
 
 class _MarkedSending:
@@ -1747,13 +1794,6 @@ class _MarkedSending:
         super().send(data)
 
 
-# The answers urllib3 gave to the requests of the JSON-2 call this thread or
-# task runs, a redirect's included, in order (_AnswerRecording): the call
-# closes them after any failure (_Json2._post). Each call sets its own list
-# in its own context (_own_context), which it leaves behind as it ends.
-_CALL_ANSWERS = contextvars.ContextVar("_CALL_ANSWERS")
-
-
 class _AnswerRecording:
     """For the library's urllib3 connections: each answer of urllib3 one of
     them gives is recorded in the answers of the call (_CALL_ANSWERS) as it
@@ -1765,26 +1805,47 @@ class _AnswerRecording:
         return answers[-1]
 
 
+class _ConnectionRecording:
+    """For the library's urllib3 connections: each one is recorded among the
+    connections of its client (_CLIENT_CONNECTIONS) as it connects, before
+    it opens its socket, which urllib3 makes in connect only.
+
+    urllib3 keeps a connection in its pool from one call to the next, and
+    takes it out of the pool to check it before it reuses it
+    (HTTPConnectionPool._get_conn, is_connection_dropped): an interrupt
+    there left the connection out of the pool, held only by the frames of
+    the interrupt's traceback, and its socket open after Client.close().
+    A pool that requests' close drops also keeps its connections until it
+    is collected (urllib3 2's PoolManager.clear), which the traceback of an
+    interrupt in urllib3's own steps delays as long as it lives."""
+
+    def connect(self):
+        _CLIENT_CONNECTIONS.get().add(self)
+        super().connect()
+
+
 class _Json2HTTPConnection(
+    _ConnectionRecording,
     _AnswerRecording,
     _MarkedSending,
     _Quiet,
     urllib3.connection.HTTPConnection,
     _AnswerClosing,
 ):
-    """urllib3's connection for http, for JSON-2, with _AnswerRecording,
-    _MarkedSending and _AnswerClosing."""
+    """urllib3's connection for http, for JSON-2, with _ConnectionRecording,
+    _AnswerRecording, _MarkedSending and _AnswerClosing."""
 
 
 class _Json2HTTPSConnection(
+    _ConnectionRecording,
     _AnswerRecording,
     _MarkedSending,
     _Quiet,
     urllib3.connection.HTTPSConnection,
     _AnswerClosing,
 ):
-    """urllib3's connection for https, for JSON-2, with _AnswerRecording,
-    _MarkedSending and _AnswerClosing."""
+    """urllib3's connection for https, for JSON-2, with _ConnectionRecording,
+    _AnswerRecording, _MarkedSending and _AnswerClosing."""
 
 
 class _Json2HTTPConnectionPool(urllib3.HTTPConnectionPool):
@@ -1801,7 +1862,7 @@ class _Json2HTTPSConnectionPool(urllib3.HTTPSConnectionPool):
 
 class _Json2Adapter(requests.adapters.HTTPAdapter):
     """requests' adapter, whose pool manager opens the library's pools, so
-    that its connections are the library's (_Quiet)."""
+    that its connections are the library's (_Quiet, _ConnectionRecording)."""
 
     def init_poolmanager(self, *args, **kwargs):
         super().init_poolmanager(*args, **kwargs)
@@ -2144,6 +2205,9 @@ class _Json2:
         self._key = config["password"]
         self._timeout = timeout
         self._session = _OriginSession(self._url, self._key)
+        # Each of its connections, as it connects (_ConnectionRecording),
+        # held weakly: the record keeps none alive.
+        self._connections = weakref.WeakSet()
 
     def call(self, model, method, ids, named):
         # The body holds named arguments only: the records as ids, then the
@@ -2180,7 +2244,9 @@ class _Json2:
         # No logger of urllib3 logs a record of the call (_Json2CallRecords).
         _filter_urllib3_loggers()
         _IN_JSON2_CALL.set(True)
-        # The answers its connections give (_AnswerRecording).
+        # The connections that connect for it (_ConnectionRecording), and the
+        # answers they give (_AnswerRecording).
+        _CLIENT_CONNECTIONS.set(self._connections)
         answers = []
         _CALL_ANSWERS.set(answers)
         try:
@@ -2291,7 +2357,12 @@ class _Json2:
         return outcome
 
     def close(self):
+        # The session's close drops the pools, then each connection of the
+        # client still held is closed, whoever holds it: a pool an error's
+        # frames hold, or such a frame itself (_ConnectionRecording).
         self._session.close()
+        for connection in self._connections:
+            connection.close()
 
 
 def _check_names(profile, model, method):
