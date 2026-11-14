@@ -2992,6 +2992,61 @@ class KeptConnectionTest(StubTestCase):
         self.assertEqual(len(opened), 1)
         self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
 
+    def test_an_interrupted_close_of_a_connection_the_server_closed_closes_it(self):
+        # The server closes the call's connection once it answered, and the
+        # next call's check finds it closed and closes it, through
+        # xmlrpc.client's close, which forgets the kept connection, then
+        # closes it (Transport.close). An interrupt at the start of the
+        # connection's close, the first in the call, left it open, held only
+        # by the frames of the interrupt's traceback, after Client.close()
+        # too. It is closed before the interrupt goes on, and the next call
+        # works.
+        self.fail_on_resource_warnings()
+        opened = self.record_sockets(socket)
+        odoo = self.start(KeepAliveOdoo({("call", 1): "answer, then close idle"}))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        # The call's connection, the second, once the server's end of it has
+        # come: readable, as the check before reuse reads it. Before that, the
+        # check would let the call go out on it, and its close would not run.
+        self.assertTrue(urllib3.util.wait_for_read(opened[1], timeout=HOLD))
+        interrupt = KeyboardInterrupt()
+        with self.interrupted_at(odoo_xmlrpc_auth.client._AnswerClosing, "close", 1, interrupt):
+            error = self.raised(
+                KeyboardInterrupt, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        self.assertIs(error, interrupt)
+        # The login's connection and the first call's, both closed.
+        self.assertEqual(len(opened), 2)
+        self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+
+    def test_an_interrupted_close_of_the_logins_connection_leaves_no_socket_open(self):
+        # The login's ServerProxy closes the transport as it ends, through
+        # xmlrpc.client's close, which forgets the kept connection, then
+        # closes it (Transport.close). An interrupt at the start of the
+        # connection's close, the first of a new client's, left it open, held
+        # only by the frames of the interrupt's traceback, after
+        # Client.close() too. The connection stays the client's until it is
+        # closed: the interrupt is held as the client closes, as a prompt
+        # holds the last error.
+        self.fail_on_resource_warnings()
+        opened = self.record_sockets(socket)
+        odoo = self.start(KeepAliveOdoo())
+        self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+        interrupt = KeyboardInterrupt()
+        client = Client("erp")
+        self.addCleanup(client.close)
+        with self.interrupted_at(odoo_xmlrpc_auth.client._AnswerClosing, "close", 1, interrupt):
+            error = self.raised(
+                KeyboardInterrupt, lambda: client.call("res.partner", "search_count", domain=[])
+            )
+        self.assertIs(error, interrupt)
+        client.close()
+        self.assertEqual(len(opened), 1)
+        self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+        self.assertEqual(odoo.requests, [(1, "login")])
+
     def test_an_interrupted_tcp_connect_sends_nothing_and_the_next_call_works(self):
         # An interrupt, such as Ctrl-C, in the TCP connect itself, the
         # login's or the call's: socket.create_connection, which makes the

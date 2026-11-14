@@ -1286,10 +1286,19 @@ class _Sending:
     anything was sent, and a failure of the open connection, but for the
     read timeout, or an answer whose status is not 200 raises _CutOff: the
     server may have read the request. After any failure, whatever it
-    raises, an interrupt such as Ctrl-C among them, the connection is
-    closed before the error goes on, unchanged, and no socket of it is left
-    open. A Fault, Odoo's own answer, read whole, keeps it, as any answer
-    does. An interrupt from the moment socket.create_connection makes its
+    raises, an interrupt such as Ctrl-C among them, in the check of the
+    kept connection too, the connection is closed before the error goes on,
+    unchanged, and no socket of it is left open. A Fault, Odoo's own
+    answer, read whole, keeps it, as any answer does.
+
+    The transport's close closes the kept connection before xmlrpc.client's
+    forgets it (Transport.close, which forgets it first, then closes it):
+    in xmlrpc.client's order, an interrupt between the two, as the check
+    finds the connection closed by the server, or as the login's
+    ServerProxy closes it, would leave the connection open, held only by
+    the frames of the interrupt's traceback, after Client.close() too.
+
+    An interrupt from the moment socket.create_connection makes its
     socket to the moment that function returns it to the connection's
     connect, in the TCP connect above all, leaves that socket to the
     garbage collector: that function closes it only after an OSError, and
@@ -1307,16 +1316,24 @@ class _Sending:
     ServerProxy keeps xmlrpc.client's own sending: it writes a request on
     its kept connection unchecked, and sends it again after those errors."""
 
+    def close(self):
+        # xmlrpc.client's close forgets the kept connection, then closes it
+        # (Transport.close). Closed here first, it stays kept until it is.
+        connection = self._connection[1]
+        if connection is not None:
+            connection.close()
+        super().close()
+
     def request(self, host, handler, request_body, verbose=False):
-        connection = self.make_connection(host)
-        # Readable before a request: at its end, or holding what no request
-        # asked for. No answer to this request can come on it.
-        if connection.sock is not None and urllib3.util.wait_for_read(
-            connection.sock, timeout=0.0
-        ):
-            self.close()
-            connection = self.make_connection(host)
         try:
+            connection = self.make_connection(host)
+            # Readable before a request: at its end, or holding what no
+            # request asked for. No answer to this request can come on it.
+            if connection.sock is not None and urllib3.util.wait_for_read(
+                connection.sock, timeout=0.0
+            ):
+                self.close()
+                connection = self.make_connection(host)
             if connection.sock is None:
                 connection.connect()
             answer = self._answer(host, handler, request_body, verbose)
