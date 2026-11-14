@@ -465,7 +465,11 @@ intercept an interrupt or the exhaustion of a resource, and their
 tracebacks are how they are diagnosed. Over XML-RPC, `Client` first
 closes the connection of the request one of them ends, as it does after
 any failure: it keeps a connection only after an answer read whole, a
-result or Odoo's `Fault`. (Raised while `Client` encodes a
+result or Odoo's `Fault`. Over JSON-2 it first closes every answer the
+call got, its socket and the connection it still holds with it,
+whichever step of `urllib3`, `requests` or the library the error stopped:
+an answer read whole has given its connection back for the next call.
+(Raised while `Client` encodes a
 call's values, a `RecursionError` is an `ArgumentError`, above, even when
 the caller's deep stack caused it. Raised while it reads the JSON of an
 answer over JSON-2, it makes the answer one that is not JSON, even when

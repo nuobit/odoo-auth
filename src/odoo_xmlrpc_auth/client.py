@@ -1,5 +1,4 @@
 import configparser
-import contextlib
 import contextvars
 import decimal
 import functools
@@ -494,8 +493,9 @@ def _cut_off(error):
     mark the call as started instead, just before the first byte of one of
     its requests is sent, a redirect's included (_MarkedSending). Only a
     call over JSON-2 sets the mark, and each call has its own, from its
-    start to its end (_own_mark): any other error reads it unset, that of
-    a call over XML-RPC made in the middle of a call over JSON-2 included.
+    start to its end (_own_context): any other error reads it unset, that
+    of a call over XML-RPC made in the middle of a call over JSON-2
+    included.
     """
     if isinstance(error, _CutOff):
         after_sending = error.call
@@ -1103,13 +1103,19 @@ class _TimedConnection:
         self.sock.settimeout(self._read_timeout)
 
 
-class _AnswerClosing:
-    """For Client's http.client connections: closing one closes the answer
-    it gave last too. When the connection closes after an answer,
-    http.client hands that answer its socket (HTTPConnection.getresponse),
-    and xmlrpc.client does not close an answer it fails to read: a
-    transport that closes its connection after a failure (_Sending) then
-    leaves no answer's socket open."""
+class _AnswerClosing(http.client.HTTPConnection):
+    """For Client's connections, over both APIs: closing one closes the
+    answer http.client gave last on it too. When the connection closes
+    after an answer, http.client hands that answer its socket
+    (HTTPConnection.getresponse), and closing the connection no longer
+    reaches it. xmlrpc.client does not close an answer it fails to read,
+    and urllib3, after a failure before its own answer wraps http.client's,
+    closes the connection only (HTTPConnectionPool.urlopen): closed after
+    a failure, a connection then leaves no answer's socket open.
+
+    It wraps http.client's own getresponse and close, which urllib3's
+    connection calls through super(): a connection of JSON-2 lists it after
+    urllib3's class, so that it comes between the two."""
 
     _answer = None
 
@@ -1125,7 +1131,8 @@ class _AnswerClosing:
 
 
 # Whether the library handles a call over JSON-2 in this thread or task,
-# from its first request to its answer read (_Json2.call).
+# from before its first request to its answer read: set in the call's own
+# context (_Json2._post, _own_context).
 _IN_JSON2_CALL = contextvars.ContextVar("_IN_JSON2_CALL", default=False)
 
 
@@ -1581,12 +1588,11 @@ class ServerProxy(xmlrpc.client.ServerProxy):
                 )
             self._profile = profile
             self._db = config["db"]
-            # The login's, with every argument at its default, as in 1.x, and
-            # a mark of its own (_own_mark), as each execute_kw has.
-            with _own_mark():
-                self._uid = _log_in(
-                    profile, config, _proxy_transport(config["url"], {})
-                )
+            # The login's, with every argument at its default, as in 1.x, in
+            # a context of its own (_own_context), as each execute_kw runs.
+            self._uid = _own_context(
+                _log_in, profile, config, _proxy_transport(config["url"], {})
+            )
             # Readable as in 1.x: scripts that log in to Odoo's web
             # themselves read it. An attribute, not a local, so no local
             # shows it; but a frame that holds the proxy, as each of its
@@ -1613,13 +1619,11 @@ class ServerProxy(xmlrpc.client.ServerProxy):
         execute_kw = super().__getattr__("execute_kw")
         if self._profile is None:
             return execute_kw(*args, **kwargs)
-        with _own_mark():
-            return _send(
-                self._profile,
-                lambda: execute_kw(
-                    self._db, self._uid, self._password, *args, **kwargs
-                ),
-            )
+        return _own_context(
+            _send,
+            self._profile,
+            lambda: execute_kw(self._db, self._uid, self._password, *args, **kwargs),
+        )
 
 
 def _origin(url):
@@ -1701,25 +1705,28 @@ class _BearerKey(requests.auth.AuthBase):
 
 # Whether a request of the JSON-2 call this thread or task runs, a redirect's
 # included, started to go out on an open connection (_MarkedSending), for
-# _cut_off. It is the call's: each call, over either API, clears it as it
-# starts and gives it back its value as it ends (_own_mark), so that no
-# other call, and no error raised outside a call over JSON-2, reads it set.
+# _cut_off. It is the call's: each call, over either API, runs in a context
+# of its own, in which it is unset as the call starts (_own_context), so that
+# no other call, and no error raised outside a call over JSON-2, reads it set.
 _REQUEST_STARTED = contextvars.ContextVar("_REQUEST_STARTED", default=False)
 
 
-@contextlib.contextmanager
-def _own_mark():
-    """Give the call that runs in the block a mark of its own
-    (_REQUEST_STARTED): unset as the block starts, and given back its value
-    as the block ends, also when it raises. A call made in the middle of a
-    call over JSON-2 once its request went out, as a signal handler or a
-    finalizer can make one, reads its own mark, and the call over JSON-2
-    has its own back afterwards."""
-    started = _REQUEST_STARTED.set(False)
-    try:
-        yield
-    finally:
-        _REQUEST_STARTED.reset(started)
+def _own_context(function, *args):
+    """``function(*args)``, a call over either API, run in a context of its
+    own: a copy of this thread's or task's, in which the call's mark
+    (_REQUEST_STARTED) is unset as the call starts.
+
+    Each context variable the call sets, its mark and, over JSON-2,
+    _IN_JSON2_CALL and _CALL_ANSWERS, is set in that copy only, which the
+    call leaves behind as it ends, and nothing gives them back their value:
+    whatever ends the call, an interrupt such as Ctrl-C in its setup or its
+    cleanup included, the caller's context is as it was. A call made in the
+    middle of a call over JSON-2 once its request went out, as a signal
+    handler or a finalizer can make one, reads its own mark, and the call
+    over JSON-2 keeps its own."""
+    context = contextvars.copy_context()
+    context.run(_REQUEST_STARTED.set, False)
+    return context.run(function, *args)
 
 
 class _MarkedSending:
@@ -1740,12 +1747,44 @@ class _MarkedSending:
         super().send(data)
 
 
-class _Json2HTTPConnection(_MarkedSending, _Quiet, urllib3.connection.HTTPConnection):
-    """urllib3's connection for http, for JSON-2, with _MarkedSending."""
+# The answers urllib3 gave to the requests of the JSON-2 call this thread or
+# task runs, a redirect's included, in order (_AnswerRecording): the call
+# closes them after any failure (_Json2._post). Each call sets its own list
+# in its own context (_own_context), which it leaves behind as it ends.
+_CALL_ANSWERS = contextvars.ContextVar("_CALL_ANSWERS")
 
 
-class _Json2HTTPSConnection(_MarkedSending, _Quiet, urllib3.connection.HTTPSConnection):
-    """urllib3's connection for https, for JSON-2, with _MarkedSending."""
+class _AnswerRecording:
+    """For the library's urllib3 connections: each answer of urllib3 one of
+    them gives is recorded in the answers of the call (_CALL_ANSWERS) as it
+    is given, before urllib3 or requests runs another step with it."""
+
+    def getresponse(self):
+        answers = _CALL_ANSWERS.get()
+        answers.append(super().getresponse())
+        return answers[-1]
+
+
+class _Json2HTTPConnection(
+    _AnswerRecording,
+    _MarkedSending,
+    _Quiet,
+    urllib3.connection.HTTPConnection,
+    _AnswerClosing,
+):
+    """urllib3's connection for http, for JSON-2, with _AnswerRecording,
+    _MarkedSending and _AnswerClosing."""
+
+
+class _Json2HTTPSConnection(
+    _AnswerRecording,
+    _MarkedSending,
+    _Quiet,
+    urllib3.connection.HTTPSConnection,
+    _AnswerClosing,
+):
+    """urllib3's connection for https, for JSON-2, with _AnswerRecording,
+    _MarkedSending and _AnswerClosing."""
 
 
 class _Json2HTTPConnectionPool(urllib3.HTTPConnectionPool):
@@ -1967,21 +2006,10 @@ class _XmlRpc:
         failure = None
         try:
             # The login's Fault too, such as a db the server does not hold,
-            # is an error Odoo answers. The call, its login included, has a
-            # mark of its own (_own_mark), which nothing over XML-RPC sets.
-            with _own_mark():
-                self._log_in_once()
-                result = _send(
-                    self._profile,
-                    lambda: self._request(
-                        _execute_kw_request(
-                            self._config["db"],
-                            self._uid,
-                            self._config["password"].reveal(),
-                            params,
-                        )
-                    ),
-                )
+            # is an error Odoo answers. The call, its login included, runs in
+            # a context of its own (_own_context), in which nothing over
+            # XML-RPC sets the mark.
+            result = _own_context(self._logged_in_request, params)
         except xmlrpc.client.Fault as fault:
             password = self._config["password"]
             failure = OdooError(
@@ -1998,6 +2026,23 @@ class _XmlRpc:
         if failure is not None:
             raise failure
         return result
+
+    def _logged_in_request(self, params):
+        """The answer to the request of execute_kw with ``params``, the
+        call's own values marshalled (_request), after a login at the first
+        call; a failure of the transport raises RequestError (_send)."""
+        self._log_in_once()
+        return _send(
+            self._profile,
+            lambda: self._request(
+                _execute_kw_request(
+                    self._config["db"],
+                    self._uid,
+                    self._config["password"].reveal(),
+                    params,
+                )
+            ),
+        )
 
     def _log_in_once(self):
         """Log in at the first call, for the uid every call sends. Raises
@@ -2114,39 +2159,70 @@ class _Json2:
         if failure is not None:
             raise failure
         path = "/".join(urllib.parse.quote(name, safe="") for name in (model, method))
-        # Nothing of this call has gone out yet: its mark is its own
-        # (_own_mark), which its connections set (_MarkedSending).
-        with _own_mark():
-            # No logger of urllib3 logs a record of the call (_Json2CallRecords).
-            _filter_urllib3_loggers()
-            in_call = _IN_JSON2_CALL.set(True)
-            try:
-                failure, result = _send(
-                    self._profile,
-                    lambda: self._outcome(
-                        self._session.post(
-                            f"{self._url}/json/2/{path}",
-                            data=body.encode("ascii"),
-                            headers={
-                                "Content-Type": "application/json",
-                                # Without a session, Odoo takes the database
-                                # from this header when the server holds
-                                # several (odoo/http.py,
-                                # Request._get_session_and_dbname).
-                                "X-Odoo-Database": self._db,
-                            },
-                            timeout=self._timeout,
-                            # The body is read in _outcome, where its status
-                            # is known.
-                            stream=True,
-                        )
-                    ),
-                )
-            finally:
-                _IN_JSON2_CALL.reset(in_call)
+        # Nothing of this call has gone out yet: its mark is its own, in its
+        # own context (_own_context), which its connections set
+        # (_MarkedSending).
+        failure, result = _own_context(self._post, path, body)
+        # Raised here, once the call's context and the frame of _post are
+        # gone, and the answers they held with them: an answer kept in a frame
+        # of the error would keep its pool alive, whose connections urllib3
+        # closes only once the pool is collected, and its headers, which can
+        # echo the key.
         if failure is not None:
             raise failure
         return result
+
+    def _post(self, path, body):
+        """POST ``body`` to ``path``, under /json/2/: the outcome of the
+        answer (_outcome), or the RequestError of a failure of the transport
+        raised (_send). It runs in the call's own context (_own_context),
+        whose variables it sets."""
+        # No logger of urllib3 logs a record of the call (_Json2CallRecords).
+        _filter_urllib3_loggers()
+        _IN_JSON2_CALL.set(True)
+        # The answers its connections give (_AnswerRecording).
+        answers = []
+        _CALL_ANSWERS.set(answers)
+        try:
+            outcome = _send(
+                self._profile,
+                lambda: self._outcome(
+                    self._session.post(
+                        f"{self._url}/json/2/{path}",
+                        data=body.encode("ascii"),
+                        headers={
+                            "Content-Type": "application/json",
+                            # Without a session, Odoo takes the database from
+                            # this header when the server holds several
+                            # (odoo/http.py, Request._get_session_and_dbname).
+                            "X-Odoo-Database": self._db,
+                        },
+                        timeout=self._timeout,
+                        # The body is read in _outcome, where its status is
+                        # known.
+                        stream=True,
+                    )
+                ),
+            )
+        except BaseException:
+            # Whatever ends the call here, the RequestError _send raises for an
+            # error of the transport or what it lets through, an interrupt
+            # such as Ctrl-C among them, can stop the call where nothing
+            # closes an answer: urllib3 closes one, and its connection, after
+            # a failure as it reads the body, but not as it decodes what it
+            # read, nor does requests or the library in their own steps (a
+            # redirect's drain, _outcome). Each answer of the call is closed
+            # here, the socket of its body and the connection it still holds
+            # with it, and the error goes on as it is. An answer read whole
+            # gave its connection back to the pool, and closing it leaves that
+            # connection alone. Each is taken out of the list as it is closed,
+            # into no local: this frame stays in the traceback of the error,
+            # and a loop's variable would keep the last answer, whose headers
+            # can echo the key.
+            while answers:
+                answers.pop().close()
+            raise
+        return outcome
 
     def _outcome(self, response):
         """The outcome of ``response``, the answer to a call: (None, the

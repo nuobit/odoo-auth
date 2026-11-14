@@ -6,7 +6,13 @@ table the test fills and record every request they get, so that a test can
 check what was sent, and where.
 """
 
+import collections
+import collections.abc
+import configparser
 import contextlib
+import contextvars
+import email.message
+import http.client
 import http.server
 import json
 import os
@@ -19,6 +25,7 @@ import xmlrpc.server
 from unittest import mock
 
 import requests
+import urllib3
 
 # Dummy values of the stores; never a real credential. KEY has the shape of
 # an Odoo API key, 40 lowercase hexadecimal digits.
@@ -101,24 +108,107 @@ class StoreMixin:
 
 
 def _shown(local):
-    """What a printer of a frame's locals shows of ``local``: its repr, or
-    nothing when the repr fails, as it does for an object whose __init__
-    raised before setting what its repr reads, or a value nested deeper than
-    repr follows (pytest prints a placeholder instead).
+    """What a printer of a frame's locals shows of ``local``, and a debugger
+    one attribute down of the answers, requests and errors in it.
 
-    For an answer or a request of requests, whose repr shows only a status
-    or a method, also what a debugger shows one attribute down: the
-    answer's body, and the request's headers and body, which carry the
-    key (``response.request.headers``)."""
+    A printer shows a value's repr, or nothing when the repr fails, as it
+    does for an object whose __init__ raised before setting what its repr
+    reads (pytest prints a placeholder instead). A list, a tuple, a set or a
+    deque shows each of its items so, and a mapping its keys and its values,
+    at any depth, also when it is nested deeper than its repr follows, as a
+    debugger opens a dict: an answer or a request can sit in any container.
+    Every mapping is walked so, a mapping proxy, the headers of requests or
+    urllib3 and a context of contextvars, the values of its variables,
+    among them, but configparser's parser and its sections: mappings of a
+    store's text values, never of an answer or a request, which a debugger
+    shows by their attributes, as any object (debugpy opens as containers
+    only tuples, lists, dicts, ordered dicts, sets and frozensets). Each of
+    them shows its repr and the repr of each of its attributes, one level
+    down. A section's attributes, its parser and its name, show none of its
+    values, and the library's loader holds the store's section for that
+    (_read_section); a parser's sections show them all.
+
+    The repr of an answer, a request or an error of requests shows only a
+    status, a method or a message; that of an answer of urllib3 or of
+    http.client, or of a message's headers, only its class; that of
+    xmlrpc.client's ProtocolError, not its headers. Each also shows what a
+    debugger shows one attribute down, where the key can be: requests'
+    answer's body, url, headers, history (the answers of the redirects it
+    followed, each shown so), request and the next request of a redirect it
+    did not follow (``_next``); a prepared request's url, headers and body
+    (``response.request.headers``); a request's url, headers, params, data
+    and json; an error's request and answer; urllib3's answer's url,
+    headers and body, once read; http.client's answer's headers, and each
+    header of a message; a ProtocolError's url and headers. A redirect's
+    Location can echo the key: in its answer's headers, and in the url of
+    the request that follows it, which is also the url of that request's
+    answer."""
+    texts = []
+    pending = [local]
+    # Each value walked, by its id, kept alive so that no id is taken again
+    # by another value during the walk; each is shown once, which also ends
+    # the walk of a container that holds itself.
+    walked = {}
+    while pending:
+        value = pending.pop()
+        if id(value) not in walked:
+            walked[id(value)] = value
+            if isinstance(value, (configparser.RawConfigParser, configparser.SectionProxy)):
+                texts.append(_printed(value))
+                texts += [_printed(attribute) for attribute in vars(value).values()]
+            # A context of contextvars is a mapping from Python 3.14 only.
+            elif isinstance(value, (collections.abc.Mapping, contextvars.Context)):
+                pending += [*value.keys(), *value.values()]
+            elif isinstance(value, (list, tuple, set, frozenset, collections.deque)):
+                pending += value
+            else:
+                texts.append(_printed(value))
+                pending += _one_attribute_down(value)
+    return "".join(texts)
+
+
+def _printed(value):
+    """``value``'s repr, or nothing when the repr fails (_shown)."""
     try:
-        shown = repr(local)
+        printed = repr(value)
     except (AttributeError, RecursionError):
-        shown = ""
-    if isinstance(local, requests.Response):
-        shown += repr(local.content) + _shown(local.request)
-    elif isinstance(local, requests.PreparedRequest):
-        shown += repr(local.headers) + repr(local.body)
-    return shown
+        printed = ""
+    return printed
+
+
+def _one_attribute_down(value):
+    """What a debugger shows one attribute down of ``value``, an answer, a
+    request or an error of requests, an answer of urllib3 or of
+    http.client, a message's headers or xmlrpc.client's ProtocolError, where
+    its repr does not show it (_shown); nothing for any other value."""
+    if isinstance(value, requests.Response):
+        down = [
+            value._content,
+            value.url,
+            value.headers,
+            value.history,
+            value.request,
+            value._next,
+        ]
+    elif isinstance(value, requests.PreparedRequest):
+        down = [value.url, value.headers, value.body]
+    elif isinstance(value, requests.Request):
+        down = [value.url, value.headers, value.params, value.data, value.json]
+    elif isinstance(value, requests.RequestException):
+        down = [value.request, value.response]
+    elif isinstance(value, urllib3.response.HTTPResponse):
+        down = [value.url, value.headers, value._body]
+    elif isinstance(value, http.client.HTTPResponse):
+        # None until the answer's head is read, and unset on an answer whose
+        # making stopped before it.
+        down = [getattr(value, "headers", None)]
+    elif isinstance(value, email.message.Message):
+        down = value.items()
+    elif isinstance(value, xmlrpc.client.ProtocolError):
+        down = [value.url, value.headers]
+    else:
+        down = []
+    return down
 
 
 def free_port():
@@ -349,6 +439,13 @@ class KeepAliveOdoo:
     - "answer an error that stalls": a 500 whose head announces a body of
       10 bytes, of which only the first 4 come; the connection stays open,
       and the server reads on.
+    - "answer at length": a 200 whose body is LONG, as JSON; the connection
+      stays open.
+    - "redirect at length": a 303 to the same path, whose body is LONG; the
+      connection stays open.
+    - "answer at length, then close" and "redirect at length, then close":
+      either of those two, saying Connection: close; then the server closes
+      the connection.
     - "drop": the server closes the connection unanswered, as one that ran
       the call and broke off before its answer.
     - "reset": the server resets the connection unanswered.
@@ -357,6 +454,9 @@ class KeepAliveOdoo:
     ANSWER = 3
     # The 500's body, Fail, in chunks.
     CHUNKED_FAIL = b"Transfer-Encoding: chunked\r\n\r\n4\r\nFail\r\n0\r\n\r\n"
+    # A body of 128,890 bytes, which a client reads in several pieces: a
+    # list of numbers as JSON.
+    LONG = json.dumps(list(range(20_000))).encode()
 
     def __init__(self, plan=None):
         self.plan = plan if plan is not None else {}
@@ -421,6 +521,11 @@ class KeepAliveOdoo:
                     break
                 elif action == "answer an error that stalls":
                     connection.sendall(self._error(b"Content-Length: 10\r\n\r\nFail"))
+                elif action in self._AT_LENGTH:
+                    status, closes = self._AT_LENGTH[action]
+                    connection.sendall(self._at_length(status, path, closes))
+                    if closes:
+                        break
                 elif action == "drop":
                     break
                 elif action == "reset":
@@ -462,6 +567,26 @@ class KeepAliveOdoo:
         """A 500 whose head ends with ``rest``, its last headers, the blank
         line, then its body."""
         return b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\n" + rest
+
+    # The status of each action that answers with LONG, and whether it
+    # closes the connection after it.
+    _AT_LENGTH = {
+        "answer at length": ("200 OK", False),
+        "redirect at length": ("303 See Other", False),
+        "answer at length, then close": ("200 OK", True),
+        "redirect at length, then close": ("303 See Other", True),
+    }
+
+    def _at_length(self, status, path, closes):
+        """An answer of ``status`` whose body is LONG: a 303 to ``path``,
+        and with Connection: close when it ``closes``."""
+        location = f"Location: {path}\r\n" if status.startswith("303") else ""
+        connection = "Connection: close\r\n" if closes else ""
+        head = (
+            f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{location}"
+            f"{connection}Content-Length: {len(self.LONG)}\r\n\r\n"
+        )
+        return head.encode() + self.LONG
 
     def _answer(self, path):
         if path.startswith("/xmlrpc/"):
