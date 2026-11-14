@@ -42,7 +42,8 @@ What else a 1.x caller meets:
   after anything its handshake raises, an interrupt such as Ctrl-C among
   them, where earlier releases close it only after an `OSError` or a
   `ValueError`; a `Client` relies on it to leave no socket open when a
-  handshake fails or is interrupted.
+  handshake fails or is interrupted (an interrupt in the few steps of
+  `ssl` before the handshake starts is another matter: § Library usage).
 - A profile is refused too when its `url` holds a backslash, port 0, a
   query or a fragment, or a host IDNA refuses, or when its `url`, `db`,
   `user` or `api` holds its `password` (§ Configure a profile).
@@ -238,8 +239,34 @@ A `Client` keeps its connection open from one call to the next, over both
 APIs, and checks it before a request goes out on it, as `urllib3` checks a
 connection of its pool: when the server has closed it since its last
 answer, the request goes out on a new connection. After a failure of the
-connection it keeps none, and leaves no socket open. Each request goes out
-once, never again by itself after a failure ([Errors](#errors)).
+connection it keeps none, and leaves no socket open, but for two cases,
+each in a few steps of the code that opens the connection, before the
+connection holds what that code makes:
+
+- The TCP connect. `socket.create_connection` (XML-RPC) and `urllib3`'s
+  (JSON-2) close the socket they make only after an `OSError`, and the
+  connection holds that socket only once it comes back to the
+  connection's `connect`. An interrupt such as Ctrl-C that lands from the
+  socket's creation to that moment, in the TCP connect above all, leaves
+  the socket to Python's garbage collector, which closes it with a
+  `ResourceWarning`. An interrupted connect goes on in the system, so the
+  socket may end up connected. Nothing of the request was sent on it: the
+  call raises the same interrupt, and the next call works.
+- The start of the TLS handshake, over https. Python's `ssl` makes its TLS
+  socket on the TCP socket's file descriptor, then detaches the TCP
+  socket, and only then enters the `try` whose bare `except` closes the
+  TLS socket after anything the handshake raises (`SSLSocket._create`).
+  An interrupt in those few steps leaves the TLS socket to the garbage
+  collector, which closes its descriptor later, with a `ResourceWarning`.
+  Before the detach, the connection's close has closed that descriptor
+  already, through the TCP socket: by the time the collector closes it
+  again, the process may have given that number to another file or
+  socket, a later call's connection among them, and that close fails
+  (`EBADF`) or closes the other one under its owner. Nothing of the
+  request was sent: the call raises the same interrupt.
+
+Each request goes out once, never again by itself after a failure
+([Errors](#errors)).
 
 ### ServerProxy: the XML-RPC drop-in
 

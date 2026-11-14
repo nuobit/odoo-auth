@@ -158,6 +158,35 @@ class StubTestCase(StoreMixin, unittest.TestCase):
         self.addCleanup(patcher.stop)
         return opened
 
+    @contextlib.contextmanager
+    def interrupted_connect(self, number, interrupt):
+        """For the with block: the TCP connect of the ``number``-th socket
+        that connects in it, from 1, raises ``interrupt`` instead of
+        connecting (socket.socket.connect, which socket.create_connection
+        calls for http.client, and urllib3.util.connection's for urllib3);
+        every other socket connects. The block ends by closing that socket,
+        which the library leaves to the garbage collector, without checking
+        whether anything closed it first: Python or urllib3 may close it one
+        day. Closed here, it gives no ResourceWarning when it is collected."""
+        connects = 0
+        interrupted = []
+        connect = socket.socket.connect
+
+        def interrupting(sock, address):
+            nonlocal connects
+            connects += 1
+            if connects == number:
+                interrupted.append(sock)
+                raise interrupt
+            return connect(sock, address)
+
+        try:
+            with mock.patch.object(socket.socket, "connect", interrupting):
+                yield
+        finally:
+            for sock in interrupted:
+                sock.close()
+
     def wait_for_heads(self):
         """From now to the end of the test, each connection of http.client,
         urllib3's among them, waits up to HOLD seconds for the head of an
@@ -2457,6 +2486,50 @@ class KeptConnectionTest(StubTestCase):
                 # recorded, the interrupted one's among them, in any order.
                 odoo.stop()
                 self.assertCountEqual(odoo.requests, received)
+
+    def test_an_interrupted_tcp_connect_sends_nothing_and_the_next_call_works(self):
+        # An interrupt, such as Ctrl-C, in the TCP connect itself, the
+        # login's or the call's: socket.create_connection, which makes the
+        # socket for http.client, closes it only after an OSError, and the
+        # connection, whose sock http.client sets once connected, never got
+        # it. The connection's close does not reach it, and it is left to the
+        # garbage collector: the test checks nothing of that socket
+        # (interrupted_connect). Nothing went out on it: the interrupt goes on
+        # unchanged, and the next call works, on a new connection, after a
+        # login of its own when the login's connect was the one interrupted.
+        self.fail_on_resource_warnings()
+        connects = {"the login's connect": 1, "the call's connect": 2}
+        for case, number in connects.items():
+            with self.subTest(case=case):
+                odoo = self.start(KeepAliveOdoo())
+                self.make_profile(odoo.url, "xmlrpc", PASSWORD)
+                interrupt = KeyboardInterrupt()
+                with self.interrupted_connect(number, interrupt):
+                    with Client("erp") as client:
+                        with self.assertRaises(KeyboardInterrupt) as raised:
+                            client.call("res.partner", "search_count", domain=[])
+                        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                self.assertIs(raised.exception, interrupt)
+                self.assertEqual(odoo.requests, [(1, "login"), (2, "call")])
+
+    def test_an_interrupted_json2_tcp_connect_sends_nothing_and_the_next_call_works(self):
+        # The test above over JSON-2, which has no login: urllib3's
+        # create_connection, which makes the socket, closes it only after an
+        # OSError, and urllib3 closes the connection, which never got it,
+        # after anything a request raises (HTTPConnectionPool.urlopen). The
+        # socket is left to the garbage collector too, the interrupt goes on
+        # unchanged, and the next call goes out on a new connection.
+        self.fail_on_resource_warnings()
+        odoo = self.start(KeepAliveOdoo())
+        self.make_profile(odoo.url, "json2", KEY)
+        interrupt = KeyboardInterrupt()
+        with self.interrupted_connect(1, interrupt):
+            with Client("erp") as client:
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    client.call("res.partner", "search_count", domain=[])
+                self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertIs(raised.exception, interrupt)
+        self.assertEqual(odoo.requests, [(1, "call")])
 
     def test_an_interrupted_tls_handshake_leaves_nothing_for_the_next_call(self):
         # Offline: the login is replaced, and the server, which speaks no

@@ -1109,7 +1109,7 @@ class _AnswerClosing:
     http.client hands that answer its socket (HTTPConnection.getresponse),
     and xmlrpc.client does not close an answer it fails to read: a
     transport that closes its connection after a failure (_Sending) then
-    leaves no socket open."""
+    leaves no answer's socket open."""
 
     _answer = None
 
@@ -1281,7 +1281,20 @@ class _Sending:
     raises, an interrupt such as Ctrl-C among them, the connection is
     closed before the error goes on, unchanged, and no socket of it is left
     open. A Fault, Odoo's own answer, read whole, keeps it, as any answer
-    does.
+    does. An interrupt from the moment socket.create_connection makes its
+    socket to the moment that function returns it to the connection's
+    connect, in the TCP connect above all, leaves that socket to the
+    garbage collector: that function closes it only after an OSError, and
+    the connection, whose sock http.client sets then, never got it. An
+    interrupted connect goes on in the system, so the socket may end up
+    connected; nothing of the request went out on it, and the next request
+    goes out on a new connection. Over https, the close does not reach the
+    TLS socket ssl makes on the TCP socket's descriptor either, in the few
+    steps before the try that closes it after anything the handshake raises
+    (SSLSocket._create, which detaches the TCP socket on the way): an
+    interrupt there leaves it to the garbage collector, whose close of the
+    descriptor comes later, after the connection's own when the interrupt
+    came before the detach, by then perhaps another file's or socket's.
 
     ServerProxy keeps xmlrpc.client's own sending: it writes a request on
     its kept connection unchecked, and sends it again after those errors."""
@@ -1319,10 +1332,12 @@ class _Sending:
             # descriptor over is closed by ssl itself after anything the
             # handshake raises, from Python 3.11.8 and 3.12.2
             # (SSLSocket._create): the reason the library requires 3.11.8 or
-            # later, but not 3.12.0 or 3.12.1. An interrupted send leaves the
-            # connection in the middle of a request. The connection is closed
-            # here, with the answer it handed its socket to (_AnswerClosing),
-            # and the error goes on as it is.
+            # later, but not 3.12.0 or 3.12.1. ssl makes it a few steps before
+            # the try that closes it, and an interrupt in those steps leaves
+            # it to the garbage collector (_Sending). An interrupted send
+            # leaves the connection in the middle of a request. The connection
+            # is closed here, with the answer it handed its socket to
+            # (_AnswerClosing), and the error goes on as it is.
             self.close()
             raise
         return answer
