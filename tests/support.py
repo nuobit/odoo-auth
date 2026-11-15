@@ -59,7 +59,7 @@ class StoreMixin:
             home = getattr(self, "_home", None)
             if home is None:
                 home = self.use_home()
-            folder = os.path.join(home, ".config", "odoo-xmlrpc-auth")
+            folder = os.path.join(home, ".config", "odoo-auth")
             os.makedirs(folder)
             os.chmod(folder, 0o700)
             self._store_folder = folder

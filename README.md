@@ -1,4 +1,4 @@
-# odoo-xmlrpc-auth
+# odoo-auth
 
 A minimal CLI proxy and Python library for calls to Odoo, over XML-RPC or
 Odoo's External JSON-2 API. Its only job is to **inject credentials** so they
@@ -7,19 +7,19 @@ never appear in command history or scripts.
 ## Install
 
 ```bash
-pip install git+https://github.com/NuoBiT/odoo-xmlrpc-auth.git
+pip install git+https://github.com/NuoBiT/odoo-auth.git
 ```
 
 Update:
 
 ```bash
-pip install --upgrade git+https://github.com/NuoBiT/odoo-xmlrpc-auth.git
+pip install --upgrade git+https://github.com/NuoBiT/odoo-auth.git
 ```
 
 Uninstall:
 
 ```bash
-pip uninstall odoo-xmlrpc-auth
+pip uninstall odoo-auth
 ```
 
 ## Upgrading to 2.0
@@ -31,6 +31,16 @@ installing 2.0. `api = xmlrpc` keeps a profile working as before.
 
 What else a 1.x caller meets:
 
+- The library's new names: the distribution `odoo-auth`, the package
+  `odoo_auth` and the command `odoo-auth`. 2.0 ships nothing under 1.x's
+  names, so a script written for 1.x must import and run these instead.
+- 2.0 is another distribution, so installing it leaves 1.x in place:
+  uninstall 1.x first, or its package and command stay installed, and a
+  script still on them keeps running 1.x.
+- 2.0 reads the profiles from `~/.config/odoo-auth/` only, a folder 1.x
+  does not read: each profile must be there, and a script that opens the
+  store's folder itself, rather than through the library, must open that
+  one.
 - Python 3.11.8 or later, but not 3.12.0 or 3.12.1, and `requests`
   2.32.3 and `urllib3` 2.6.0 or later, which must be importable whatever
   the profile's API: the client imports them when it is imported.
@@ -64,11 +74,11 @@ What else a 1.x caller meets:
 ## CLI usage
 
 ```
-odoo-xmlrpc-auth --profile <name> '<json>'
-         │                │          │
-         │                │          └─ one JSON object: the call, by name
-         │                └─ profile name → reads ~/.config/odoo-xmlrpc-auth/<name>.conf
-         └─ calls Odoo over the API the profile names, prints the result as JSON
+odoo-auth --profile <name> '<json>'
+    │                 │       │
+    │                 │       └─ one JSON object: the call, by name
+    │                 └─ profile name → reads ~/.config/odoo-auth/<name>.conf
+    └─ calls Odoo over the API the profile names, prints the result as JSON
 ```
 
 The payload is a `Client.call` (below) written as JSON:
@@ -87,19 +97,19 @@ them.
 
 ```bash
 # Read a record
-odoo-xmlrpc-auth --profile customer1 \
+odoo-auth --profile customer1 \
   '{"model":"res.partner","method":"read","ids":[1],"kwargs":{"fields":["name"]}}'
 
 # Search with fields and a limit
-odoo-xmlrpc-auth --profile customer1 \
+odoo-auth --profile customer1 \
   '{"model":"project.task","method":"search_read","kwargs":{"domain":[["project_id","=",5]],"fields":["name","stage_id"],"limit":10}}'
 
 # Rename a task
-odoo-xmlrpc-auth --profile customer1 \
+odoo-auth --profile customer1 \
   '{"model":"project.task","method":"write","ids":[42],"kwargs":{"vals":{"name":"Fixed"}}}'
 
 # Create a task, on either API
-odoo-xmlrpc-auth --profile customer1 \
+odoo-auth --profile customer1 \
   '{"model":"project.task","method":"create","kwargs":{"vals_list":[{"name":"Bug: login broken","project_id":42}]}}'
 ```
 
@@ -110,7 +120,7 @@ arguments, through the same login and with the same errors as a call by
 name:
 
 ```bash
-odoo-xmlrpc-auth --profile customer1 \
+odoo-auth --profile customer1 \
   '{"model":"project.task","method":"create","args":[{"name":"Bug: login broken","project_id":42}]}'
 ```
 
@@ -149,7 +159,7 @@ another character that does not print, as a profile's name always does.
 `Client` calls Odoo by name, over the API the profile's `api` line names:
 
 ```python
-from odoo_xmlrpc_auth.client import Client
+from odoo_auth.client import Client
 
 with Client(profile="customer1") as odoo:
     companies = odoo.call(
@@ -315,7 +325,7 @@ Drop-in replacement for `xmlrpc.client.ServerProxy`, for `api = xmlrpc`
 profiles. Just change the import and add `profile=`:
 
 ```python
-from odoo_xmlrpc_auth.client import ServerProxy
+from odoo_auth.client import ServerProxy
 
 proxy = ServerProxy(profile="customer1")
 
@@ -554,10 +564,10 @@ frame's locals.
 One file per Odoo instance, `chmod 600`:
 
 ```bash
-mkdir -p ~/.config/odoo-xmlrpc-auth
-chmod 700 ~/.config/odoo-xmlrpc-auth
+mkdir -p ~/.config/odoo-auth
+chmod 700 ~/.config/odoo-auth
 
-cat > ~/.config/odoo-xmlrpc-auth/customer1.conf << 'CONF'
+cat > ~/.config/odoo-auth/customer1.conf << 'CONF'
 [odoo]
 url=https://customer1.odoo.com
 db=prod_db
@@ -566,7 +576,7 @@ password=your-api-key
 api=json2
 CONF
 
-chmod 600 ~/.config/odoo-xmlrpc-auth/customer1.conf
+chmod 600 ~/.config/odoo-auth/customer1.conf
 ```
 
 `api` names the API every call of the profile goes through:

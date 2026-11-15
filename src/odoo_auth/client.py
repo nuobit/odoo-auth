@@ -967,7 +967,7 @@ def _read_section(profile):
     """
     if os.sep in profile or profile.startswith("."):
         raise ConfigError(f"Invalid profile name: {profile!r}")
-    config_dir = os.path.expanduser("~/.config/odoo-xmlrpc-auth")
+    config_dir = os.path.expanduser("~/.config/odoo-auth")
     config_path = os.path.join(config_dir, f"{profile}.conf")
 
     failure = None
@@ -1755,7 +1755,7 @@ class ServerProxy(xmlrpc.client.ServerProxy):
 
     Usage::
 
-        from odoo_xmlrpc_auth.client import ServerProxy
+        from odoo_auth.client import ServerProxy
 
         proxy = ServerProxy(profile="customer1")
         tasks = proxy.execute_kw("project.task", "search_read",
@@ -1784,7 +1784,7 @@ class ServerProxy(xmlrpc.client.ServerProxy):
                 raise ConfigError(
                     f"Profile {profile!r} has `api = json2`, and ServerProxy "
                     "speaks XML-RPC only: call it through "
-                    f"odoo_xmlrpc_auth.client.Client(profile={profile!r})"
+                    f"odoo_auth.client.Client(profile={profile!r})"
                 )
             self._profile = profile
             self._db = config["db"]
@@ -2680,7 +2680,7 @@ class Client:
 
     Usage::
 
-        from odoo_xmlrpc_auth.client import Client
+        from odoo_auth.client import Client
 
         with Client(profile="customer1") as odoo:
             companies = odoo.call(
