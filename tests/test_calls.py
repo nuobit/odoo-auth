@@ -2279,6 +2279,28 @@ class ArgumentTest(StubTestCase):
         self.assertNeverShows(error, KEY)
 
 
+class StubsTest(StubTestCase):
+    """What the stubs of support.py answer by themselves, which the tests
+    that start them rely on."""
+
+    def test_a_request_to_a_bare_recorder_gets_a_404_with_an_empty_body(self):
+        # A bare HttpRecorder stands where no request may go, such as
+        # another origin a redirect names, or a proxy of the environment:
+        # what reaches it is recorded, and answered as HttpRecorder says.
+        recorder = self.start(HttpRecorder())
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", recorder.server.server_address[1], timeout=HOLD
+        )
+        self.addCleanup(connection.close)
+        connection.request("POST", "/json/2/res.partner/read", body=b"{}")
+        answer = connection.getresponse()
+        self.assertEqual((answer.status, answer.read()), (404, b""))
+        self.assertEqual(
+            [(request["method"], request["path"]) for request in recorder.requests],
+            [("POST", "/json/2/res.partner/read")],
+        )
+
+
 class ShownTest(unittest.TestCase):
     """What the frames tests below read of a local (support._shown): each
     holder of the key shows it, one attribute down of the answers, requests
@@ -4762,12 +4784,71 @@ class CutOffTest(StubTestCase):
                             caller.run(variables._REQUEST_STARTED.get),
                             caller.run(variables._IN_JSON2_CALL.get),
                             caller.run(variables._CALL_ANSWERS.get, None),
+                            caller.run(variables._CLIENT_CONNECTIONS.get, None),
                         ),
-                        (True, False, None),
+                        (True, False, None, None),
                     )
                 # Every call but the last was interrupted, some of them in the
                 # call's own context, and the last ran whole.
                 self.assertEqual(results, [3])
+                self.assertIn(read_in_the_call, read_at_the_interrupts)
+
+    def test_an_interrupt_at_any_line_of_a_call_that_fails_leaves_its_callers_context(self):
+        # The test above, over a call that fails. Its trace function stops
+        # tracing once it raises (interrupted_at_line), so a call that
+        # succeeds has no line of a cleanup after a failure interrupted. Here
+        # the call's cleanup lines run traced, and each is interrupted in
+        # turn: over XML-RPC the call gets a 500, after which the transport
+        # closes its connection; over JSON-2 a redirect whose body breaks
+        # off, which the drain closes, then the call each answer it got. The
+        # last call fails whole, with the error of its status.
+        self.fail_on_resource_warnings()
+        login_and_call = self.start(RawXmlRpc())
+        login_and_call.call_answer = Answer(500, b"Fail", {"Content-Type": "text/html"})
+        json2 = self.start(Json2Odoo())
+        json2.answers[("res.partner", "write")] = RawAnswer(
+            b"HTTP/1.1 303 See Other\r\nLocation: /json/2/res.partner/search_count\r\n"
+            b"Connection: close\r\nContent-Length: 100000\r\n\r\nthe start of a body"
+        )
+        variables = odoo_xmlrpc_auth.client
+        cases = {
+            "xmlrpc": (login_and_call, PASSWORD, variables._REQUEST_STARTED.get, False, 500),
+            "json2": (json2, KEY, variables._IN_JSON2_CALL.get, True, 303),
+        }
+        for api, (stub, secret, read, read_in_the_call, code) in cases.items():
+            with self.subTest(api=api):
+                self.make_profile(stub.url, api, secret, f"erp-{api}")
+                caller = contextvars.copy_context()
+                caller.run(variables._REQUEST_STARTED.set, True)
+                errors = []
+                read_at_the_interrupts = []
+                number = 0
+                while not errors:
+                    number += 1
+                    interrupt = KeyboardInterrupt()
+                    with Client(f"erp-{api}") as client:
+                        with self.interrupted_at_line(number, interrupt, read) as read_there:
+                            with contextlib.suppress(KeyboardInterrupt):
+                                errors.append(
+                                    caller.run(
+                                        self.raised,
+                                        RequestError,
+                                        lambda: client.call("res.partner", "write", [7], vals={}),
+                                    )
+                                )
+                    read_at_the_interrupts += read_there
+                    self.assertEqual(
+                        (
+                            caller.run(variables._REQUEST_STARTED.get),
+                            caller.run(variables._IN_JSON2_CALL.get),
+                            caller.run(variables._CALL_ANSWERS.get, None),
+                            caller.run(variables._CLIENT_CONNECTIONS.get, None),
+                        ),
+                        (True, False, None, None),
+                    )
+                # Every call but the last was interrupted, some of them in the
+                # call's own context, and the last failed whole.
+                self.assertEqual([error.code for error in errors], [code])
                 self.assertIn(read_in_the_call, read_at_the_interrupts)
 
     def test_server_proxy_sends_a_call_cut_off_a_second_time(self):
