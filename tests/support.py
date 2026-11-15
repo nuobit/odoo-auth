@@ -18,6 +18,7 @@ import json
 import os
 import socket
 import struct
+import sys
 import tempfile
 import threading
 import xmlrpc.client
@@ -355,12 +356,24 @@ class HttpRecorder:
             def log_message(self, *args):
                 pass
 
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server = _StubServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.stop = serve(self.server)
 
     def answer(self, request):
         return Answer(404, b"")
+
+
+class _StubServer(http.server.ThreadingHTTPServer):
+    """http.server's threading server, for the stubs, that reports nothing
+    of a client gone before the stub's answer reached it, as a call a test
+    interrupts goes: the stub's write then raises a ConnectionError, a
+    broken pipe or a reset. Any other error is reported as the server
+    reports it, its traceback on stderr."""
+
+    def handle_error(self, request, client_address):
+        if not isinstance(sys.exc_info()[1], ConnectionError):
+            super().handle_error(request, client_address)
 
 
 class Json2Odoo(HttpRecorder):
