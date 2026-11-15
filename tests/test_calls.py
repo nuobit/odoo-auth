@@ -39,9 +39,9 @@ from unittest import mock
 import requests
 import urllib3
 
-import odoo_xmlrpc_auth.client
-from odoo_xmlrpc_auth import cli
-from odoo_xmlrpc_auth.client import (
+import odoo_auth.client
+from odoo_auth import cli
+from odoo_auth.client import (
     ArgumentError,
     AuthError,
     Client,
@@ -273,7 +273,7 @@ class StubTestCase(StoreMixin, unittest.TestCase):
         gets, as the interrupt is raised, what ``read()`` gives in the code it
         stops: empty when fewer lines ran. No collection of garbage runs in
         the block (collector_paused)."""
-        source = odoo_xmlrpc_auth.client.__file__
+        source = odoo_auth.client.__file__
         lines = 0
         read_at_the_interrupt = []
 
@@ -1534,9 +1534,9 @@ class Json2ClientTest(StubTestCase):
 
         self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}", MakesALogger)
         after = self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}")
-        odoo_xmlrpc_auth.client._filter_urllib3_loggers()
+        odoo_auth.client._filter_urllib3_loggers()
         self.assertEqual(len(made), 1)
-        self.assertEqual(after.filters, [odoo_xmlrpc_auth.client._JSON2_CALL_RECORDS])
+        self.assertEqual(after.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
 
     def test_a_logger_dropped_between_two_steps_of_the_walk_breaks_nothing(self):
         # The test above, for a logger dropped: walking logging's dict
@@ -1552,9 +1552,9 @@ class Json2ClientTest(StubTestCase):
 
         self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}", DropsALogger)
         after = self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}")
-        odoo_xmlrpc_auth.client._filter_urllib3_loggers()
+        odoo_auth.client._filter_urllib3_loggers()
         self.assertEqual(dropped, [doomed])
-        self.assertEqual(after.filters, [odoo_xmlrpc_auth.client._JSON2_CALL_RECORDS])
+        self.assertEqual(after.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
 
     @unittest.skipIf(
         sys.version_info >= (3, 12),
@@ -1590,12 +1590,12 @@ class Json2ClientTest(StubTestCase):
         gc.set_threshold(1)
         plant()
         try:
-            odoo_xmlrpc_auth.client._filter_urllib3_loggers()
+            odoo_auth.client._filter_urllib3_loggers()
         finally:
             gc.set_threshold(*threshold)
             armed.clear()
         self.assertNotEqual(made, [])
-        self.assertEqual(unfiltered.filters, [odoo_xmlrpc_auth.client._JSON2_CALL_RECORDS])
+        self.assertEqual(unfiltered.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
 
     @unittest.skipIf(
         sys.version_info >= (3, 12),
@@ -1631,14 +1631,14 @@ class Json2ClientTest(StubTestCase):
             DropsALogger(name)
         gc.set_threshold(1)
         try:
-            odoo_xmlrpc_auth.client._filter_urllib3_loggers()
+            odoo_auth.client._filter_urllib3_loggers()
             # Counted before the collection below, which runs every finalizer
             # still waiting: each logger was dropped inside the walk.
             self.assertEqual(len(dropped), 200)
         finally:
             gc.set_threshold(*threshold)
             gc.collect()
-        self.assertEqual(unfiltered.filters, [odoo_xmlrpc_auth.client._JSON2_CALL_RECORDS])
+        self.assertEqual(unfiltered.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
 
     def test_urllib3_logs_nothing_of_an_https_call(self):
         # Offline, the TLS sockets fakes: an answer whose header's name
@@ -1978,7 +1978,7 @@ class Json2ClientTest(StubTestCase):
         # patched out here to reach the check of each request behind it.
         # requests ends the host at the backslash: the call would go to
         # 127.0.0.1, port 80.
-        with mock.patch("odoo_xmlrpc_auth.client._check_url"):
+        with mock.patch("odoo_auth.client._check_url"):
             client = self.make_client(
                 "http://127.0.0.1\\.odoo.example.com:8069", "json2", KEY, "other"
             )
@@ -2044,7 +2044,7 @@ class Json2ClientTest(StubTestCase):
             with self.subTest(name=name):
                 with self.assertRaises(ValueError) as caught:
                     self.client.call(name, "read", [7])
-                self.assertIsInstance(caught.exception, odoo_xmlrpc_auth.client.ArgumentError)
+                self.assertIsInstance(caught.exception, odoo_auth.client.ArgumentError)
                 with self.assertRaises(ValueError):
                     self.client.call("res.partner", name, [7])
         self.assertEqual(self.odoo.requests, [])
@@ -2052,7 +2052,7 @@ class Json2ClientTest(StubTestCase):
     def test_ids_that_are_not_a_list_are_refused_before_sending(self):
         with self.assertRaisesRegex(TypeError, "ids must be None") as caught:
             self.client.call("res.partner", "read", 7)
-        self.assertIsInstance(caught.exception, odoo_xmlrpc_auth.client.ArgumentError)
+        self.assertIsInstance(caught.exception, odoo_auth.client.ArgumentError)
         self.assertEqual(self.odoo.requests, [])
 
 
@@ -2112,7 +2112,7 @@ class ArgumentTest(StubTestCase):
         )
         self.assertNoFrameHolds(error, password)
         self.assertNeverShows(error, password)
-        self.assertIsInstance(error, odoo_xmlrpc_auth.client.ArgumentError)
+        self.assertIsInstance(error, odoo_auth.client.ArgumentError)
         self.assertTrue(str(error).startswith("A call of profile 'erp' cannot be sent: "))
 
     def test_a_value_xmlrpc_cannot_marshal_is_refused_unsent(self):
@@ -2174,7 +2174,7 @@ class ArgumentTest(StubTestCase):
         odoo = self.start(XmlRpcOdoo())
         odoo.answers[("res.partner", "write")] = True
         client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
-        module = odoo_xmlrpc_auth.client
+        module = odoo_auth.client
         written, carried = [], []
         dumps, request = xmlrpc.client.Marshaller.dumps, module._execute_kw_request
 
@@ -2442,7 +2442,7 @@ class FramesTest(StubTestCase):
         SystemExit, raised in its handler of that ConfigError, which the
         exit keeps as its __context__, with its frames."""
         payload = '{"model": "res.partner", "method": "search"}'
-        argv = ["odoo-xmlrpc-auth", "--profile", profile, payload]
+        argv = ["odoo-auth", "--profile", profile, payload]
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
             cli_exit = self.raised(SystemExit, cli.main)
         return {
@@ -2543,14 +2543,14 @@ class FramesTest(StubTestCase):
     def test_no_frame_of_a_store_accessible_by_others_holds_the_password(self):
         # Refused before the file is read.
         self.make_profile(f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD)
-        folder = os.path.join(os.environ["HOME"], ".config", "odoo-xmlrpc-auth")
+        folder = os.path.join(os.environ["HOME"], ".config", "odoo-auth")
         os.chmod(folder, 0o755)
         refused = {"the folder": self.refusals("erp")}
         os.chmod(folder, 0o700)
         os.chmod(os.path.join(folder, "erp.conf"), 0o644)
         refused["the file"] = self.refusals("erp")
         self.assertIn(
-            "odoo-xmlrpc-auth is accessible by others", str(refused["the folder"]["Client"])
+            "odoo-auth is accessible by others", str(refused["the folder"]["Client"])
         )
         self.assertIn("erp.conf is accessible by others", str(refused["the file"]["Client"]))
         for case, refusals in refused.items():
@@ -2562,7 +2562,7 @@ class FramesTest(StubTestCase):
         # The read fails once the password's line is read.
         self.make_profile(f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD)
         with mock.patch.object(
-            odoo_xmlrpc_auth.client, "open", create=True, new=open_failing_at_its_end
+            odoo_auth.client, "open", create=True, new=open_failing_at_its_end
         ):
             refusals = self.refusals("erp")
         self.assertIn("erp.conf cannot be read (Input/output error)", str(refusals["Client"]))
@@ -2657,7 +2657,7 @@ class FramesTest(StubTestCase):
             f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD, "erp-xmlrpc"
         )
         made_in_the_middle = []
-        outcome = odoo_xmlrpc_auth.client._Json2._outcome
+        outcome = odoo_auth.client._Json2._outcome
 
         def in_the_middle(json2, response):
             made_in_the_middle.append(
@@ -2668,7 +2668,7 @@ class FramesTest(StubTestCase):
             )
             return outcome(json2, response)
 
-        with mock.patch.object(odoo_xmlrpc_auth.client._Json2, "_outcome", in_the_middle):
+        with mock.patch.object(odoo_auth.client._Json2, "_outcome", in_the_middle):
             self.assertEqual(json2_client.call("res.partner", "search_count", domain=[]), 3)
         (error,) = made_in_the_middle
         self.assertNoFrameHolds(error, KEY)
@@ -2727,7 +2727,7 @@ class WireDebugTest(StubTestCase):
             self.addCleanup(transport.close)
             return UID
 
-        with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", log_in):
+        with mock.patch.object(odoo_auth.client, "_log_in", log_in):
             proxy = ServerProxy(profile="https-xmlrpc")
         self.addCleanup(proxy("close"))
         adapter = json2_client._transport._session.get_adapter(url)
@@ -2908,7 +2908,7 @@ class ServerProxyTransportTest(StubTestCase):
         # sent, as a connection connects only when it sends.
         self.make_profile("https://127.0.0.1", "xmlrpc", PASSWORD, "https")
         context = ssl.create_default_context()
-        with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", return_value=UID):
+        with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
             proxy = ServerProxy(profile="https", context=context)
         self.addCleanup(proxy("close"))
         transport = proxy("transport")
@@ -3444,7 +3444,7 @@ class KeptConnectionTest(StubTestCase):
                 interrupt = KeyboardInterrupt()
                 with Client(f"erp-{api}") as client:
                     with self.interrupted_as_it_starts(
-                        odoo_xmlrpc_auth.client._HTTPResponse.__init__, number, interrupt
+                        odoo_auth.client._HTTPResponse.__init__, number, interrupt
                     ):
                         error = self.raised(
                             KeyboardInterrupt,
@@ -3816,7 +3816,7 @@ class KeptConnectionTest(StubTestCase):
                 self.make_profile(odoo.url.replace("http://", "https://"), "xmlrpc", PASSWORD)
                 interrupt = KeyboardInterrupt()
                 reset = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
-                with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", return_value=UID):
+                with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
                     with mock.patch.object(owner, step, side_effect=[interrupt, reset]):
                         with Client("erp") as client:
                             with self.assertRaises(KeyboardInterrupt) as raised:
@@ -4125,7 +4125,7 @@ class CutOffTest(StubTestCase):
         self.make_profile("https://127.0.0.1", "xmlrpc", PASSWORD)
         tcp_socket = mock.create_autospec(socket.socket, instance=True)
         reset = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
-        with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", return_value=UID):
+        with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
             with mock.patch("socket.create_connection", return_value=tcp_socket):
                 with mock.patch.object(
                     ssl.SSLContext, "wrap_socket", side_effect=reset
@@ -4174,7 +4174,7 @@ class CutOffTest(StubTestCase):
             + body
         )
         reset = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
-        with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", return_value=UID):
+        with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
             with mock.patch(
                 "socket.create_connection", side_effect=[failed_tcp_socket, tcp_socket]
             ):
@@ -4263,7 +4263,7 @@ class CutOffTest(StubTestCase):
         with mock.patch("socket.create_connection", return_value=tcp_socket) as connect:
             with mock.patch.object(ssl.SSLContext, "wrap_socket", return_value=tls_socket):
                 self.raised(
-                    odoo_xmlrpc_auth.client._CutOff,
+                    odoo_auth.client._CutOff,
                     lambda: transport.request("127.0.0.1", "/xmlrpc/2/object", b"<call/>"),
                 )
         connect.assert_called_once()
@@ -4787,7 +4787,7 @@ class CutOffTest(StubTestCase):
         xmlrpc_client = self.make_client(
             f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD, "erp-xmlrpc"
         )
-        variables = odoo_xmlrpc_auth.client
+        variables = odoo_auth.client
         read_in_the_middle = []
         logged_in_request = variables._XmlRpc._logged_in_request
 
@@ -4826,7 +4826,7 @@ class CutOffTest(StubTestCase):
         # the answer's head is read, none of them is set in the caller's
         # context, whatever the call set in its own.
         odoo = self.start(KeepAliveOdoo())
-        variables = odoo_xmlrpc_auth.client
+        variables = odoo_auth.client
         cases = {"xmlrpc": PASSWORD, "json2": KEY}
         for api, secret in cases.items():
             with self.subTest(api=api):
@@ -4912,7 +4912,7 @@ class CutOffTest(StubTestCase):
         # call itself changes.
         self.fail_on_resource_warnings()
         odoo = self.start(KeepAliveOdoo())
-        variables = odoo_xmlrpc_auth.client
+        variables = odoo_auth.client
         cases = {
             "xmlrpc": (PASSWORD, variables._REQUEST_STARTED.get, False),
             "json2": (KEY, variables._IN_JSON2_CALL.get, True),
@@ -4968,7 +4968,7 @@ class CutOffTest(StubTestCase):
             b"HTTP/1.1 303 See Other\r\nLocation: /json/2/res.partner/search_count\r\n"
             b"Connection: close\r\nContent-Length: 100000\r\n\r\nthe start of a body"
         )
-        variables = odoo_xmlrpc_auth.client
+        variables = odoo_auth.client
         cases = {
             "xmlrpc": (login_and_call, PASSWORD, variables._REQUEST_STARTED.get, False, 500),
             "json2": (json2, KEY, variables._IN_JSON2_CALL.get, True, 303),
@@ -5273,7 +5273,7 @@ class TimeoutTest(StubTestCase):
         # The XML-RPC login is replaced: it goes out under the same read
         # timeout, and its answer, should it come later than that on a loaded
         # machine, would make the timeout fire at the login. JSON-2 has none.
-        with mock.patch.object(odoo_xmlrpc_auth.client, "_log_in", return_value=UID):
+        with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
             for case, (url, api, secret, original, name) in cases.items():
                 with self.subTest(case=case):
                     self.make_profile(url, api, secret)
@@ -5490,7 +5490,7 @@ class CliTest(StubTestCase):
         text = payload if isinstance(payload, str) else json.dumps(payload)
         stdout, stderr = io.StringIO(), io.StringIO()
         code = 0
-        argv = ["odoo-xmlrpc-auth", "--profile", profile, text]
+        argv = ["odoo-auth", "--profile", profile, text]
         with mock.patch.object(sys, "argv", argv):
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 try:
@@ -5555,7 +5555,7 @@ class CliTest(StubTestCase):
     def test_the_args_form_goes_through_the_client_and_reads_the_profile_once(self):
         self.xmlrpc_odoo.answers[("res.partner", "read")] = [{"id": 7}]
         with mock.patch.object(
-            odoo_xmlrpc_auth.client, "_load_config", wraps=odoo_xmlrpc_auth.client._load_config
+            odoo_auth.client, "_load_config", wraps=odoo_auth.client._load_config
         ) as load:
             code, _, _ = self.run_cli(
                 "erp-xmlrpc", {"model": "res.partner", "method": "read", "args": [[7]]}

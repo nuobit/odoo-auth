@@ -1,4 +1,4 @@
-"""Tests of odoo_xmlrpc_auth.client: no network, no real store.
+"""Tests of odoo_auth.client: no network, no real store.
 
 The store is built under a temporary HOME, with dummy values only, and the
 endpoint that authenticates is replaced, so no test can reach a server. A
@@ -30,8 +30,8 @@ import unittest
 import xmlrpc.client
 from unittest import mock
 
-from odoo_xmlrpc_auth import cli
-from odoo_xmlrpc_auth.client import (
+from odoo_auth import cli
+from odoo_auth.client import (
     ArgumentError,
     AuthError,
     Client,
@@ -80,7 +80,7 @@ class ServerProxyTest(StoreTestCase):
         self.use_home()
         with self.assertRaisesRegex(
             ConfigError,
-            r"\AConfig file not found: [^\n]*/\.config/odoo-xmlrpc-auth/erp\.conf\. "
+            r"\AConfig file not found: [^\n]*/\.config/odoo-auth/erp\.conf\. "
             r"Create it with a \[odoo\] section, the keys url, db, user, "
             r"password, and the line `api = xmlrpc` or `api = json2`\Z",
         ):
@@ -96,7 +96,7 @@ class ServerProxyTest(StoreTestCase):
     def test_a_store_that_cannot_be_read_says_why_and_chains_no_error(self):
         # A folder in the file's place: open() raises IsADirectoryError.
         home = self.use_home()
-        folder = os.path.join(home, ".config", "odoo-xmlrpc-auth")
+        folder = os.path.join(home, ".config", "odoo-auth")
         os.makedirs(os.path.join(folder, "erp.conf"))
         os.chmod(folder, 0o700)
         for open_profile in (Client, ServerProxy):
@@ -737,7 +737,7 @@ class ApiLineTest(StoreTestCase):
         with self.assertRaisesRegex(
             ConfigError,
             r"^Profile 'erp' has `api = json2`, and ServerProxy speaks XML-RPC "
-            r"only: call it through odoo_xmlrpc_auth\.client\.Client"
+            r"only: call it through odoo_auth\.client\.Client"
             r"\(profile='erp'\)$",
         ):
             ServerProxy(profile="erp")
@@ -1079,14 +1079,14 @@ class OneLineTest(StoreTestCase):
         self.assertRegex(
             str(error), r"\AConfig file not found: '[^\n]*home\\nnext[^\n]*/erp\.conf'\. "
         )
-        folder = os.path.join(home, ".config", "odoo-xmlrpc-auth")
+        folder = os.path.join(home, ".config", "odoo-auth")
         os.makedirs(folder)
         os.chmod(folder, 0o755)
         error = self.raised(ConfigError, lambda: Client(profile="erp"))
         self.assertRegex(
             str(error),
-            r"\A'[^\n]*home\\nnext[^\n]*/odoo-xmlrpc-auth' is accessible by others\. "
-            r"Fix with: chmod 700 '[^\n]*home\\nnext[^\n]*/odoo-xmlrpc-auth'\Z",
+            r"\A'[^\n]*home\\nnext[^\n]*/odoo-auth' is accessible by others\. "
+            r"Fix with: chmod 700 '[^\n]*home\\nnext[^\n]*/odoo-auth'\Z",
         )
 
     def test_a_type_name_or_a_code_holding_a_newline_is_quoted_escaped(self):
@@ -1141,7 +1141,7 @@ class OneLineTest(StoreTestCase):
         # An OSError with no errno has no strerror: its type's name says why.
         self.make_store(self.XMLRPC_STORE)
         weird = type("Weird\nError", (OSError,), {})
-        with mock.patch("odoo_xmlrpc_auth.client.open", side_effect=weird(), create=True):
+        with mock.patch("odoo_auth.client.open", side_effect=weird(), create=True):
             error = self.raised(ConfigError, lambda: Client(profile="erp"))
         self.assertRegex(
             str(error),
@@ -1249,7 +1249,7 @@ class CliTest(StoreTestCase):
         self.common.authenticate.side_effect = xmlrpc.client.ProtocolError(
             "odoo.example.com/xmlrpc/2/common", 502, "Bad Gateway", {}
         )
-        argv = ["odoo-xmlrpc-auth", "--profile", "erp", '{"model": "res.partner", "method": "search"}']
+        argv = ["odoo-auth", "--profile", "erp", '{"model": "res.partner", "method": "search"}']
         stderr = io.StringIO()
         with mock.patch.object(sys, "argv", argv):
             with contextlib.redirect_stderr(stderr):
@@ -1264,7 +1264,7 @@ class CliTest(StoreTestCase):
 
     def test_a_missing_profile_prints_one_line(self):
         self.use_home()
-        argv = ["odoo-xmlrpc-auth", "--profile", "erp", '{"model": "res.partner", "method": "search"}']
+        argv = ["odoo-auth", "--profile", "erp", '{"model": "res.partner", "method": "search"}']
         stderr = io.StringIO()
         with mock.patch.object(sys, "argv", argv):
             with contextlib.redirect_stderr(stderr):
@@ -1281,7 +1281,7 @@ class CliTest(StoreTestCase):
     def run_cli(self, profile, payload='{"model": "res.partner", "method": "search"}'):
         """Run the CLI on ``payload`` for ``profile``, a call it refuses;
         return its exit code and its stderr."""
-        argv = ["odoo-xmlrpc-auth", "--profile", profile, payload]
+        argv = ["odoo-auth", "--profile", profile, payload]
         stderr = io.StringIO()
         with mock.patch.object(sys, "argv", argv):
             with contextlib.redirect_stderr(stderr):
