@@ -52,6 +52,7 @@ from odoo_xmlrpc_auth.client import (
     ServerProxy,
     _execute_kw,
     _origin,
+    _read_config,
     _SafeTransport,
 )
 from support import (
@@ -2386,6 +2387,24 @@ class ResourceWarningsCheckTest(unittest.TestCase):
         self.assertEqual(warnings.filters, filters)
 
 
+class FailsAtItsEnd(io.FileIO):
+    """A file whose read fails with EIO where its end is, as a read from a
+    failing disk or a network file system can fail: every byte before it
+    comes as the file has it."""
+
+    def readinto(self, buffer):
+        count = super().readinto(buffer)
+        if count == 0:
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return count
+
+
+def open_failing_at_its_end(path, encoding):
+    """open() as the library's loader calls it, for a text file read
+    through FailsAtItsEnd."""
+    return io.TextIOWrapper(io.BufferedReader(FailsAtItsEnd(path)), encoding=encoding)
+
+
 class FramesTest(StubTestCase):
     """No frame of an error the library raises holds the password or the
     API key in a local: a test runner or a debugger prints each frame's
@@ -2393,6 +2412,24 @@ class FramesTest(StubTestCase):
     holds a ServerProxy, as each of its calls' frames does, shows its
     password one attribute down, in _password, readable as in 1.x:
     support._shown does not open a ServerProxy."""
+
+    def refusals(self, profile):
+        """The error each reader of the store raises for ``profile``, a
+        profile the loader refuses, by the reader's name. Client,
+        ServerProxy and _read_config raise ConfigError. The CLI ends with
+        SystemExit, raised in its handler of that ConfigError, which the
+        exit keeps as its __context__, with its frames."""
+        payload = '{"model": "res.partner", "method": "search"}'
+        argv = ["odoo-xmlrpc-auth", "--profile", profile, payload]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
+            cli_exit = self.raised(SystemExit, cli.main)
+        return {
+            "Client": self.raised(ConfigError, lambda: Client(profile=profile)),
+            "ServerProxy": self.raised(ConfigError, lambda: ServerProxy(profile=profile)),
+            "_read_config": self.raised(ConfigError, lambda: _read_config(profile)),
+            "the CLI": cli_exit,
+            "the CLI's ConfigError": cli_exit.__context__,
+        }
 
     def test_no_frame_of_a_failed_xmlrpc_call_of_client_holds_the_password(self):
         odoo = self.start(XmlRpcOdoo())
@@ -2445,8 +2482,20 @@ class FramesTest(StubTestCase):
         self.assertNoFrameHolds(error, PASSWORD)
 
     def test_no_frame_of_a_refused_profile_holds_the_password(self):
-        # Each is refused after the password is read.
+        # Each is refused after the password is read, by the checks of its
+        # values (_checked_config).
+        self.make_store(
+            "[odoo]\n"
+            "url = https://odoo.example.com\n"
+            f"db = {DB}\n"
+            f"user = {USER}\n"
+            f"password = {PASSWORD}\n",
+            profile="no-api",
+        )
+        self.make_profile("https://odoo.example.com", "xml-rpc", PASSWORD, "bad-api")
+        self.make_profile(f"https://{PASSWORD}.example.com", "xmlrpc", PASSWORD, "url-holding-it")
         self.make_profile("ftp://odoo.example.com", "xmlrpc", PASSWORD, "bad-url")
+        self.make_profile("https://odoo.example.com", "json2", PASSWORD, "not-a-key")
         self.make_store(
             "[odoo]\n"
             "url = https://odoo.example.com\n"
@@ -2456,11 +2505,98 @@ class FramesTest(StubTestCase):
             "api = json2\n",
             profile="bad-db",
         )
-        cases = {"bad-url": PASSWORD, "bad-db": KEY}
+        cases = {
+            "no-api": PASSWORD,
+            "bad-api": PASSWORD,
+            "url-holding-it": PASSWORD,
+            "bad-url": PASSWORD,
+            "not-a-key": PASSWORD,
+            "bad-db": KEY,
+        }
         for profile, password in cases.items():
-            with self.subTest(profile=profile):
-                error = self.raised(ConfigError, lambda: Client(profile=profile))
-                self.assertNoFrameHolds(error, password)
+            for reader, error in self.refusals(profile).items():
+                with self.subTest(profile=profile, reader=reader):
+                    self.assertNoFrameHolds(error, password)
+
+    def test_no_frame_of_a_store_accessible_by_others_holds_the_password(self):
+        # Refused before the file is read.
+        self.make_profile(f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD)
+        folder = os.path.join(os.environ["HOME"], ".config", "odoo-xmlrpc-auth")
+        os.chmod(folder, 0o755)
+        refused = {"the folder": self.refusals("erp")}
+        os.chmod(folder, 0o700)
+        os.chmod(os.path.join(folder, "erp.conf"), 0o644)
+        refused["the file"] = self.refusals("erp")
+        self.assertIn(
+            "odoo-xmlrpc-auth is accessible by others", str(refused["the folder"]["Client"])
+        )
+        self.assertIn("erp.conf is accessible by others", str(refused["the file"]["Client"]))
+        for case, refusals in refused.items():
+            for reader, error in refusals.items():
+                with self.subTest(case=case, reader=reader):
+                    self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_no_frame_of_a_store_that_cannot_be_read_holds_the_password(self):
+        # The read fails once the password's line is read.
+        self.make_profile(f"http://127.0.0.1:{free_port()}", "xmlrpc", PASSWORD)
+        with mock.patch.object(
+            odoo_xmlrpc_auth.client, "open", create=True, new=open_failing_at_its_end
+        ):
+            refusals = self.refusals("erp")
+        self.assertIn("erp.conf cannot be read (Input/output error)", str(refusals["Client"]))
+        for reader, error in refusals.items():
+            with self.subTest(reader=reader):
+                self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_no_frame_of_a_store_that_is_not_valid_ini_holds_the_password(self):
+        # Each error comes once the password's line is read: configparser
+        # reports a line that is no key after it has read the whole file,
+        # and a key given twice where it meets it. TextIOWrapper decodes a
+        # file a chunk at a time, of 8192 bytes from Python 3.11 to 3.14,
+        # and gives no line of a chunk it cannot decode: the byte UTF-8
+        # cannot decode comes after a comment line of 1 MiB, far past the
+        # first chunk.
+        self.make_store(
+            f"[odoo]\npassword = {PASSWORD}\nthis line is no key\n", profile="no-key"
+        )
+        self.make_store(
+            f"[odoo]\npassword = {PASSWORD}\ndb = {DB}\ndb = {DB}\n", profile="key-twice"
+        )
+        self.make_store(
+            f"[odoo]\npassword = {PASSWORD}\n#{'-' * 2**20}\nnote = é\n",
+            encoding="latin-1",
+            profile="not-utf8",
+        )
+        for profile in ("no-key", "key-twice", "not-utf8"):
+            refusals = self.refusals(profile)
+            self.assertIn("is not a valid INI file", str(refusals["Client"]))
+            for reader, error in refusals.items():
+                with self.subTest(profile=profile, reader=reader):
+                    self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_no_frame_of_a_store_without_its_odoo_section_holds_the_password(self):
+        self.make_store(f"[odo]\npassword = {PASSWORD}\n", profile="other-section")
+        self.make_store(f"[DEFAULT]\npassword = {PASSWORD}\n", profile="defaults")
+        for profile in ("other-section", "defaults"):
+            refusals = self.refusals(profile)
+            self.assertIn("Missing [odoo] section", str(refusals["Client"]))
+            for reader, error in refusals.items():
+                with self.subTest(profile=profile, reader=reader):
+                    self.assertNoFrameHolds(error, PASSWORD)
+
+    def test_no_frame_of_a_store_missing_a_key_holds_the_password(self):
+        self.make_store(
+            "[odoo]\n"
+            "url = https://odoo.example.com\n"
+            f"user = {USER}\n"
+            f"password = {PASSWORD}\n"
+            "api = xmlrpc\n"
+        )
+        refusals = self.refusals("erp")
+        self.assertRegex(str(refusals["Client"]), r"^Missing keys in .*/erp\.conf: db$")
+        for reader, error in refusals.items():
+            with self.subTest(reader=reader):
+                self.assertNoFrameHolds(error, PASSWORD)
 
     def test_no_frame_of_an_answer_refused_over_json2_holds_the_key(self):
         # The answer's request carries the key in its headers, and Odoo's
