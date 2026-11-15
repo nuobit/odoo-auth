@@ -28,6 +28,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 import types
 import unittest
 import uuid
@@ -129,6 +130,14 @@ def collect_garbage():
         return gc.collect() > 0
 
     retried(collected, "a collection of garbage in this thread")
+
+
+def running(function):
+    """Whether ``function`` runs in this thread: a frame of it is on this
+    thread's stack, the caller's or one below it."""
+    return any(
+        frame.f_code is function.__code__ for frame, _ in traceback.walk_stack(sys._getframe(1))
+    )
 
 
 class StubTestCase(StoreMixin, unittest.TestCase):
@@ -1069,14 +1078,9 @@ class NotXmlRpcTest(StubTestCase):
         self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
 
 
-class Json2ClientTest(StubTestCase):
-    def setUp(self):
-        super().setUp()
-        self.odoo = self.start(Json2Odoo())
-        self.client = self.make_client(self.odoo.url, "json2", KEY)
-
-    def sent_body(self, request=0):
-        return json.loads(self.odoo.requests[request]["body"])
+class LoggersMixin:
+    """Loggers a test makes, each taken out of logging's loggers as the
+    test ends, for a unittest.TestCase."""
 
     def made_logger(self, name, logger_class=logging.Logger):
         """The new logger ``name``, of ``logger_class``, a subclass of
@@ -1110,6 +1114,16 @@ class Json2ClientTest(StubTestCase):
 
         self.addCleanup(take_out)
         return logger
+
+
+class Json2ClientTest(LoggersMixin, StubTestCase):
+    def setUp(self):
+        super().setUp()
+        self.odoo = self.start(Json2Odoo())
+        self.client = self.make_client(self.odoo.url, "json2", KEY)
+
+    def sent_body(self, request=0):
+        return json.loads(self.odoo.requests[request]["body"])
 
     def test_a_method_of_records_gets_the_ids_by_name(self):
         self.odoo.answers[("res.partner", "read")] = [{"id": 7, "name": "Example"}]
@@ -1496,7 +1510,7 @@ class Json2ClientTest(StubTestCase):
         }
 
         class FailingTest(unittest.TestCase):
-            made_logger = Json2ClientTest.made_logger
+            made_logger = LoggersMixin.made_logger
 
             def test_it(self):
                 self.made_logger(f"{family}.new.one")
@@ -1515,130 +1529,6 @@ class Json2ClientTest(StubTestCase):
             },
             held_before,
         )
-
-    def test_a_logger_made_between_two_steps_of_the_walk_breaks_nothing(self):
-        # Each call over JSON-2 first walks logging's loggers. Code that runs
-        # meanwhile, a thread or a signal's handler, can make a logger
-        # between two steps of the walk: walking logging's dict itself, the
-        # walk then raised RuntimeError on any Python, the dict having grown
-        # under it. Here a logger of urllib3 makes one as the walk gives it
-        # the filter, and the walk goes on to the logger of urllib3 made
-        # after it.
-        made = []
-        test = self
-
-        class MakesALogger(logging.Logger):
-            def addFilter(self, filter):
-                super().addFilter(filter)
-                made.append(test.made_logger(f"made_by_a_test.{uuid.uuid4().hex}"))
-
-        self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}", MakesALogger)
-        after = self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}")
-        odoo_auth.client._filter_urllib3_loggers()
-        self.assertEqual(len(made), 1)
-        self.assertEqual(after.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
-
-    def test_a_logger_dropped_between_two_steps_of_the_walk_breaks_nothing(self):
-        # The test above, for a logger dropped: walking logging's dict
-        # itself, the walk raised RuntimeError on any Python, the dict having
-        # shrunk under it.
-        doomed = self.made_logger(f"made_by_a_test.{uuid.uuid4().hex}")
-        dropped = []
-
-        class DropsALogger(logging.Logger):
-            def addFilter(self, filter):
-                super().addFilter(filter)
-                dropped.append(logging.Logger.manager.loggerDict.pop(doomed.name))
-
-        self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}", DropsALogger)
-        after = self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}")
-        odoo_auth.client._filter_urllib3_loggers()
-        self.assertEqual(dropped, [doomed])
-        self.assertEqual(after.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
-
-    @unittest.skipIf(
-        sys.version_info >= (3, 12),
-        "from Python 3.12, no collection runs inside a call of C such as the walk's",
-    )
-    def test_a_logger_made_during_the_walk_over_the_loggers_breaks_nothing(self):
-        # Python 3.11 can collect garbage as an object is made inside a call
-        # of C, and run a finalizer there, which can make a logger, as a
-        # thread that runs meanwhile can. Each call over JSON-2 walks
-        # logging's loggers first: taken one by one from logging's dict, which
-        # then changed size, the walk raised RuntimeError. Here each object
-        # made runs a collection, and each collection the finalizer of an
-        # object in a cycle, which makes a logger and the next such object.
-        made = []
-        armed = threading.Event()
-        test = self
-
-        class MakesALogger:
-            def __del__(self):
-                if armed.is_set():
-                    # A name no logger has yet: logging's dict grows.
-                    made.append(test.made_logger(f"made_by_a_test.{uuid.uuid4().hex}"))
-                    plant()
-
-        def plant():
-            garbage = MakesALogger()
-            garbage.itself = garbage
-
-        unfiltered = self.made_logger("urllib3.contrib.made_by_a_test_before_the_walk")
-        threshold = gc.get_threshold()
-        gc.collect()
-        armed.set()
-        gc.set_threshold(1)
-        plant()
-        try:
-            odoo_auth.client._filter_urllib3_loggers()
-        finally:
-            gc.set_threshold(*threshold)
-            armed.clear()
-        self.assertNotEqual(made, [])
-        self.assertEqual(unfiltered.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
-
-    @unittest.skipIf(
-        sys.version_info >= (3, 12),
-        "from Python 3.12, no collection runs inside a call of C such as the copy's",
-    )
-    def test_a_logger_dropped_as_the_loggers_are_copied_breaks_nothing(self):
-        # Python 3.11's dict.copy makes the new dict after it took the
-        # entries of logging's dict and before it reads their count: a
-        # collection of garbage that the allocation runs there, whose
-        # finalizer drops a logger, as a thread that runs meanwhile can, gave
-        # a copy whose count was one entry short, and its walk raised
-        # RuntimeError. Here objects in cycles, each of whose finalizers
-        # drops a logger the test made, wait in the youngest generation of
-        # garbage for the first collection once the walk starts: on Python
-        # 3.11 the first object made then runs it.
-        names = [f"made_by_a_test.{uuid.uuid4().hex}" for _ in range(200)]
-        for name in names:
-            self.made_logger(name)
-        dropped = []
-
-        class DropsALogger:
-            def __init__(self, name):
-                self.name = name
-                self.itself = self
-
-            def __del__(self):
-                dropped.append(logging.Logger.manager.loggerDict.pop(self.name))
-
-        unfiltered = self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}")
-        threshold = gc.get_threshold()
-        gc.collect()
-        for name in names:
-            DropsALogger(name)
-        gc.set_threshold(1)
-        try:
-            odoo_auth.client._filter_urllib3_loggers()
-            # Counted before the collection below, which runs every finalizer
-            # still waiting: each logger was dropped inside the walk.
-            self.assertEqual(len(dropped), 200)
-        finally:
-            gc.set_threshold(*threshold)
-            gc.collect()
-        self.assertEqual(unfiltered.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
 
     def test_urllib3_logs_nothing_of_an_https_call(self):
         # Offline, the TLS sockets fakes: an answer whose header's name
@@ -2054,6 +1944,214 @@ class Json2ClientTest(StubTestCase):
             self.client.call("res.partner", "read", 7)
         self.assertIsInstance(caught.exception, odoo_auth.client.ArgumentError)
         self.assertEqual(self.odoo.requests, [])
+
+
+class WalkOverTheLoggersTest(LoggersMixin, unittest.TestCase):
+    """The walk over logging's loggers that each call over JSON-2 runs
+    first (_filter_urllib3_loggers), in tests that call no server and start
+    none: no thread of the test runs beside the walk. What any thread lets
+    go goes back on Python's free lists, and the two tests of a collection
+    inside the walk catch a broken walk only while those lists hold few
+    objects, as their comments say."""
+
+    def walk_until(self, happened, waited_for):
+        """Walk logging's loggers, as each call over JSON-2 does first
+        (_filter_urllib3_loggers), until ``happened()``, with the
+        collector's threshold for the youngest generation at 1: a collection
+        of garbage starts as soon as the objects made since the last, less
+        those freed, are more than one. It is set right before the first
+        walk, with nothing made in between, so that the walk's first object,
+        or its second, starts one. One walk is enough, unless another thread
+        is in a collection all along it, which a finalizer that lets the GIL
+        go keeps running: no collection starts beside one in progress. It
+        walks again for as long as retried tries, letting the other threads
+        go on between two walks (time.sleep), as collect_garbage does between
+        its tries, so that such a collection can end; then it fails, saying
+        that it waited for ``waited_for``. No other thread is let go on
+        between the tests' collection before the walk (collect_garbage) and
+        the first walk: one that ran there could let objects go back on
+        Python's free lists, which the tests' comments need empty."""
+
+        def walked():
+            odoo_auth.client._filter_urllib3_loggers()
+            done = happened()
+            if not done:
+                time.sleep(0)
+            return done
+
+        threshold = gc.get_threshold()
+        gc.set_threshold(1)
+        try:
+            retried(walked, waited_for)
+        finally:
+            gc.set_threshold(*threshold)
+
+    def test_a_logger_made_between_two_steps_of_the_walk_breaks_nothing(self):
+        # Each call over JSON-2 first walks logging's loggers. Code that runs
+        # meanwhile, a thread or a signal's handler, can make a logger
+        # between two steps of the walk: walking logging's dict itself, the
+        # walk then raised RuntimeError on any Python, the dict having grown
+        # under it. Here a logger of urllib3 makes one as the walk gives it
+        # the filter, and the walk goes on to the logger of urllib3 made
+        # after it.
+        made = []
+        test = self
+
+        class MakesALogger(logging.Logger):
+            def addFilter(self, filter):
+                super().addFilter(filter)
+                made.append(test.made_logger(f"made_by_a_test.{uuid.uuid4().hex}"))
+
+        self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}", MakesALogger)
+        after = self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}")
+        odoo_auth.client._filter_urllib3_loggers()
+        self.assertEqual(len(made), 1)
+        self.assertEqual(after.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
+
+    def test_a_logger_dropped_between_two_steps_of_the_walk_breaks_nothing(self):
+        # The test above, for a logger dropped: walking logging's dict
+        # itself, the walk raised RuntimeError on any Python, the dict having
+        # shrunk under it.
+        doomed = self.made_logger(f"made_by_a_test.{uuid.uuid4().hex}")
+        dropped = []
+
+        class DropsALogger(logging.Logger):
+            def addFilter(self, filter):
+                super().addFilter(filter)
+                dropped.append(logging.Logger.manager.loggerDict.pop(doomed.name))
+
+        self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}", DropsALogger)
+        after = self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}")
+        odoo_auth.client._filter_urllib3_loggers()
+        self.assertEqual(dropped, [doomed])
+        self.assertEqual(after.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
+
+    @unittest.skipIf(
+        sys.version_info >= (3, 12),
+        "from Python 3.12, no collection runs inside a call of C such as the walk's",
+    )
+    def test_a_logger_made_during_the_walk_over_the_loggers_breaks_nothing(self):
+        # Python 3.11 can collect garbage as an object is made inside a call
+        # of C, and run a finalizer there, which can make a logger, as a
+        # thread that runs meanwhile can. Each call over JSON-2 walks
+        # logging's loggers first: taken one by one from logging's dict, which
+        # then changed size, the walk raised RuntimeError. Here the objects
+        # the walk makes start collections one after another (walk_until), and
+        # each collection runs the finalizer of an object in a cycle, which
+        # makes the next such object and, run inside the walk, a logger.
+        #
+        # A list of the dict's items takes a 2-tuple for each entry: the
+        # iterator's own for the first, a new one for each next, as the list
+        # holds each. A new one comes from Python's free list of 2-tuples
+        # while the free list holds any, and is made otherwise, which starts
+        # a collection: a walk over such a list fails here only while the free
+        # list holds fewer 2-tuples than the dict has entries as the list is
+        # made. The collection before the walk (collect_garbage) empties the
+        # free list; another thread that lets go as many in between makes
+        # that walk pass.
+        #
+        # Any thread's collection, which an allocation or gc.collect() starts,
+        # runs the finalizers it finds in that thread: outside the walk, one
+        # makes no logger. Each object the walk can find is made inside a
+        # collection, beside which none starts in any thread: the first by
+        # the finalizer of the one planted just before the collection before
+        # the walk (collect_garbage), each next by its predecessor's. One that
+        # ran while an object was still held would move it to an older
+        # generation, which the walk's collections of the youngest do not
+        # reach.
+        made = []
+        armed = threading.Event()
+        test = self
+
+        class MakesALogger:
+            def __del__(self):
+                if armed.is_set():
+                    if running(odoo_auth.client._filter_urllib3_loggers):
+                        # A name no logger has yet: logging's dict grows.
+                        made.append(test.made_logger(f"made_by_a_test.{uuid.uuid4().hex}"))
+                    plant()
+
+        def plant():
+            garbage = MakesALogger()
+            garbage.itself = garbage
+
+        unfiltered = self.made_logger("urllib3.contrib.made_by_a_test_before_the_walk")
+        # Disarmed whatever ends the test, a failed wait included: armed, the
+        # finalizers would plant again at every collection, and make loggers
+        # in the later tests' walks.
+        try:
+            armed.set()
+            plant()
+            collect_garbage()
+            self.walk_until(lambda: made != [], "a logger made inside the walk")
+        finally:
+            armed.clear()
+        self.assertEqual(unfiltered.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
+
+    @unittest.skipIf(
+        sys.version_info >= (3, 12),
+        "from Python 3.12, no collection runs inside a call of C such as the copy's",
+    )
+    def test_a_logger_dropped_as_the_loggers_are_copied_breaks_nothing(self):
+        # Python 3.11's dict.copy makes the new dict after it took the
+        # entries of logging's dict and before it reads their count: a
+        # collection of garbage that the allocation runs there, whose
+        # finalizer drops a logger, as a thread that runs meanwhile can, gave
+        # a copy whose count was one entry short, and its walk raised
+        # RuntimeError. Here objects in cycles, each of whose finalizers
+        # drops a logger the test made, wait in the youngest generation of
+        # garbage for the first collection once the walk starts: on Python
+        # 3.11 the first object the walk makes then starts it (walk_until).
+        #
+        # dict.copy takes the entries before it makes its dict only on its
+        # fast path, which it takes while at most a third of the dict's
+        # entries are deleted ones; and it makes its dict, an allocation that
+        # can start a collection, only when Python's free list of dicts holds
+        # none, as it takes one from there whenever it can. The collection
+        # before the walk (collect_garbage) empties that list, and nothing the
+        # test runs from it to the walk lets a dict go; another thread that
+        # lets one go in between makes the walk over such a copy pass.
+        #
+        # Any thread's collection, which an allocation or gc.collect() starts,
+        # runs the finalizers it finds in that thread: outside the walk, one
+        # drops nothing and makes its object again. So each object the walk
+        # can find is made inside a collection, beside which none starts in
+        # any thread: the collection before the walk (collect_garbage), or
+        # a later one. One that ran while an object was still held would move
+        # it to an older generation, which the walk's collections of the
+        # youngest do not reach.
+        names = [f"made_by_a_test.{uuid.uuid4().hex}" for _ in range(200)]
+        for name in names:
+            self.made_logger(name)
+        dropped = []
+        armed = threading.Event()
+
+        class DropsALogger:
+            def __init__(self, name):
+                self.name = name
+                self.itself = self
+
+            def __del__(self):
+                if armed.is_set():
+                    if running(odoo_auth.client._filter_urllib3_loggers):
+                        dropped.append(logging.Logger.manager.loggerDict.pop(self.name))
+                    else:
+                        DropsALogger(self.name)
+
+        unfiltered = self.made_logger(f"urllib3.contrib.made_by_a_test_{uuid.uuid4().hex}")
+        # Disarmed whatever ends the test, a failed wait included: armed, the
+        # finalizers would make their objects again at every collection, in
+        # the later tests' walks too.
+        try:
+            armed.set()
+            for name in names:
+                DropsALogger(name)
+            collect_garbage()
+            self.walk_until(lambda: dropped != [], "a logger dropped inside the walk")
+        finally:
+            armed.clear()
+        self.assertEqual(len(dropped), 200)
+        self.assertEqual(unfiltered.filters, [odoo_auth.client._JSON2_CALL_RECORDS])
 
 
 def _nested(depth):
