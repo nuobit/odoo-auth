@@ -93,6 +93,18 @@ class ServerProxyTest(StoreTestCase):
         self.assertIsNone(caught.exception.__cause__)
         self.assertIsNone(caught.exception.__context__)
 
+    def test_a_missing_profile_says_how_to_create_it(self):
+        # The store's folder holds another profile, not this one.
+        self.make_store("[odoo]\n", profile="other")
+        with self.assertRaises(ConfigError) as caught:
+            Client(profile="erp")
+        self.assertEqual(
+            str(caught.exception),
+            f"Config file not found: {self._home}/.config/odoo-auth/erp.conf. "
+            "Create it with a [odoo] section, the keys url, db, user, password, "
+            "and the line `api = xmlrpc` or `api = json2`",
+        )
+
     def test_a_store_that_cannot_be_read_says_why_and_chains_no_error(self):
         # A folder in the file's place: open() raises IsADirectoryError.
         home = self.use_home()
