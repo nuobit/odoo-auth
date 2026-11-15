@@ -960,20 +960,22 @@ def _read_section(profile):
     and the section holds every key of _REQUIRED_KEYS. ConfigError
     otherwise.
 
-    The section, not a dict of it: its repr shows no value.
+    The section, not a dict of it: its repr shows no value, nor does the
+    repr of any of its attributes, its parser's included, which shows only
+    its class. The parser itself shows every value one attribute down, and
+    no frame of this function holds it (_parsed_section).
     """
     if os.sep in profile or profile.startswith("."):
         raise ConfigError(f"Invalid profile name: {profile!r}")
     config_dir = os.path.expanduser("~/.config/odoo-xmlrpc-auth")
     config_path = os.path.join(config_dir, f"{profile}.conf")
 
-    parser = configparser.RawConfigParser()
     failure = None
     try:
         _check_permissions(config_dir)
         with open(config_path, encoding="utf-8") as f:
             _check_permissions(config_path, fd=f.fileno())
-            parser.read_file(f)
+            section = _parsed_section(f)
     except FileNotFoundError:
         # The folder or the file: the file cannot exist without its folder.
         failure = ConfigError(
@@ -1000,12 +1002,11 @@ def _read_section(profile):
     # caught error as its __context__: it is raised after them.
     if failure is not None:
         raise failure
-    if not parser.has_section(_SECTION):
+    if section is None:
         raise ConfigError(
             f"Missing [{_SECTION}] section in {_one_line(config_path)}"
         )
 
-    section = parser[_SECTION]
     missing = [k for k in _REQUIRED_KEYS if k not in section]
     if missing:
         raise ConfigError(
@@ -1014,13 +1015,37 @@ def _read_section(profile):
     return section, config_path
 
 
+def _parsed_section(f):
+    """The [odoo] section of ``f``, a file of the store open for reading,
+    or None when it has none. What reading or parsing it raises, an
+    OSError, a UnicodeDecodeError or an error of configparser, goes on as
+    it is, for _read_section to catch.
+
+    A function of its own for the parser's sake: the parser holds every
+    value the file had up to any error, the password among them, in its
+    sections and its defaults, which a debugger shows one attribute down
+    (pytest -l prints only its repr, which shows its class). Held by the
+    frame of _read_section, it would show them with each ConfigError raised
+    there once the file is read: a store missing a key or its [odoo]
+    section, or one that is not valid INI, or cannot be read, after its
+    password's line. Here only this frame holds it, which returns the
+    section, whose attributes show no value, or ends with an error that
+    _read_section catches and drops before it raises ConfigError.
+    """
+    parser = configparser.RawConfigParser()
+    parser.read_file(f)
+    return parser[_SECTION] if parser.has_section(_SECTION) else None
+
+
 def _checked_config(profile, section, config_path):
     """The values of ``section``, the [odoo] section of the store of
     ``profile`` in ``config_path``, checked: url, db, user, api, and the
     password as a _Secret. ConfigError otherwise.
 
-    The checks read the section, whose repr shows no value, and the
-    password as a _Secret: no frame of a ConfigError holds the password.
+    The checks read the section, whose repr shows no value, nor do the
+    reprs of its attributes (_read_section), and the password as a _Secret,
+    whose repr shows only its length: no frame of a ConfigError shows the
+    password.
     """
     _check_api(profile, section, config_path)
     password = _Secret(section["password"])
