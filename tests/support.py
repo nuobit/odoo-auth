@@ -86,25 +86,39 @@ class StoreMixin:
         self.fail(f"{error_class.__name__} not raised")
 
     def assertNoFrameHolds(self, error, value):
-        """No frame of ``error``'s traceback but the tests' own holds
-        ``value`` in a local: a test runner or a debugger prints the repr of
-        each (``pytest -l``). Fails naming each frame and local that does.
+        """No frame but the tests' own holds ``value`` in a local, in the
+        traceback of ``error`` or of any error chained to it, its __cause__
+        or its __context__, at any depth: a test runner or a debugger prints
+        the repr of each local of each frame of the whole chain
+        (``pytest -l``). Fails naming each frame and local that does.
 
         ``error`` comes from ``raised``: the one assertRaises keeps has no
         traceback left to check."""
         self.assertIsNotNone(error.__traceback__)
         tests_folder = os.path.dirname(os.path.abspath(__file__))
         holding = []
-        traceback = error.__traceback__
-        while traceback is not None:
-            frame = traceback.tb_frame
-            if os.path.dirname(os.path.abspath(frame.f_code.co_filename)) != tests_folder:
-                holding += [
-                    f"{frame.f_code.co_name}:{name}"
-                    for name, local in frame.f_locals.items()
-                    if value in _shown(local)
+        # Each error of the chain, by its id, kept alive so that no id is
+        # taken again by another error during the walk; each is walked once,
+        # which also ends a chain that loops.
+        walked = {}
+        pending = [error]
+        while pending:
+            chained = pending.pop()
+            if id(chained) not in walked:
+                walked[id(chained)] = chained
+                traceback = chained.__traceback__
+                while traceback is not None:
+                    frame = traceback.tb_frame
+                    if os.path.dirname(os.path.abspath(frame.f_code.co_filename)) != tests_folder:
+                        holding += [
+                            f"{frame.f_code.co_name}:{name}"
+                            for name, local in frame.f_locals.items()
+                            if value in _shown(local)
+                        ]
+                    traceback = traceback.tb_next
+                pending += [
+                    link for link in (chained.__cause__, chained.__context__) if link is not None
                 ]
-            traceback = traceback.tb_next
         self.assertEqual(holding, [])
 
 
