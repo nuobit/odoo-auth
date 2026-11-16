@@ -1186,10 +1186,15 @@ class _HTTPResponse(http.client.HTTPResponse):
     answer's close: an interrupt, a MemoryError or a RecursionError between
     the two would leave the file open, and the socket with it, held only by
     the frames of its traceback, after Client.close() too. The answer keeps
-    its file from the end of its making, and its close closes it once
-    http.client's close has run, whatever that did: the connection's close
-    reaches the answer (_AnswerClosing), and so does urllib3's answer after
-    a failure as it reads (HTTPResponse._error_catcher).
+    its file from the end of its making, and its close closes the file
+    http.client has forgotten, once http.client's close has run, whatever
+    that did: the connection's close reaches the answer (_AnswerClosing),
+    and so does urllib3's answer after a failure as it reads
+    (HTTPResponse._error_catcher). A file http.client still holds is left
+    to it, for the answer's next close, which those reach: http.client's
+    close flushes the file it holds first, and a closed file refuses that
+    with a ValueError, which would take the place of the error that cut the
+    close short, an interrupt such as Ctrl-C among them.
 
     The making sets the answer's file, ``fp``, first, and http.client's
     close reads it (HTTPResponse.__init__, HTTPResponse.close). Until it is
@@ -1233,12 +1238,13 @@ class _HTTPResponse(http.client.HTTPResponse):
             raise
 
     def close(self):
-        # http.client's close flushes the file it still holds, and a closed
-        # file refuses that: the file is closed after it.
         try:
             super().close()
         finally:
-            if self._file is not None:
+            # Only the file http.client has forgotten (fp): one it still
+            # holds, which an error kept its close from reaching, it flushes
+            # at the answer's next close, and a closed file refuses that.
+            if self.fp is None and self._file is not None:
                 self._file.close()
 
 
