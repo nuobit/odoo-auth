@@ -13,6 +13,7 @@ import contextlib
 import contextvars
 import datetime
 import errno
+import functools
 import gc
 import gzip
 import hashlib
@@ -33,6 +34,7 @@ import types
 import unittest
 import uuid
 import warnings
+import weakref
 import xmlrpc.client
 import zlib
 from unittest import mock
@@ -180,17 +182,21 @@ class StubTestCase(StoreMixin, unittest.TestCase):
         self.addCleanup(patcher.stop)
         return timeouts
 
-    def record_sockets(self, module):
+    def record_sockets(self, module, kept=lambda sock: sock):
         """The list where each socket that ``module``'s create_connection
-        opens, from now to the end of the test, is recorded in order: the
+        opens, from now to the end of the test, is recorded in order, as
+        ``kept`` gives it: the socket itself by default, which the list keeps
+        alive; a weak reference to it with weakref.ref, which keeps none of
+        them alive, for a test of when Python frees a socket. They are the
         connections of a Client's transport, real ones, over XML-RPC with
         socket's, over JSON-2 with urllib3.util.connection's."""
         opened = []
         create = module.create_connection
 
         def recording(*args, **kwargs):
-            opened.append(create(*args, **kwargs))
-            return opened[-1]
+            sock = create(*args, **kwargs)
+            opened.append(kept(sock))
+            return sock
 
         patcher = mock.patch.object(module, "create_connection", recording)
         patcher.start()
@@ -311,15 +317,18 @@ class StubTestCase(StoreMixin, unittest.TestCase):
         """For the with block: the ``number``-th call of ``function`` in this
         thread, from 1, raises ``interrupt`` as it starts, before its first
         line runs, from Python's trace function (sys.settrace), which stops
-        tracing once it raises; every other call runs as it is. No
-        collection of garbage runs in the block (collector_paused)."""
+        tracing once it raises; every other call runs as it is. Yields the
+        list that gets ``interrupt`` as it is raised: empty when fewer calls
+        ran. No collection of garbage runs in the block (collector_paused)."""
         calls = 0
+        raised = []
 
         def starting(frame, event, arg):
             nonlocal calls
             if event == "call" and frame.f_code is function.__code__:
                 calls += 1
                 if calls == number:
+                    raised.append(interrupt)
                     raise interrupt
             return None
 
@@ -327,7 +336,7 @@ class StubTestCase(StoreMixin, unittest.TestCase):
         with collector_paused():
             sys.settrace(starting)
             try:
-                yield
+                yield raised
             finally:
                 sys.settrace(previous)
 
@@ -393,6 +402,49 @@ class StubTestCase(StoreMixin, unittest.TestCase):
                 yield
             finally:
                 sys.settrace(previous)
+
+    @contextlib.contextmanager
+    def interrupted_file_count(self, number, interrupt):
+        """For the with block: the ``number``-th close of a socket's file in
+        this thread, from 1 (socket.SocketIO.close), raises ``interrupt``
+        once it has marked the file closed and before the socket counts the
+        file out (socket._decref_socketios), as an interrupt there would. The
+        block ends by counting each such file out, as that close would have,
+        which closes the socket if its own close came first, without checking
+        whether anything did it first: Python may one day. Counted out here,
+        the socket gives no ResourceWarning when it is collected. No
+        collection of garbage runs in the block (collector_paused)."""
+        statement = "self._sock._decref_socketios()"
+        lines, start = inspect.getsourcelines(socket.SocketIO.close)
+        (line,) = [
+            start + offset
+            for offset, text in enumerate(lines)
+            if text.strip().startswith(statement)
+        ]
+        files = 0
+        counting = []
+
+        def tracing(frame, event, arg):
+            nonlocal files
+            if event == "line" and frame.f_lineno == line:
+                files += 1
+                if files == number:
+                    counting.append(frame.f_locals["self"]._sock)
+                    raise interrupt
+            return tracing
+
+        def calls(frame, event, arg):
+            return tracing if frame.f_code is socket.SocketIO.close.__code__ else None
+
+        previous = sys.gettrace()
+        with collector_paused():
+            sys.settrace(calls)
+            try:
+                yield
+            finally:
+                sys.settrace(previous)
+                for sock in counting:
+                    sock._decref_socketios()
 
     def wait_for_heads(self):
         """From now to the end of the test, each connection of http.client,
@@ -3259,7 +3311,8 @@ class KeptConnectionTest(StubTestCase):
     def test_an_https_connection_the_server_closed_carries_nothing(self):
         # Offline, without a TLS handshake: the TLS sockets are fakes, each
         # one's file descriptor a real socket's, the kept end of a pair, which
-        # is readable once its other end, the server's, is closed.
+        # is readable once its other end, the server's, is closed. A fake's
+        # close leaves it no descriptor, as a socket's does.
         body = xmlrpc.client.dumps((3,), methodresponse=True).encode()
         answer = (
             "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n"
@@ -3273,6 +3326,9 @@ class KeptConnectionTest(StubTestCase):
             self.addCleanup(server_end.close)
             tls_socket = mock.create_autospec(ssl.SSLSocket, instance=True)
             tls_socket.fileno.return_value = kept_end.fileno()
+            tls_socket.close.side_effect = functools.partial(
+                setattr, tls_socket.fileno, "return_value", -1
+            )
             tls_socket.makefile.side_effect = lambda *args, **kwargs: io.BytesIO(answer)
             tls_sockets.append(tls_socket)
             server_ends.append(server_end)
@@ -3984,6 +4040,80 @@ class KeptConnectionTest(StubTestCase):
                 self.assertEqual(len(opened), 1)
                 self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
 
+    def test_an_interrupt_as_an_answer_the_call_let_go_closes_goes_on_as_it_is(self):
+        # xmlrpc.client reads each answer to its end and never closes it, and
+        # urllib3 leaves unclosed a redirect whose body the call drains,
+        # undecoded, when that body has a length and is not empty, as
+        # KeepAliveOdoo's has. Dropped as the next answer replaced it, such
+        # an answer was closed by IOBase's finalizer as it was collected,
+        # which drops an interrupt raised in that close (silently before
+        # Python 3.13): the call went on as if no interrupt had come. The
+        # connection closes the answer before it makes the next one
+        # (_AnswerClosing). An interrupt comes as each close of an answer the
+        # call runs starts, in turn, a new client each time, until the call
+        # runs whole: the call raises it, unchanged, and the next call works.
+        # Over XML-RPC the login is replaced; over JSON-2 the closes are the
+        # first call's answer, the redirect and the answer it leads to.
+        self.fail_on_resource_warnings()
+        cases = {
+            "the second call on a kept XML-RPC connection": ("xmlrpc", PASSWORD, {}, 1),
+            "a redirect drained on a kept JSON-2 connection": (
+                "json2",
+                KEY,
+                {("call", 2): "redirect at length"},
+                3,
+            ),
+        }
+        for case, (api, secret, plan, closes) in cases.items():
+            with self.subTest(case=case):
+                results = []
+                number = 0
+                while not results:
+                    number += 1
+                    odoo = self.start(KeepAliveOdoo(plan))
+                    client = self.make_client(odoo.url, api, secret, f"erp-{api}-{number}")
+                    interrupt = KeyboardInterrupt()
+                    with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
+                        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                        with self.interrupted_as_it_starts(
+                            odoo_auth.client._HTTPResponse.close, number, interrupt
+                        ) as raised:
+                            try:
+                                results.append(
+                                    client.call("res.partner", "search_count", domain=[])
+                                )
+                            except KeyboardInterrupt as error:
+                                self.assertIs(error, interrupt)
+                        # The call returns only when none of its closes was
+                        # interrupted: an interrupted one raised it.
+                        self.assertEqual(raised, [] if results else [interrupt])
+                        self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                self.assertEqual(results, [3])
+                # The closes interrupted in turn, before the call that ran
+                # whole: the case's, and no other.
+                self.assertEqual(number - 1, closes)
+
+    def test_a_connection_whose_last_answer_is_unread_refuses_the_next_one(self):
+        # The connection closes its last answer before it makes the next one
+        # only once http.client is done with it, its body read to its end
+        # (_AnswerClosing). One whose body is unread is left to http.client,
+        # which refuses to make the next answer (ResponseNotReady) rather than
+        # read that body as the next answer's head, and stays readable. No
+        # caller of the library's connections asks for it: xmlrpc.client and
+        # urllib3 read or close each answer before the next request.
+        self.fail_on_resource_warnings()
+        odoo = self.start(KeepAliveOdoo())
+        connection = odoo_auth.client._HTTPConnection(
+            odoo.url.removeprefix("http://"), timeout=HOLD, read_timeout=HOLD
+        )
+        self.addCleanup(connection.close)
+        connection.request("POST", "/json/2/res.partner/search_count", body=b"{}")
+        unread = connection.getresponse()
+        connection.request("POST", "/json/2/res.partner/search_count", body=b"{}")
+        with self.assertRaises(http.client.ResponseNotReady):
+            connection.getresponse()
+        self.assertEqual(unread.read(), b"3")
+
     def test_the_call_after_an_interrupt_once_the_logins_socket_closed_works(self):
         # The connection's close closes its socket, then forgets it
         # (_SocketClosing): an interrupt between the two, as the login's
@@ -4025,6 +4155,289 @@ class KeptConnectionTest(StubTestCase):
         self.assertEqual(len(opened), 3)
         self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
         self.assertEqual(odoo.requests, [(1, "login"), (2, "call"), (3, "call")])
+
+    def test_an_interrupt_before_an_answers_file_is_counted_out_leaves_the_next_call_working(
+        self,
+    ):
+        # socket.SocketIO.close marks the answer's file closed, then counts it
+        # out of the socket, whose own close waits for its files: an
+        # interrupt between the two, as http.client closes the file at the
+        # end of the body, leaves the socket counting a closed file, which no
+        # close of the socket closes (the README's case). Nothing here checks
+        # that socket: Python may one day count the file out first
+        # (interrupted_file_count). The interrupt goes on unchanged, and the
+        # next call works. The login is replaced over XML-RPC.
+        self.fail_on_resource_warnings()
+        cases = {"xmlrpc": PASSWORD, "json2": KEY}
+        for api, secret in cases.items():
+            with self.subTest(api=api):
+                odoo = self.start(KeepAliveOdoo())
+                client = self.make_client(odoo.url, api, secret, f"erp-{api}")
+                interrupt = KeyboardInterrupt()
+                with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
+                    with self.interrupted_file_count(1, interrupt):
+                        error = self.raised(
+                            KeyboardInterrupt,
+                            lambda: client.call("res.partner", "search_count", domain=[]),
+                        )
+                        self.assertIs(error, interrupt)
+                        self.assertEqual(
+                            client.call("res.partner", "search_count", domain=[]), 3
+                        )
+
+    def test_an_interrupt_as_an_answers_file_closes_its_socket_leaves_no_socket_open(self):
+        # Once the answer's file is counted out of the socket, the file's
+        # close closes the socket, if its connection closed it first
+        # (socket._decref_socketios), as each answer of an HTTP/1.0 stub
+        # here closes its connection: an interrupt between the two leaves the
+        # socket open, counting no file. The connection's close closes it
+        # again (_AnswerClosing), before the interrupt goes on unchanged, and
+        # the next call works. The login is replaced over XML-RPC.
+        self.fail_on_resource_warnings()
+        call = self.start(RawXmlRpc())
+        call.call_answer = Answer(
+            200, xmlrpc.client.dumps((3,), methodresponse=True).encode(), {"Content-Type": "text/xml"}
+        )
+        json2 = self.start(Json2Odoo())
+        json2.answers[("res.partner", "search_count")] = 3
+        cases = {
+            "xmlrpc": (call, PASSWORD, socket),
+            "json2": (json2, KEY, urllib3.util.connection),
+        }
+        for api, (stub, secret, module) in cases.items():
+            with self.subTest(api=api):
+                client = self.make_client(stub.url, api, secret, f"erp-{api}")
+                opened = self.record_sockets(module)
+                interrupt = KeyboardInterrupt()
+                with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
+                    with self.interrupted_at_statement(
+                        socket.socket._decref_socketios, "self.close()", 1, interrupt
+                    ):
+                        error = self.raised(
+                            KeyboardInterrupt,
+                            lambda: client.call("res.partner", "search_count", domain=[]),
+                        )
+                    self.assertIs(error, interrupt)
+                    self.assertEqual(len(opened), 1)
+                    self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+                    self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                client.close()
+                self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+
+    def test_an_interrupt_as_an_unanswered_calls_answer_closes_leaves_no_socket_open(self):
+        # A server that drops the call unanswered: http.client closes the
+        # answer whose head it could not read, in a bare except
+        # (HTTPConnection.getresponse). An interrupt as that close starts
+        # leaves the answer's file open, the socket with it, held by the
+        # frames of the interrupt's traceback, as a prompt holds the last
+        # error. The connection keeps the answer it makes, and closes it
+        # before the interrupt goes on unchanged (_AnswerClosing); the next
+        # call works. The login is replaced over XML-RPC.
+        self.fail_on_resource_warnings()
+        cases = {
+            "xmlrpc": (PASSWORD, socket),
+            "json2": (KEY, urllib3.util.connection),
+        }
+        for api, (secret, module) in cases.items():
+            with self.subTest(api=api):
+                odoo = self.start(KeepAliveOdoo({("call", 1): "drop"}))
+                client = self.make_client(odoo.url, api, secret, f"erp-{api}")
+                opened = self.record_sockets(module)
+                interrupt = KeyboardInterrupt()
+                with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
+                    with self.interrupted_as_it_starts(
+                        odoo_auth.client._HTTPResponse.close, 1, interrupt
+                    ):
+                        error = self.raised(
+                            KeyboardInterrupt,
+                            lambda: client.call("res.partner", "search_count", domain=[]),
+                        )
+                    self.assertIs(error, interrupt)
+                    client.close()
+                    self.assertEqual(len(opened), 1)
+                    self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+                    self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                client.close()
+                self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+
+    def test_an_error_once_an_unanswered_calls_file_is_counted_out_leaves_no_socket_open(self):
+        # A server that drops or resets the call unanswered: http.client
+        # closes the connection, then the answer whose head it could not
+        # read (HTTPConnection.getresponse), and the answer's file, once
+        # counted out of the socket, runs the socket's own close
+        # (socket._decref_socketios). One of the three errors between the
+        # two left the socket open, counting no file, after Client.close()
+        # too: the connection's close closed again the socket of the answer
+        # getresponse gave, and this one was never given. The connection
+        # keeps the answer whose head failed for its close (_AnswerClosing).
+        # The same error goes on, no socket is left open, and the next call
+        # works. The login is replaced over XML-RPC.
+        self.fail_on_resource_warnings()
+        cases = {
+            "xmlrpc": (PASSWORD, socket),
+            "json2": (KEY, urllib3.util.connection),
+        }
+        for api, (secret, module) in cases.items():
+            for unanswered in ("drop", "reset"):
+                for error_class in (KeyboardInterrupt, MemoryError, RecursionError):
+                    with self.subTest(api=api, unanswered=unanswered, error=error_class):
+                        odoo = self.start(KeepAliveOdoo({("call", 1): unanswered}))
+                        client = self.make_client(
+                            odoo.url, api, secret, f"erp-{api}-{unanswered}-{error_class.__name__}"
+                        )
+                        opened = self.record_sockets(module)
+                        error = error_class()
+                        with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
+                            with self.interrupted_at_statement(
+                                socket.socket._decref_socketios, "self.close()", 1, error
+                            ):
+                                raised = self.raised(
+                                    error_class,
+                                    lambda: client.call("res.partner", "search_count", domain=[]),
+                                )
+                            self.assertIs(raised, error)
+                            client.close()
+                            self.assertEqual(len(opened), 1)
+                            self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+                            self.assertEqual(
+                                client.call("res.partner", "search_count", domain=[]), 3
+                            )
+                        client.close()
+                        self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+
+    def test_an_answer_whose_files_close_stopped_goes_with_the_error_that_stopped_it(self):
+        # socket.SocketIO.close marks the answer's file closed, then counts it
+        # out of the socket: an interrupt between the two, at the end of the
+        # body, leaves the socket counting a closed file, which no close of it
+        # closes, until Python frees it, once neither the error's traceback
+        # nor the answer holds it (the README's case). Over JSON-2 urllib3
+        # keeps the connection, closed, in its pool, and the connection kept
+        # the answer it made until its next call: with the error dropped and
+        # collected, the client alive, the socket stayed open. The connection
+        # keeps no answer past its close (_AnswerClosing), and the error
+        # takes the socket with it, as over XML-RPC. The sockets are
+        # recorded weakly: a record would keep each alive. The socket's
+        # finalizer closes it with a ResourceWarning, which the test records
+        # rather than prints. The login is replaced over XML-RPC.
+        cases = {
+            "xmlrpc": (PASSWORD, socket),
+            "json2": (KEY, urllib3.util.connection),
+        }
+        for api, (secret, module) in cases.items():
+            with self.subTest(api=api):
+                odoo = self.start(KeepAliveOdoo())
+                client = self.make_client(odoo.url, api, secret, f"erp-{api}")
+                opened = self.record_sockets(module, weakref.ref)
+                interrupt = KeyboardInterrupt()
+                with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
+                    with self.interrupted_at_statement(
+                        socket.SocketIO.close, "self._sock._decref_socketios()", 1, interrupt
+                    ):
+                        error = self.raised(
+                            KeyboardInterrupt,
+                            lambda: client.call("res.partner", "search_count", domain=[]),
+                        )
+                    self.assertIs(error, interrupt)
+                    self.assertEqual(len(opened), 1)
+                    with warnings.catch_warnings(record=True):
+                        warnings.simplefilter("always", ResourceWarning)
+                        del error, interrupt
+                        collect_garbage()
+                    self.assertEqual([sock() for sock in opened], [None])
+                    self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+
+    def test_an_answer_whose_files_close_the_connections_close_stopped_goes_with_the_error(self):
+        # The test above, as the connection's close closes the answer it
+        # keeps, here an XML-RPC 500 in chunks, left unread. The connection
+        # kept that answer past its close the interrupt cut short, and the
+        # transport kept the connection: with the error dropped and
+        # collected, the client alive, the socket stayed open until the next
+        # call or close. The connection's close forgets the answer once the
+        # answer's file is closed, whatever error comes inside that close
+        # (_AnswerClosing), and the error takes the socket with it. The
+        # sockets are recorded weakly, and the socket's finalizer closes it
+        # with a ResourceWarning, which the test records rather than prints.
+        # The login is replaced.
+        odoo = self.start(KeepAliveOdoo({("call", 1): "answer an error in chunks"}))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        opened = self.record_sockets(socket, weakref.ref)
+        interrupt = KeyboardInterrupt()
+        with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
+            with self.interrupted_at_statement(
+                socket.SocketIO.close, "self._sock._decref_socketios()", 1, interrupt
+            ):
+                error = self.raised(
+                    KeyboardInterrupt,
+                    lambda: client.call("res.partner", "search_count", domain=[]),
+                )
+            self.assertIs(error, interrupt)
+            self.assertEqual(len(opened), 1)
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always", ResourceWarning)
+                del error, interrupt
+                collect_garbage()
+            self.assertEqual([sock() for sock in opened], [None])
+            self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+
+    def test_an_answer_whose_close_stopped_before_its_file_closes_at_the_next_close(self):
+        # http.client's close of an answer marks it closed, then closes its
+        # file (HTTPResponse.close): an interrupt between the two, as the
+        # connection's close closes an XML-RPC 500 in chunks, left unread,
+        # leaves the file open, and the socket with it. The connection keeps
+        # that answer, and its next close, Client.close()'s, closes the file
+        # and the socket, while the interrupt is still held, as a prompt
+        # holds the last error. The login is replaced.
+        self.fail_on_resource_warnings()
+        odoo = self.start(KeepAliveOdoo({("call", 1): "answer an error in chunks"}))
+        client = self.make_client(odoo.url, "xmlrpc", PASSWORD)
+        opened = self.record_sockets(socket)
+        interrupt = KeyboardInterrupt()
+        with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
+            with self.interrupted_at_statement(
+                http.client.HTTPResponse.close, "self._close_conn()", 1, interrupt
+            ):
+                error = self.raised(
+                    KeyboardInterrupt,
+                    lambda: client.call("res.partner", "search_count", domain=[]),
+                )
+        self.assertIs(error, interrupt)
+        client.close()
+        self.assertEqual(len(opened), 1)
+        self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+
+    def test_an_answer_whose_close_had_not_started_is_closed_by_the_next_close(self):
+        # An interrupt as the connection's close starts, before that close
+        # reaches the answer it keeps, here an XML-RPC answer read to its end
+        # on a connection the answer closed (HTTP/1.0), leaves that answer
+        # open, though its file is closed. The connection keeps it, and its
+        # next close, Client.close()'s, closes it. Forgotten, it would have
+        # been closed by IOBase's finalizer as it was collected, where an
+        # error is dropped or reported, never raised. The login is replaced.
+        stub = self.start(RawXmlRpc())
+        stub.call_answer = Answer(
+            200, xmlrpc.client.dumps((3,), methodresponse=True).encode(), {"Content-Type": "text/xml"}
+        )
+        client = self.make_client(stub.url, "xmlrpc", PASSWORD)
+        with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
+            self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        finalized = []
+        close = odoo_auth.client._HTTPResponse.close
+
+        def recording(answer):
+            # IOBase's finalizer marks the object it closes so.
+            if getattr(answer, "_finalizing", False):
+                finalized.append("an answer closed by IOBase's finalizer")
+            close(answer)
+
+        interrupt = KeyboardInterrupt()
+        with mock.patch.object(odoo_auth.client._HTTPResponse, "close", recording):
+            with self.interrupted_as_it_starts(http.client.HTTPConnection.close, 1, interrupt):
+                error = self.raised(KeyboardInterrupt, client.close)
+            self.assertIs(error, interrupt)
+            client.close()
+            del error, interrupt
+            collect_garbage()
+        self.assertEqual(finalized, [])
 
     def test_an_interrupt_in_client_close_over_json2_goes_on_as_it_is(self):
         # Client.close() closes the session's pools of urllib3 through their

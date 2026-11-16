@@ -1229,9 +1229,12 @@ class _HTTPResponse(http.client.HTTPResponse):
     # the making ends (above).
     _file = None
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, sock, *args, **kwargs):
+        # The socket the answer's file is made on, for the connection's
+        # close (_AnswerClosing).
+        self._socket = sock
         try:
-            super().__init__(*args, **kwargs)
+            super().__init__(sock, *args, **kwargs)
             self._file = self.fp
         except BaseException:
             self.close()
@@ -1247,42 +1250,163 @@ class _HTTPResponse(http.client.HTTPResponse):
             if self.fp is None and self._file is not None:
                 self._file.close()
 
+    def closed_with_its_file(self):
+        """Whether the answer is closed and its file too, at least marked
+        closed (socket.SocketIO.close): a close of it can then do nothing
+        more, as the close of a file marked closed returns at once and
+        raises nothing, also where the close that marked it stopped before
+        the socket counted it out (_AnswerClosing)."""
+        return self.closed and (self._file is None or self._file.closed)
+
 
 class _AnswerClosing(http.client.HTTPConnection):
     """For Client's connections, over both APIs: closing one closes the
-    answer http.client gave last on it too. When the connection closes
-    after an answer, http.client hands that answer its socket
-    (HTTPConnection.getresponse), and closing the connection no longer
-    reaches it. xmlrpc.client does not close an answer it fails to read,
-    and urllib3, after a failure before its own answer wraps http.client's,
-    closes the connection only (HTTPConnectionPool.urlopen): closed after
-    a failure, a connection then leaves no answer's socket open, but that
-    of an answer whose making an interrupt, a MemoryError or a
-    RecursionError stopped inside socket.makefile, once the socket counted
-    the answer's file: that socket closes as the error's traceback is
-    collected, with a ResourceWarning only when the garbage collector frees
-    the traceback in a reference cycle and the socket in the same
-    collection (_HTTPResponse). Its answers are _HTTPResponse, through the
-    class http.client makes them of (response_class).
+    answer it keeps too, the one http.client gave last on it, or the one
+    http.client made in a getresponse that failed (below). When the
+    connection closes after an answer, http.client hands that answer its
+    socket (HTTPConnection.getresponse), and closing the connection no
+    longer reaches it. xmlrpc.client does not close an answer it fails to
+    read, and urllib3, after a failure before its own answer wraps
+    http.client's, closes the connection only (HTTPConnectionPool.urlopen):
+    closed after a failure, a connection then leaves no answer's socket
+    open, but in two cases of README § Library usage, each left by an
+    interrupt such as Ctrl-C, a MemoryError or a RecursionError. One is the
+    socket of an answer whose making one of them stopped inside
+    socket.makefile, once the socket counted the answer's file: it closes
+    as the error's traceback is collected, with a ResourceWarning only when
+    the garbage collector frees the traceback in a reference cycle and the
+    socket in the same collection (_HTTPResponse). The other is the socket
+    of an answer whose file's close one of them stopped once the file was
+    marked closed and before the socket counted it out: it counts a closed
+    file, which no close can close, and Python closes it as it frees it,
+    with a ResourceWarning (below).
+
+    http.client makes each answer before it reads the answer's head
+    (HTTPConnection.getresponse, through response_class), and closes it in
+    a bare except after any error of the steps that follow: as the head
+    cannot be read, from a server that drops or resets the call unanswered
+    (it closes the connection first then), or as the read timeout fires or
+    TLS fails; or as it closes the connection for an answer that closes
+    it. One of those errors as that close starts would leave the answer's
+    file open, the socket with it, held only by the frames of the error's
+    traceback, after Client.close() too. The connection keeps the answer
+    http.client makes while getresponse runs, once it is made: an answer
+    whose making fails is not kept, and _HTTPResponse closes one whose
+    making failed in its try. After any error in getresponse, the
+    connection keeps the answer http.client made as the one its close
+    closes, then closes it, before the error goes on (below).
+    Its answers are _HTTPResponse.
+
+    The socket's close waits for the answer's file, which holds it, and the
+    file's close counts itself out of the socket, then runs the socket's
+    close once the connection has closed the socket
+    (socket._decref_socketios): an error between the two, as the body of an
+    answer the connection handed its socket to ends, as the answer to a
+    call dropped or reset unanswered closes once the connection closed, or
+    as the connection's close closes an answer not read whole, leaves the
+    socket open, counting no file, after Client.close() too. The
+    connection's close closes the socket of the answer it keeps again, once
+    the answer is closed: then it closes, and a socket already closed is
+    left as it is. An error that comes before the file is counted out
+    leaves the socket counting a file that is closed, which no close can
+    close (README § Library usage). The connection's close then forgets the
+    answer all the same, once the answer and its file are closed, whatever
+    error cut that close short (_HTTPResponse.closed_with_its_file), so
+    that the socket goes with the error's traceback, as the answer does,
+    and not with the connection; an answer whose close an error cut short
+    before that it keeps, for its next close to finish.
+
+    xmlrpc.client reads each answer to its end and never closes it. urllib3
+    closes an answer it reads at the end of a body in chunks, or when a
+    read finds nothing more: it stops reading once the answer's file is
+    closed (HTTPResponse.stream), and reads past a body's end only as it
+    decodes, for a piece shorter than the size asked (HTTPResponse.read).
+    It leaves unclosed the answer of a body with a length whose last read
+    ended at the body's end: that of a redirect whose body, not empty, the
+    call drains undecoded, always, and that of an answer whose content
+    requests reads decoded, in pieces of 10,240 bytes, when its last piece
+    is whole, as for a body whose length is a multiple of them. Nor does
+    requests' close of such an answer close it, as urllib3 counts it closed
+    once its file is (Response.close, HTTPResponse.close). http.client has
+    closed such an answer's file, but not the answer, which, dropped as the
+    next one replaced it, IOBase's finalizer would close as it is
+    collected, where Python drops or reports one of those errors
+    (_HTTPResponse). getresponse closes the answer the connection keeps
+    before the next one is made, once http.client is done with it, its file
+    closed (HTTPResponse.isclosed): one of them in that close goes on as it
+    is.
+    An answer http.client is not done with, its body not read to its end,
+    is left as it is. http.client refuses to make the next answer while it
+    keeps it (ResponseNotReady), as it keeps one that keeps its connection;
+    one that closed its connection, which it does not keep, the next
+    getresponse replaces, unclosed, for IOBase's finalizer to close as it
+    is collected. No caller of the library's connections reaches that: a
+    connection carries a request only once the last answer on it was read
+    to its end or closed, or once the connection was closed (_Sending,
+    urllib3's pool).
 
     It wraps http.client's own getresponse and close, which urllib3's
     connection calls through super(): a connection of JSON-2 lists it after
     urllib3's class, so that it comes between the two. It keeps the answer
-    until its close has closed it; the connection's socket is closed before,
-    ahead of urllib3's close (_SocketClosing)."""
+    getresponse gives, or the one http.client made in a getresponse that
+    failed, until its close has closed it, with its file, and forgotten
+    it, or the next getresponse gives the next one, and the answer
+    http.client makes only while getresponse runs: urllib3 keeps a closed
+    connection in its pool, from one call to the next, and an answer the
+    connection held past its close would keep its socket, whatever an
+    error left open, for as long as the connection lives. The connection's
+    socket is closed before, ahead of urllib3's close (_SocketClosing)."""
 
-    response_class = _HTTPResponse
+    # The answer the connection's close closes (above).
     _answer = None
+    # The answer http.client makes in the getresponse that runs (above).
+    _made = None
+
+    def response_class(self, *args, **kwargs):
+        """The answer http.client makes, with ``args`` and ``kwargs``, for
+        this connection, kept once it is made (above)."""
+        self._made = _HTTPResponse(*args, **kwargs)
+        return self._made
 
     def getresponse(self):
-        self._answer = super().getresponse()
+        # The answer before this one, once http.client is done with it, is
+        # closed here, before the next one is made (above).
+        if self._answer is not None and self._answer.isclosed():
+            self._answer.close()
+        self._made = None
+        try:
+            self._answer = super().getresponse()
+        except BaseException:
+            # Kept first, for the connection's close, which closes its socket
+            # again where an error cut short its close here or http.client's
+            # (above). Those closes leave nothing for this one to raise
+            # (_HTTPResponse); the error goes on as it is.
+            if self._made is not None:
+                self._answer = self._made
+                self._answer.close()
+            raise
+        finally:
+            # http.client's connection closes inside getresponse, as an answer
+            # that closes it is handed its socket: an answer made here is the
+            # connection's to close only once getresponse ends (above).
+            self._made = None
         return self._answer
 
     def close(self):
-        super().close()
-        if self._answer is not None:
-            self._answer.close()
-            self._answer = None
+        try:
+            super().close()
+            if self._answer is not None:
+                self._answer.close()
+        finally:
+            # Forgotten once it is closed with its file, whatever error cut
+            # its close short; kept otherwise, for the next close (above).
+            if self._answer is not None and self._answer.closed_with_its_file():
+                # The connection no longer reads it: closing its socket again
+                # closes it only where an error cut its own close short
+                # (above).
+                if self._answer._socket.fileno() != -1:
+                    self._answer._socket.close()
+                self._answer = None
 
 
 # Whether the library handles a call over JSON-2 in this thread or task,
@@ -1475,7 +1599,7 @@ class _Sending:
     server may have read the request. After any failure, whatever it
     raises, an interrupt such as Ctrl-C among them, in the check of the
     kept connection too, the connection is closed before the error goes on,
-    unchanged, and no socket of it is left open, but in the three cases
+    unchanged, and no socket of it is left open, but in the four cases
     below. A Fault, Odoo's own answer, read whole, keeps it, as any answer
     does.
 
@@ -1487,7 +1611,9 @@ class _Sending:
     leave the connection open, held only by the frames of the error's
     traceback, after Client.close() too. The connection's own close closes
     its socket before it forgets it (_SocketClosing), and the answer's close
-    its file (_HTTPResponse).
+    its file (_HTTPResponse), and the connection forgets the answer once the
+    answer and its file are closed, whatever error cut their close short
+    (_AnswerClosing).
 
     A close that one of those errors cuts short leaves the connection kept,
     partly closed: its socket closed but not forgotten, which the check
@@ -1500,7 +1626,7 @@ class _Sending:
     which completes what the close cut short did not do, and goes out on a
     new connection.
 
-    Each of the three cases below is left by an interrupt such as Ctrl-C,
+    Each of the four cases below is left by an interrupt such as Ctrl-C,
     a MemoryError or a RecursionError, the errors the library lets through
     as they are. One of them from the moment socket.create_connection makes
     its socket to the moment that function returns it to the connection's
@@ -1522,6 +1648,12 @@ class _Sending:
     traceback is collected, and the request went out on it. It closes then,
     with a ResourceWarning only when the garbage collector frees the
     traceback in a reference cycle and the socket in the same collection.
+    Nor does any close reach the socket of an answer whose file's close one
+    of them stopped once the file was marked closed and before the socket
+    counted it out (socket.SocketIO.close, _AnswerClosing): the socket
+    counts a closed file, stays open until Python frees it, once the
+    error's traceback and the answer are gone, and closes it then with a
+    ResourceWarning. The request went out: the server may have run it.
 
     ServerProxy keeps xmlrpc.client's own sending: it writes a request on
     its kept connection unchecked, and sends it again after those errors."""
