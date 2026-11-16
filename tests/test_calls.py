@@ -1137,11 +1137,14 @@ class LoggersMixin:
     def made_logger(self, name, logger_class=logging.Logger):
         """The new logger ``name``, of ``logger_class``, a subclass of
         logging.Logger, made as logging makes any logger. Once the test ends,
-        whatever its outcome, what the making added to logging's loggers is
-        taken out: each name it added, the logger's and the placeholder of
-        each parent name that had none, and the logger from the placeholder
-        of each parent name that had one. Every logger a test makes is made
-        here."""
+        whatever its outcome, what the making changed in logging's loggers is
+        undone: each name it added is taken out, the logger's and the
+        placeholder of each parent name that had none; the logger is taken
+        from the placeholder of each parent name that had one; and when
+        ``name`` held a placeholder, which logging replaces with the logger,
+        making the logger the parent of the loggers below it, the
+        placeholder is put back, and each of those loggers gets back the
+        parent it had. Every logger a test makes is made here."""
         manager = logging.Logger.manager
         before = dict(manager.loggerDict)
         previous = manager.loggerClass
@@ -1156,6 +1159,7 @@ class LoggersMixin:
             for holder in before.values()
             if isinstance(holder, logging.PlaceHolder) and logger in holder.loggerMap
         ]
+        replaced = before.get(name)
 
         def take_out():
             # A test may have dropped the logger itself.
@@ -1163,9 +1167,45 @@ class LoggersMixin:
                 manager.loggerDict.pop(key, None)
             for holder in holders:
                 del holder.loggerMap[logger]
+            # A name that held nothing is among those added.
+            if isinstance(replaced, logging.PlaceHolder):
+                manager.loggerDict[name] = replaced
+                for below in replaced.loggerMap:
+                    if below.parent is logger:
+                        below.parent = logger.parent
 
         self.addCleanup(take_out)
         return logger
+
+
+class MadeLoggerTest(LoggersMixin, unittest.TestCase):
+    """What the tests' maker of loggers (LoggersMixin.made_logger) leaves in
+    logging's loggers once a test ends: nothing the making changed."""
+
+    def test_a_logger_made_where_a_placeholder_stood_leaves_the_placeholder(self):
+        # logging puts a placeholder under each parent name of a logger that
+        # has no logger yet, and a logger made under that name takes its
+        # place and becomes the parent of the loggers below it. The parent is
+        # made in a test of its own, run whole here, so that its cleanup runs
+        # while the logger below, this test's, and its placeholder stay.
+        parent = f"made_by_a_test.{uuid.uuid4().hex}"
+        below = self.made_logger(f"{parent}.below")
+        placeholder = logging.Logger.manager.loggerDict[parent]
+        self.assertIsInstance(placeholder, logging.PlaceHolder)
+        self.assertIs(below.parent, logging.root)
+        seen = []
+
+        class MakesTheParent(LoggersMixin, unittest.TestCase):
+            def runTest(self):
+                made = self.made_logger(parent)
+                seen.append((made.name, below.parent is made))
+
+        result = unittest.TestResult()
+        MakesTheParent().run(result)
+        self.assertEqual((result.errors, result.failures), ([], []))
+        self.assertEqual(seen, [(parent, True)])
+        self.assertIs(logging.Logger.manager.loggerDict[parent], placeholder)
+        self.assertIs(below.parent, logging.root)
 
 
 class Json2ClientTest(LoggersMixin, StubTestCase):
