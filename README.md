@@ -255,7 +255,7 @@ APIs, and checks it before a request goes out on it, as `urllib3` checks a
 connection of its pool: when the server has closed it since its last
 answer, the request goes out on a new connection. After a failure of the
 connection it keeps none, nor after a close of it that one of the three
-errors below cut short, and leaves no socket open, but for four cases,
+errors below cut short, and leaves no socket open, but for five cases,
 each where one of the three errors the library lets through as they are
 (an interrupt such as Ctrl-C, a `MemoryError`, or a `RecursionError` from
 the caller's own deep stack, § Errors) comes in a few steps of the code of
@@ -301,6 +301,19 @@ state, whichever of the three it is:
   and without one if the socket outlived an earlier collection and a
   younger one frees the cycle. The request went out: the server may have
   run it. The call raises the same error.
+- The close of the answer's file, over both APIs. Python's
+  `socket.SocketIO.close` marks the file closed, then counts it out of the
+  socket (`_decref_socketios`), whose own close waits for its files. One
+  of the three between the two, as `http.client` closes the file at the
+  end of a body or as the answer closes, leaves the socket counting a file
+  that is closed: no close of the socket closes it then, `Client.close()`'s
+  included, and it stays open until Python frees it, once neither the
+  frames of the error's traceback nor the answer hold it (the connection's
+  close drops the answer it keeps), and closes it with a
+  `ResourceWarning`. The request went out: the server may have run it.
+  The call raises the same error, and the next call works. (Once the file
+  is counted out, an error before the socket's own close leaves nothing
+  open: the connection's close closes that socket again.)
 - The check of a kept connection, over JSON-2. `urllib3` takes a kept
   connection out of its pool, then checks it before it reuses it
   (`HTTPConnectionPool._get_conn`, `is_connection_dropped`). One of the
@@ -535,7 +548,7 @@ result or Odoo's `Fault`. Over JSON-2 it first closes every answer the
 call got, its socket and the connection it still holds with it,
 whichever step of `urllib3`, `requests` or the library the error stopped:
 an answer read whole has given its connection back for the next call.
-These closes do not reach what one of them leaves in the four cases of
+These closes do not reach what one of them leaves in the five cases of
 § Library usage. One of them in `Client.close()` goes on as it is, over
 JSON-2 too, where the client takes the pools of `urllib3` from their pool
 managers, closes the session of `requests`, which drops them from those
