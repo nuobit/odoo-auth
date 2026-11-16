@@ -2358,6 +2358,28 @@ class ShownTest(unittest.TestCase):
         self.assertNotIn(PASSWORD, _shown(parser["odoo"]))
 
 
+class FramesCheckTest(StoreMixin, unittest.TestCase):
+    """What the frames tests below check of an error (assertNoFrameHolds):
+    every frame of its whole chain, as a test runner prints it."""
+
+    def test_a_frame_of_an_error_chained_to_it_fails_the_check(self):
+        # configparser's frames hold its parser, whose sections show the
+        # password one attribute down (_shown): an error raised in the
+        # handler of configparser's keeps them, through its __context__.
+        def raised_in_the_handler():
+            try:
+                configparser.RawConfigParser().read_string(
+                    f"[odoo]\npassword = {PASSWORD}\nnot a line of INI\n"
+                )
+            except configparser.Error:
+                raise ValueError("raised in the handler of configparser's error")
+
+        error = self.raised(ValueError, raised_in_the_handler)
+        self.assertIsInstance(error.__context__, configparser.ParsingError)
+        with self.assertRaisesRegex(AssertionError, "'read_file:self'"):
+            self.assertNoFrameHolds(error, PASSWORD)
+
+
 class ResourceWarningsCheckTest(unittest.TestCase):
     """What the check of a test that may leave no socket or file open
     (StubTestCase.fail_on_resource_warnings) leaves once that test ends."""
