@@ -3943,6 +3943,47 @@ class KeptConnectionTest(StubTestCase):
                     self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
                 self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
 
+    def test_an_interrupt_as_an_answers_close_starts_goes_on_as_it_is(self):
+        # http.client's close of an answer flushes the file it still holds,
+        # then forgets the file and closes it (HTTPResponse.close), and a
+        # closed file refuses a flush with a ValueError. An interrupt as that
+        # close starts leaves the file to the answer's next close: the call's
+        # cleanup over JSON-2, urllib3's as it ends a body in chunks, the
+        # connection's over XML-RPC, whose login is replaced here. The
+        # interrupt goes on unchanged, Client.close() raises nothing, and no
+        # socket is left open.
+        self.fail_on_resource_warnings()
+        unread = self.start(Json2Odoo())
+        unread.answers[("res.partner", "search_count")] = Answer(
+            401, b'{"message": "a body never read"}', {"WWW-Authenticate": "Bearer"}
+        )
+        chunked = self.start(Json2Odoo())
+        chunked.answers[("res.partner", "search_count")] = RawAnswer(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n1\r\n3\r\n0\r\n\r\n"
+        )
+        error_in_chunks = self.start(KeepAliveOdoo({("call", 1): "answer an error in chunks"}))
+        cases = {
+            "a JSON-2 401, its body unread": (unread, "json2", KEY, urllib3.util.connection),
+            "a JSON-2 200 in chunks": (chunked, "json2", KEY, urllib3.util.connection),
+            "an XML-RPC 500 in chunks": (error_in_chunks, "xmlrpc", PASSWORD, socket),
+        }
+        for case, (stub, api, secret, module) in cases.items():
+            with self.subTest(case=case):
+                client = self.make_client(stub.url, api, secret, f"erp-{api}")
+                opened = self.record_sockets(module)
+                interrupt = KeyboardInterrupt()
+                with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
+                    with self.interrupted_as_it_starts(http.client.HTTPResponse.close, 1, interrupt):
+                        error = self.raised(
+                            KeyboardInterrupt,
+                            lambda: client.call("res.partner", "search_count", domain=[]),
+                        )
+                self.assertIs(error, interrupt)
+                client.close()
+                self.assertEqual(len(opened), 1)
+                self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
+
     def test_the_call_after_an_interrupt_once_the_logins_socket_closed_works(self):
         # The connection's close closes its socket, then forgets it
         # (_SocketClosing): an interrupt between the two, as the login's
