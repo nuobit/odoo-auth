@@ -649,9 +649,12 @@ class _Secret:
 
     Its repr shows only its length. A test runner or a debugger prints the
     locals of every frame of a traceback (``pytest -l``), and a frame of
-    this module that holds the profile's values holds this, never the
-    value: ``reveal()`` gives the value inside the expression that sends
-    it, so that no frame keeps it in a variable.
+    this module that holds the profile's values holds them in a _Config,
+    whose password is this, never the value: ``reveal()`` gives the value
+    inside the expression that sends it, so that no frame keeps it in a
+    variable. A debugger shows the value one attribute down, in its
+    attributes: no frame of an error the library raises holds this in a
+    local, or in a container one holds.
     """
 
     __slots__ = ("_value", "_patterns")
@@ -767,27 +770,39 @@ def _check_api(profile, section, config_path):
         )
 
 
-def _check_public_fields(profile, section, password, config_path):
+def _check_public_fields(profile, section, config_path):
     """Raise ConfigError when a value of _PUBLIC_KEYS in ``section``, the
-    profile's, holds ``password``, a _Secret, in any of the forms an error
-    is masked in.
+    profile's, holds its password, in any of the forms an error is masked
+    in (_public_key_holding_the_password).
 
     A caller may print those values: a password written on the wrong line
     would show through them. The check fails closed: a password short or
     common enough to occur in one by chance is refused too. No message
-    quotes a value, and no frame here holds one in a local.
+    quotes a value, and no frame here holds one in a local, nor the
+    password's _Secret, whose value a debugger shows one attribute down.
     """
-    for key in _PUBLIC_KEYS:
-        # _check_api has refused a profile without the api line.
-        if password.occurs_in(section[key]):
-            raise ConfigError(
-                f"The {key} of profile {profile!r}, in {_one_line(config_path)}, holds "
-                "its password. Either the password was written on the wrong "
-                "line: keep it on the password line only. Or the password is "
-                f"so short or so common that it occurs in the {key}: the "
-                f"password must change, as the {key} may be printed. Neither "
-                "is shown."
-            )
+    key = _public_key_holding_the_password(section)
+    if key is not None:
+        raise ConfigError(
+            f"The {key} of profile {profile!r}, in {_one_line(config_path)}, holds "
+            "its password. Either the password was written on the wrong "
+            "line: keep it on the password line only. Or the password is "
+            f"so short or so common that it occurs in the {key}: the "
+            f"password must change, as the {key} may be printed. Neither "
+            "is shown."
+        )
+
+
+def _public_key_holding_the_password(section):
+    """The first key of _PUBLIC_KEYS whose value in ``section``, the
+    profile's, holds its password in any of the forms an error is masked in
+    (_Secret.occurs_in), or None. Returned, not raised: the _Secret it
+    makes for the check goes with this frame, and no frame of the error
+    _check_public_fields raises holds it."""
+    password = _Secret(section["password"])
+    # _check_api has refused a profile without the api line.
+    holding = [key for key in _PUBLIC_KEYS if password.occurs_in(section[key])]
+    return holding[0] if holding else None
 
 
 def _check_url(section, config_path):
@@ -926,21 +941,22 @@ def _idna_refuses(hostname):
     return refused
 
 
-def _check_json2(profile, config, config_path):
-    """Raise ConfigError unless the values JSON-2 sends in headers can go
-    there: the password is an Odoo API key, and the db one line of
-    printable ASCII without spaces.
+def _check_json2(profile, section, config_path):
+    """Raise ConfigError unless the values of ``section``, the profile's,
+    that JSON-2 sends in headers can go there: the password is an Odoo API
+    key, and the db one line of printable ASCII without spaces.
 
     Each is checked before any call, since the transport would refuse it
-    with an error that quotes it. Neither is quoted here.
+    with an error that quotes it. Neither is quoted here, nor held in a
+    local.
     """
-    if not _API_KEY.fullmatch(config["password"].reveal()):
+    if not _API_KEY.fullmatch(section["password"]):
         raise ConfigError(
             f"The password of profile {profile!r}, in {_one_line(config_path)}, "
             "must be an Odoo API key, 40 lowercase hexadecimal digits: "
             "`api = json2` takes no other. It is not shown."
         )
-    if not _is_one_ascii_line(config["db"]):
+    if not _is_one_ascii_line(section["db"]):
         raise ConfigError(
             f"The db of profile {profile!r}, in {_one_line(config_path)}, must "
             "be one line of printable ASCII without spaces, as JSON-2 sends it "
@@ -949,9 +965,31 @@ def _check_json2(profile, config, config_path):
 
 
 def _load_config(profile):
-    """The values of the store of ``profile``, checked: url, db, user, api,
-    and the password as a _Secret. ConfigError otherwise."""
+    """The values of the store of ``profile``, checked, as a _Config.
+    ConfigError otherwise."""
     return _checked_config(profile, *_read_section(profile))
+
+
+class _Config:
+    """The values of a profile's store, checked (_load_config): ``url``,
+    without its trailing slashes, ``db``, ``user``, ``api``, and
+    ``password``, a _Secret.
+
+    An object, not a dict, as the section it comes from (_read_section):
+    neither its repr nor the repr of any of its attributes shows the
+    password, the _Secret's showing only its length. A dict of the same
+    values would hold the _Secret among them, which a debugger shows as it
+    shows a local, with the password one attribute down. No frame that
+    holds the profile's values, such as the login's, shows it."""
+
+    __slots__ = ("url", "db", "user", "password", "api")
+
+    def __init__(self, url, db, user, password, api):
+        self.url = url
+        self.db = db
+        self.user = user
+        self.password = password
+        self.api = api
 
 
 def _read_section(profile):
@@ -1039,30 +1077,29 @@ def _parsed_section(f):
 
 def _checked_config(profile, section, config_path):
     """The values of ``section``, the [odoo] section of the store of
-    ``profile`` in ``config_path``, checked: url, db, user, api, and the
-    password as a _Secret. ConfigError otherwise.
+    ``profile`` in ``config_path``, checked, as a _Config. ConfigError
+    otherwise.
 
     The checks read the section, whose repr shows no value, nor do the
-    reprs of its attributes (_read_section), and the password as a _Secret,
-    whose repr shows only its length: no frame of a ConfigError shows the
-    password.
+    reprs of its attributes (_read_section). The password's _Secret, whose
+    value a debugger shows one attribute down, is made once every check has
+    passed, inside the expression that returns it: no frame of a
+    ConfigError holds it, nor shows the password.
     """
     _check_api(profile, section, config_path)
-    password = _Secret(section["password"])
     # Before the checks whose frames hold a public value in a local.
-    _check_public_fields(profile, section, password, config_path)
+    _check_public_fields(profile, section, config_path)
     _check_url(section, config_path)
-    config = {
-        "url": section["url"].rstrip("/"),
-        "db": section["db"],
-        "user": section["user"],
-        "password": password,
-        "api": section["api"],
-    }
     # Only JSON-2 sends values of the store in headers.
-    if config["api"] == "json2":
-        _check_json2(profile, config, config_path)
-    return config
+    if section["api"] == "json2":
+        _check_json2(profile, section, config_path)
+    return _Config(
+        url=section["url"].rstrip("/"),
+        db=section["db"],
+        user=section["user"],
+        password=_Secret(section["password"]),
+        api=section["api"],
+    )
 
 
 def _read_config(profile):
@@ -1077,7 +1114,7 @@ def _read_config(profile):
     """
     section, config_path = _read_section(profile)
     config = _checked_config(profile, section, config_path)
-    return {**section, "url": config["url"]}
+    return {**section, "url": config.url}
 
 
 class _AnswerParsing:
@@ -1678,12 +1715,12 @@ def _log_in(profile, config, transport):
     Odoo refuses the login.
     """
     with xmlrpc.client.ServerProxy(
-        f"{config['url']}/xmlrpc/2/common", allow_none=True, transport=transport
+        f"{config.url}/xmlrpc/2/common", allow_none=True, transport=transport
     ) as common:
         uid = _send(
             profile,
             lambda: common.authenticate(
-                config["db"], config["user"], config["password"].reveal(), {}
+                config.db, config.user, config.password.reveal(), {}
             ),
         )
     if not uid:
@@ -1777,7 +1814,7 @@ class ServerProxy(xmlrpc.client.ServerProxy):
                     constructor="ServerProxy",
                 )
             config = _load_config(profile)
-            if config["api"] != "xmlrpc":
+            if config.api != "xmlrpc":
                 # The profile decides the API. Odoo 19 logs a deprecation
                 # warning for each XML-RPC call, and an error for each method
                 # that returns None.
@@ -1787,22 +1824,22 @@ class ServerProxy(xmlrpc.client.ServerProxy):
                     f"odoo_auth.client.Client(profile={profile!r})"
                 )
             self._profile = profile
-            self._db = config["db"]
+            self._db = config.db
             # The login's, with every argument at its default, as in 1.x, in
             # a context of its own (_own_context), as each execute_kw runs.
             self._uid = _own_context(
-                _log_in, profile, config, _proxy_transport(config["url"], {})
+                _log_in, profile, config, _proxy_transport(config.url, {})
             )
             # Readable as in 1.x: scripts that log in to Odoo's web
             # themselves read it. An attribute, not a local, so no local
             # shows it; but a frame that holds the proxy, as each of its
             # calls' frames does, shows it one attribute down to a debugger.
-            self._password = config["password"].reveal()
-            given.arguments["uri"] = f"{config['url']}/xmlrpc/2/object"
+            self._password = config.password.reveal()
+            given.arguments["uri"] = f"{config.url}/xmlrpc/2/object"
             given.arguments.setdefault("allow_none", True)
             if given.arguments.get("transport") is None:
                 given.arguments["transport"] = _proxy_transport(
-                    config["url"], given.arguments
+                    config.url, given.arguments
                 )
             args, kwargs = given.args, given.kwargs
         else:
@@ -2241,10 +2278,10 @@ class _XmlRpc:
         # The login's and the calls': an answer that is not XML-RPC raises
         # _InvalidAnswer, one of _TRANSPORT_ERRORS, and each connection takes
         # the timeouts.
-        self._transport = _xmlrpc_transport(config["url"], timeout)
+        self._transport = _xmlrpc_transport(config.url, timeout)
         # Where the calls go, as xmlrpc.client's ServerProxy reads them in
         # its url (Python 3.11, ServerProxy.__init__): the host, and the path.
-        url = urllib.parse.urlsplit(f"{config['url']}/xmlrpc/2/object")
+        url = urllib.parse.urlsplit(f"{config.url}/xmlrpc/2/object")
         self._host = url.netloc
         self._handler = urllib.parse.urlunsplit(("", "", *url[2:]))
 
@@ -2281,7 +2318,9 @@ class _XmlRpc:
             # XML-RPC sets the mark.
             result = _own_context(self._logged_in_request, params)
         except xmlrpc.client.Fault as fault:
-            password = self._config["password"]
+            # The password's _Secret is read where it masks, in no local: this
+            # frame stays in the OdooError's traceback, and a debugger shows
+            # the _Secret's value one attribute down.
             failure = OdooError(
                 self._profile,
                 # Odoo's codes are ints. The decoder takes any value, a text
@@ -2289,9 +2328,9 @@ class _XmlRpc:
                 (
                     fault.faultCode
                     if isinstance(fault.faultCode, int)
-                    else password.hidden(_fault_text(fault.faultCode))
+                    else self._config.password.hidden(_fault_text(fault.faultCode))
                 ),
-                password.hidden(_fault_text(fault.faultString)),
+                self._config.password.hidden(_fault_text(fault.faultString)),
             )
         if failure is not None:
             raise failure
@@ -2306,9 +2345,9 @@ class _XmlRpc:
             self._profile,
             lambda: self._request(
                 _execute_kw_request(
-                    self._config["db"],
+                    self._config.db,
                     self._uid,
-                    self._config["password"].reveal(),
+                    self._config.password.reveal(),
                     params,
                 )
             ),
@@ -2342,7 +2381,7 @@ class _XmlRpc:
             params = _xmlrpc_params((model, method, args, kwargs))
         except _MARSHAL_ERRORS as error:
             failure = _argument_error(
-                self._profile, error, _MARSHAL_ERRORS, self._config["password"]
+                self._profile, error, _MARSHAL_ERRORS, self._config.password
             )
         if failure is not None:
             raise failure
@@ -2409,9 +2448,9 @@ class _Json2:
 
     def __init__(self, profile, config, timeout):
         self._profile = profile
-        self._url = config["url"]
-        self._db = config["db"]
-        self._key = config["password"]
+        self._url = config.url
+        self._db = config.db
+        self._key = config.password
         self._timeout = timeout
         self._session = _OriginSession(self._url, self._key)
         # Each of its connections, as it connects (_ConnectionRecording),
@@ -2694,7 +2733,7 @@ class Client:
         _check_timeout(profile, timeout)
         config = _load_config(profile)
         self.profile = profile
-        self.api = config["api"]
+        self.api = config.api
         # _load_config lets through only the two values of _APIS.
         transport = _XmlRpc if self.api == "xmlrpc" else _Json2
         self._transport = transport(profile, config, timeout)

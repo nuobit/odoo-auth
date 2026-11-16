@@ -28,6 +28,8 @@ from unittest import mock
 import requests
 import urllib3
 
+import odoo_auth.client
+
 # Dummy values of the stores; never a real credential. KEY has the shape of
 # an Odoo API key, 40 lowercase hexadecimal digits.
 KEY = "feedface" * 5
@@ -124,7 +126,7 @@ class StoreMixin:
 
 def _shown(local):
     """What a printer of a frame's locals shows of ``local``, and a debugger
-    one attribute down of the answers, requests and errors in it.
+    one attribute down of each object in it.
 
     A printer shows a value's repr, or nothing when the repr fails, as it
     does for an object whose __init__ raised before setting what its repr
@@ -137,48 +139,39 @@ def _shown(local):
     among them, but configparser's parser and its sections: mappings of a
     store's text values, never of an answer or a request, which a debugger
     shows by their attributes, as any object (debugpy opens as containers
-    only tuples, lists, dicts, ordered dicts, sets and frozensets). Each of
-    them shows its repr and the repr of each of its attributes, one level
-    down. A section's attributes, its parser and its name, show none of its
-    values, and the library's loader holds the store's section for that
-    (_read_section); a parser's sections show them all.
+    only tuples, lists, dicts, ordered dicts, sets and frozensets).
 
-    The repr of an answer, a request or an error of requests shows only a
-    status, a method or a message; that of an answer of urllib3 or of
-    http.client, or of a message's headers, only its class; that of
-    xmlrpc.client's ProtocolError, not its headers. Each also shows what a
-    debugger shows one attribute down, where the key can be: requests'
-    answer's body, url, headers, history (the answers of the redirects it
-    followed, each shown so), request and the next request of a redirect it
-    did not follow (``_next``); a prepared request's url, headers and body
-    (``response.request.headers``); a request's url, headers, params, data
-    and json; an error's request and answer; urllib3's answer's url,
-    headers and body, once read; http.client's answer's headers, and each
-    header of a message; a ProtocolError's url and headers. A redirect's
-    Location can echo the key: in its answer's headers, and in the url of
-    the request that follows it, which is also the url of that request's
-    answer."""
+    A debugger opens any object one attribute down: each object of the
+    frame's level, the local or an item of a container in it, also shows
+    the repr of each of its attributes, and each item of a container among
+    them, one level down, never another level (_one_attribute_down). A
+    section's attributes, its parser and its name, show none of its
+    values, and the library's loader holds the store's section for that
+    (_read_section); a parser's sections show them all. Below that level,
+    only the answers, the requests and the errors are opened, at any depth,
+    where the key or the password can be one attribute down of each."""
     texts = []
-    pending = [local]
-    # Each value walked, by its id, kept alive so that no id is taken again
-    # by another value during the walk; each is shown once, which also ends
-    # the walk of a container that holds itself.
+    # Each value to show, and whether it is of the frame's level.
+    pending = [(local, True)]
+    # Each value walked, by its id and its level, kept alive so that no id
+    # is taken again by another value during the walk; each is shown once
+    # at each level, which also ends the walk of a container that holds
+    # itself.
     walked = {}
     while pending:
-        value = pending.pop()
-        if id(value) not in walked:
-            walked[id(value)] = value
-            if isinstance(value, (configparser.RawConfigParser, configparser.SectionProxy)):
-                texts.append(_printed(value))
-                texts += [_printed(attribute) for attribute in vars(value).values()]
+        value, frames_level = pending.pop()
+        if (id(value), frames_level) not in walked:
+            walked[id(value), frames_level] = value
             # A context of contextvars is a mapping from Python 3.14 only.
-            elif isinstance(value, (collections.abc.Mapping, contextvars.Context)):
-                pending += [*value.keys(), *value.values()]
+            if isinstance(value, (collections.abc.Mapping, contextvars.Context)) and not isinstance(
+                value, (configparser.RawConfigParser, configparser.SectionProxy)
+            ):
+                pending += [(item, frames_level) for item in (*value.keys(), *value.values())]
             elif isinstance(value, (list, tuple, set, frozenset, collections.deque)):
-                pending += value
+                pending += [(item, frames_level) for item in value]
             else:
                 texts.append(_printed(value))
-                pending += _one_attribute_down(value)
+                pending += [(down, False) for down in _one_attribute_down(value, frames_level)]
     return "".join(texts)
 
 
@@ -191,15 +184,55 @@ def _printed(value):
     return printed
 
 
-def _one_attribute_down(value):
-    """What a debugger shows one attribute down of ``value``, an answer, a
-    request or an error of requests, an answer of urllib3 or of
-    http.client, a message's headers or xmlrpc.client's ProtocolError, where
-    its repr does not show it (_shown); nothing for any other value."""
+def _one_attribute_down(value, frames_level):
+    """What a debugger shows one attribute down of ``value``, an object, where
+    its repr does not show it (_shown), whether ``value`` is of the frame's
+    level or not.
+
+    An object of the frame's level, whatever it is, shows each of its
+    attributes, those of its __dict__ and of its classes' __slots__
+    (_attributes): an answer, a request or an error as any other object, the
+    status line's text of an answer and the auth of a request among them,
+    and the library's _Secret, whose repr shows only its length, its value
+    and its patterns, whose reprs show the value. Below that level, only an
+    answer, a request or an error shows what is one attribute down of it
+    (_opened_at_any_depth). ServerProxy, which shows the password one
+    attribute down in _password, readable as in 1.x, shows none at any
+    level: the README grants it that one exception."""
+    if isinstance(value, odoo_auth.client.ServerProxy):
+        down = []
+    else:
+        down = _attributes(value) if frames_level else _opened_at_any_depth(value)
+    return down
+
+
+def _opened_at_any_depth(value):
+    """What a debugger shows one attribute down of ``value``, an object below
+    the frame's level (_one_attribute_down): of an answer, a request or an
+    error, at any depth, where the key or the password can be; of any other
+    object, nothing.
+
+    The repr of an answer, a request or an error of requests shows only a
+    status, a method or a message; that of an answer of urllib3 or of
+    http.client, or of a message's headers, only its class; that of
+    xmlrpc.client's ProtocolError, not its headers. Each also shows what a
+    debugger shows one attribute down, where the key or the password can be:
+    requests' answer's body, url, status line's text (``reason``), headers,
+    history (the answers of the redirects it followed, each shown so),
+    request and the next request of a redirect it did not follow
+    (``_next``); a prepared request's url, headers and body
+    (``response.request.headers``); a request's url, headers, auth, params,
+    data and json; an error's request and answer; urllib3's answer's url,
+    status line's text, headers and body, once read; http.client's answer's
+    status line's text and headers, and each header of a message; a
+    ProtocolError's url and headers. A redirect's Location can echo the
+    key: in its answer's headers, and in the url of the request that
+    follows it, which is also the url of that request's answer."""
     if isinstance(value, requests.Response):
         down = [
             value._content,
             value.url,
+            value.reason,
             value.headers,
             value.history,
             value.request,
@@ -208,15 +241,15 @@ def _one_attribute_down(value):
     elif isinstance(value, requests.PreparedRequest):
         down = [value.url, value.headers, value.body]
     elif isinstance(value, requests.Request):
-        down = [value.url, value.headers, value.params, value.data, value.json]
+        down = [value.url, value.headers, value.auth, value.params, value.data, value.json]
     elif isinstance(value, requests.RequestException):
         down = [value.request, value.response]
     elif isinstance(value, urllib3.response.HTTPResponse):
-        down = [value.url, value.headers, value._body]
+        down = [value.url, value.reason, value.headers, value._body]
     elif isinstance(value, http.client.HTTPResponse):
-        # None until the answer's head is read, and unset on an answer whose
-        # making stopped before it.
-        down = [getattr(value, "headers", None)]
+        # Each unset on an answer whose making stopped before setting it, and
+        # the headers None until the answer's head is read.
+        down = [getattr(value, "reason", None), getattr(value, "headers", None)]
     elif isinstance(value, email.message.Message):
         down = value.items()
     elif isinstance(value, xmlrpc.client.ProtocolError):
@@ -224,6 +257,40 @@ def _one_attribute_down(value):
     else:
         down = []
     return down
+
+
+# What _attributes reads of a slot that is not set.
+_UNSET = object()
+
+
+def _attributes(value):
+    """The values of ``value``'s attributes, as a debugger lists them: each
+    of its __dict__, and each set slot of the __slots__ its classes declare,
+    under the name Python stores it by (_slot_name)."""
+    try:
+        attributes = list(vars(value).values())
+    except TypeError:
+        # No __dict__.
+        attributes = []
+    for cls in type(value).__mro__:
+        slots = cls.__dict__.get("__slots__", ())
+        names = [slots] if isinstance(slots, str) else slots
+        for name in names:
+            if name not in ("__dict__", "__weakref__"):
+                attribute = getattr(value, _slot_name(cls, name), _UNSET)
+                if attribute is not _UNSET:
+                    attributes.append(attribute)
+    return attributes
+
+
+def _slot_name(cls, name):
+    """The name Python stores the slot ``name`` of ``cls``'s __slots__ by: a
+    private one, ``__x`` but not ``__x__``, mangled into
+    ``_<cls's name without its leading underscores>__x``, but in a class
+    named only with underscores, where Python mangles no name."""
+    owner = cls.__name__.lstrip("_")
+    private = name.startswith("__") and not name.endswith("__")
+    return f"_{owner}{name}" if private and owner else name
 
 
 def free_port():

@@ -2400,10 +2400,53 @@ class StubsTest(StubTestCase):
         )
 
 
+class Holder:
+    """An ordinary object, which holds ``held`` in its __dict__, and whose
+    repr shows only its class."""
+
+    def __init__(self, held):
+        self.held = held
+
+
+class PrivateSlot:
+    """An object that holds ``held`` in a private slot, which Python stores
+    by a mangled name, _PrivateSlot__held."""
+
+    __slots__ = ("__held",)
+
+    def __init__(self, held):
+        self.__held = held
+
+
+class OneSlotNamed:
+    """An object whose __slots__ is one string, the name of its one slot,
+    which holds ``held``."""
+
+    __slots__ = "held"
+
+    def __init__(self, held):
+        self.held = held
+
+
+class SlotLeftUnset:
+    """An object with a slot left unset before the one that holds ``held``."""
+
+    __slots__ = ("unset", "held")
+
+    def __init__(self, held):
+        self.held = held
+
+
+# A class named only with underscores, in which Python mangles no name: its
+# private slot keeps the name it is written with, __held.
+UnderscoresOnly = type("__", (), {"__slots__": ("__held",)})
+
+
 class ShownTest(unittest.TestCase):
     """What the frames tests below read of a local (support._shown): each
     holder of the key shows it, one attribute down of the answers, requests
-    and errors a debugger opens, inside any container."""
+    and errors a debugger opens, inside any container, and of any object of
+    the frame's level, never two attributes down."""
 
     def test_the_key_one_attribute_down_of_each_holder_shows(self):
         bearer = {"Authorization": f"Bearer {KEY}"}
@@ -2445,6 +2488,136 @@ class ShownTest(unittest.TestCase):
         for holder, value in holders.items():
             with self.subTest(holder=holder):
                 self.assertIn(KEY, _shown(value))
+
+    def test_an_answers_status_text_and_a_requests_auth_show_below_the_frames_level(self):
+        # Below the frame's level, a debugger opens an answer, a request or an
+        # error where the key can be (_opened_at_any_depth): the text of an
+        # answer's status line among them, which http.client reads from the
+        # server's answer and urllib3 and requests copy, and a request's auth.
+        echo = f"echo {KEY}"
+        refused = requests.Response()
+        refused.status_code = 401
+        refused.reason = echo
+        redirect = requests.Response()
+        redirect.status_code = 302
+        redirect.reason = echo
+        followed = requests.Response()
+        followed.status_code = 200
+        followed.history = [redirect]
+        head = f"HTTP/1.1 401 {echo}\r\nContent-Length: 0\r\n\r\n".encode()
+        http_client_answer = http.client.HTTPResponse(
+            mock.Mock(makefile=lambda mode: io.BytesIO(head))
+        )
+        http_client_answer.begin()
+        holders = {
+            "an error of requests whose answer's status text echoes it": (
+                requests.exceptions.HTTPError("401", response=refused)
+            ),
+            "an answer of requests after a redirect whose status text echoes it": followed,
+            "an object holding an answer of urllib3 whose status text echoes it": Holder(
+                urllib3.response.HTTPResponse(
+                    body=b"", status=401, reason=echo, preload_content=False
+                )
+            ),
+            "an object holding an answer of http.client whose status text echoes it": Holder(
+                http_client_answer
+            ),
+            "an error of requests whose request's auth holds it": (
+                requests.exceptions.ConnectionError(
+                    "refused",
+                    request=requests.Request(
+                        "POST", "http://127.0.0.1:1/json/2/res.partner/read", auth=(USER, KEY)
+                    ),
+                )
+            ),
+        }
+        for holder, value in holders.items():
+            with self.subTest(holder=holder):
+                self.assertIn(KEY, _shown(value))
+
+    def test_an_answer_whose_making_stopped_shows_its_class_below_the_frames_level(self):
+        # An answer of the library's connections whose making stopped as it
+        # began, before it set anything, as an interrupt there leaves one
+        # (_HTTPResponse), has no status line's text and no headers to open:
+        # it shows its class.
+        half_made = odoo_auth.client._HTTPResponse.__new__(odoo_auth.client._HTTPResponse)
+        self.assertIn("_HTTPResponse object", _shown(Holder(half_made)))
+
+    def test_an_answer_or_a_request_of_the_frames_level_shows_each_of_its_attributes(self):
+        # At the frame's level, a debugger opens an answer or a request as any
+        # object, by each of its attributes, not only by those it opens of one
+        # below that level (_opened_at_any_depth): here each holds the key in
+        # an attribute those leave out, as a subclass or another version of
+        # its library can add one.
+        head = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        http_client_answer = http.client.HTTPResponse(
+            mock.Mock(makefile=lambda mode: io.BytesIO(head))
+        )
+        http_client_answer.begin()
+        holders = {
+            "an answer of requests": requests.Response(),
+            "an answer of http.client": http_client_answer,
+            "an answer of urllib3": urllib3.response.HTTPResponse(body=b"", preload_content=False),
+            "a request of requests": requests.Request(
+                "POST", "http://127.0.0.1:1/json/2/res.partner/read"
+            ),
+        }
+        for holder, value in holders.items():
+            value.added = KEY
+            with self.subTest(holder=holder):
+                self.assertIn(KEY, _shown(value))
+
+    def test_a_secret_one_attribute_down_of_any_object_shows(self):
+        # A debugger opens any object one attribute down: a _Secret holds
+        # its value in a slot, an ordinary object in its __dict__.
+        holders = {
+            "a _Secret": odoo_auth.client._Secret(PASSWORD),
+            "an ordinary object": Holder(PASSWORD),
+            "an ordinary object in a list": [Holder(PASSWORD)],
+            "an ordinary object in a mapping": {"holder": Holder(PASSWORD)},
+        }
+        for holder, value in holders.items():
+            with self.subTest(holder=holder):
+                self.assertIn(PASSWORD, _shown(value))
+
+    def test_a_secret_in_any_slot_of_an_object_shows(self):
+        # A debugger lists each slot set that the object's classes declare,
+        # by the name Python stores it by.
+        named_only_with_underscores = UnderscoresOnly()
+        setattr(named_only_with_underscores, "__held", PASSWORD)
+        holders = {
+            "a private slot": PrivateSlot(PASSWORD),
+            "the one slot a string names": OneSlotNamed(PASSWORD),
+            "a slot after one left unset": SlotLeftUnset(PASSWORD),
+            "a private slot of a class named only with underscores": named_only_with_underscores,
+        }
+        for holder, value in holders.items():
+            with self.subTest(holder=holder):
+                self.assertIn(PASSWORD, _shown(value))
+
+    def test_an_object_met_at_two_levels_shows_its_attributes_at_the_frames_one(self):
+        # The walk shows each value once at each level: an object met one
+        # attribute down of another, and at the frame's level too, shows
+        # its own attributes there, whichever of the two the walk meets
+        # first.
+        held = Holder(PASSWORD)
+        orders = {"the holder first": (Holder(held), held), "the holder last": (held, Holder(held))}
+        for order, local in orders.items():
+            with self.subTest(order=order):
+                self.assertIn(PASSWORD, _shown(local))
+
+    def test_a_secret_two_attributes_down_of_an_object_shows_nothing(self):
+        # One level down, never another: the holder shows the repr of what
+        # it holds, a _Secret's only its length, an ordinary object's only
+        # its class.
+        holders = {
+            "an object holding a _Secret": Holder(odoo_auth.client._Secret(PASSWORD)),
+            "an object holding an object that holds it": Holder(Holder(PASSWORD)),
+            "an object holding a list of such objects": Holder([Holder(PASSWORD)]),
+        }
+        for holder, value in holders.items():
+            with self.subTest(holder=holder):
+                self.assertNotIn(PASSWORD, _shown(value))
 
     def test_configparsers_parser_and_section_show_their_attributes_one_level_down(self):
         # Shown as a debugger shows them, by their attributes, not walked as
