@@ -18,6 +18,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -291,6 +292,35 @@ def _slot_name(cls, name):
     owner = cls.__name__.lstrip("_")
     private = name.startswith("__") and not name.endswith("__")
     return f"_{owner}{name}" if private and owner else name
+
+
+def run_python(*arguments, timeout=60):
+    """The finished run of a Python of its own, the tests' interpreter, with
+    -B and -W error, so that any warning is an error, then ``arguments``. It
+    imports odoo_auth from where the tests import it, and prints no colors,
+    whatever the environment asks, so that a test can match its output
+    exactly. One that runs past ``timeout`` seconds is killed, and
+    subprocess.TimeoutExpired fails the test that started it."""
+    source = os.path.dirname(os.path.dirname(odoo_auth.__file__))
+    paths = [source, *filter(None, [os.environ.get("PYTHONPATH")])]
+    return subprocess.run(
+        [sys.executable, "-B", "-W", "error", *arguments],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(paths),
+            # Python colors what it prints from 3.13 (a traceback, and from
+            # 3.14 unittest's results) when the environment forces it, on a
+            # pipe too. PYTHON_COLORS=0 overrides the environment's
+            # FORCE_COLOR and PYTHON_COLORS where Python reads its own
+            # variables, and NO_COLOR overrides FORCE_COLOR where -E or -I
+            # keeps Python from reading them (_colorize.can_colorize).
+            "PYTHON_COLORS": "0",
+            "NO_COLOR": "1",
+        },
+        timeout=timeout,
+    )
 
 
 def free_port():

@@ -8,6 +8,7 @@ Run from the repository root:
     PYTHONPATH=src python3 -m unittest discover -s tests
 """
 
+import collections
 import configparser
 import contextlib
 import contextvars
@@ -23,6 +24,7 @@ import io
 import json
 import logging
 import os
+import queue
 import socket
 import ssl
 import struct
@@ -55,6 +57,7 @@ from odoo_auth.client import (
     ServerProxy,
     _execute_kw,
     _origin,
+    _PoolQueue,
     _read_config,
     _SafeTransport,
 )
@@ -74,6 +77,7 @@ from support import (
     XmlRpcOdoo,
     free_port,
     odoo_error,
+    run_python,
     xmlrpc_answer,
     _shown,
 )
@@ -2772,6 +2776,26 @@ class ResourceWarningsCheckTest(unittest.TestCase):
         self.assertEqual(warnings.filters, filters)
 
 
+class RunPythonTest(unittest.TestCase):
+    """What a Python of its own that a test runs (support.run_python)
+    prints, which the tests that run one match exactly."""
+
+    def test_it_prints_no_colors_whatever_the_environment_asks(self):
+        # From Python 3.13, a traceback comes in colors when the environment
+        # forces them, on a pipe too; the same run with -E reads none of
+        # Python's own variables, PYTHON_COLORS among them, and still reads
+        # FORCE_COLOR. On an older Python nothing comes in colors.
+        forcing = {"FORCE_COLOR": "1", "PYTHON_COLORS": "1"}
+        with mock.patch.dict(os.environ, forcing):
+            for flags in ((), ("-E",)):
+                with self.subTest(flags=flags):
+                    run = run_python(*flags, "-c", "1 / 0")
+                    self.assertNotIn("\x1b[", run.stderr)
+                    self.assertTrue(
+                        run.stderr.endswith("ZeroDivisionError: division by zero\n"), run.stderr
+                    )
+
+
 class FailsAtItsEnd(io.FileIO):
     """A file whose read fails with EIO where its end is, as a read from a
     failing disk or a network file system can fail: every byte before it
@@ -3860,6 +3884,23 @@ class KeptConnectionTest(StubTestCase):
         self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
         self.assertEqual(odoo.requests, [(1, "call"), (2, "call")])
 
+    def test_an_error_in_the_queue_of_a_pool_hangs_nothing(self):
+        # urllib3's pool keeps its connections in a queue: a call takes its
+        # kept connection out of it and gives it back, and Client.close()
+        # empties it. urllib3's own queue, queue.LifoQueue, takes its lock
+        # and gives it back in code of Python: one of the three errors as it
+        # gave it back left it taken, and the call, or the next one,
+        # Client.close() and the pool's finalizer as the pool was collected,
+        # waited for it without end. The library's pools keep their
+        # connections in a queue without a lock (_PoolQueue). The tests of
+        # pool_queue_errors.py bring one of the three at each line of the
+        # queue's get and put in those steps, in a Python of their own under
+        # a time limit, so that a wait without end fails this test rather
+        # than hangs the run: both pass, and nothing else is printed.
+        run = run_python(os.path.join(os.path.dirname(__file__), "pool_queue_errors.py"), timeout=120)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertRegex(run.stderr, r"\A\.\.\n-+\nRan 2 tests in [0-9.]+s\n\nOK\n\Z")
+
     def test_an_interrupted_close_of_a_connection_the_server_closed_closes_it(self):
         # The server closes the call's connection once it answered, and the
         # next call's check finds it closed and closes it, through the
@@ -4664,6 +4705,141 @@ def sent_requests(tls_socket):
     """How many requests went out on ``tls_socket``, a fake: the request lines
     in what it was given to send."""
     return sent(tls_socket).count(b"POST /xmlrpc/2/object HTTP/1.1\r\n")
+
+
+class LengthReadTogether(collections.deque):
+    """A deque whose length two threads read together, until the test lets
+    them go (let_go): each waits for the other, 5 s at most, before it reads
+    the length and again after, so that two puts made at once both append
+    their items before either reads it, and both read it before either goes
+    on."""
+
+    def __init__(self):
+        super().__init__()
+        self._readers = threading.Barrier(2, timeout=5)
+
+    def __len__(self):
+        self._wait_for_the_other_reader()
+        length = super().__len__()
+        self._wait_for_the_other_reader()
+        return length
+
+    def _wait_for_the_other_reader(self):
+        try:
+            self._readers.wait()
+        except threading.BrokenBarrierError:
+            # Let go, or waited 5 s for the other reader.
+            pass
+
+    def let_go(self):
+        self._readers.abort()
+
+
+class TakenFirst(collections.deque):
+    """A deque where another thread's get takes the last item, into
+    ``taken``, just as a put takes its own item back out: what the put finds
+    when a get took that item between its append and its taking back."""
+
+    def remove(self, value):
+        self.taken = self.pop()
+        super().remove(value)
+
+
+class PoolQueueTest(unittest.TestCase):
+    """The queue in which the library's pools keep their connections
+    (_PoolQueue), through the calls urllib3 makes on it."""
+
+    def test_get_gives_the_last_item_put_first(self):
+        pool_queue = _PoolQueue(3)
+        pool_queue.put(None)
+        pool_queue.put("older", block=False)
+        pool_queue.put("newer", block=False)
+        self.assertEqual(pool_queue.get(block=False), "newer")
+        self.assertEqual(pool_queue.get(block=False), "older")
+        self.assertIsNone(pool_queue.get(block=False))
+
+    def test_get_from_an_empty_queue_raises_empty_without_waiting(self):
+        # Nothing puts an item into the queue: a get that waited for one would
+        # wait without end. Each get runs in a thread of its own, which the
+        # test waits for 5 s at most, so that a wait fails the test instead of
+        # hanging the run.
+        pool_queue = _PoolQueue(1)
+        for block in (False, True):
+            with self.subTest(block=block):
+                outcome = []
+
+                def get(block):
+                    try:
+                        outcome.append(pool_queue.get(block=block, timeout=None))
+                    except queue.Empty:
+                        outcome.append("raised Empty")
+
+                thread = threading.Thread(target=get, args=(block,), daemon=True)
+                thread.start()
+                thread.join(5)
+                self.assertFalse(thread.is_alive(), "waited 5 s for the get")
+                self.assertEqual(outcome, ["raised Empty"])
+
+    def test_put_into_a_full_queue_raises_full_and_keeps_what_it_holds(self):
+        pool_queue = _PoolQueue(1)
+        pool_queue.put("kept", block=False)
+        with self.assertRaises(queue.Full):
+            pool_queue.put("refused", block=False)
+        self.assertEqual(pool_queue.qsize(), 1)
+        self.assertEqual(pool_queue.get(block=False), "kept")
+
+    def test_puts_made_at_once_keep_no_more_than_maxsize(self):
+        # Two threads give a connection back at the same time, as urllib3's
+        # _put_conn can. Here both puts append their items before either
+        # reads the length (LengthReadTogether): each reads two items, one
+        # over maxsize, takes its own item back out and raises queue.Full. A
+        # put that read the length before its append let both find room for
+        # the last item.
+        pool_queue = _PoolQueue(1)
+        items = LengthReadTogether()
+        pool_queue._items = items
+        outcomes = []
+
+        def put(item):
+            try:
+                pool_queue.put(item, block=False)
+            except queue.Full:
+                outcomes.append(f"refused {item}")
+            else:
+                outcomes.append(f"kept {item}")
+
+        threads = [
+            threading.Thread(target=put, args=(item,), daemon=True) for item in ("first", "second")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        items.let_go()
+        self.assertEqual(sorted(outcomes), ["refused first", "refused second"])
+        self.assertEqual(list(items), [])
+
+    def test_a_put_whose_item_a_get_took_meanwhile_raises_nothing(self):
+        # A put finds the queue over maxsize once it appended its item, and
+        # another thread's get takes that item before the put takes it back
+        # out (TakenFirst): the item was given. Told queue.Full, urllib3 would
+        # close a connection the get's caller now uses.
+        pool_queue = _PoolQueue(1)
+        items = TakenFirst(["kept"])
+        pool_queue._items = items
+        pool_queue.put("given", block=False)
+        self.assertEqual(items.taken, "given")
+        self.assertEqual(list(items), ["kept"])
+
+    def test_a_maxsize_of_0_or_less_sets_no_limit(self):
+        # As queue.LifoQueue, urllib3's own queue, takes it.
+        for maxsize in (0, -1):
+            with self.subTest(maxsize=maxsize):
+                pool_queue = _PoolQueue(maxsize)
+                for item in ("first", "second", "third"):
+                    pool_queue.put(item, block=False)
+                self.assertEqual(pool_queue.qsize(), 3)
+                self.assertEqual(pool_queue.get(block=False), "third")
 
 
 class FailingAnswer(io.BytesIO):
