@@ -1,3 +1,4 @@
+import collections
 import configparser
 import contextvars
 import decimal
@@ -7,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import queue
 import re
 import socket
 import stat
@@ -2232,16 +2234,96 @@ class _Json2HTTPSConnection(
     _AnswerClosing."""
 
 
+class _PoolQueue:
+    """The queue in which a pool of the library's keeps its connections:
+    urllib3 makes it from the pool's class (ConnectionPool.QueueCls, which
+    a pool's class may replace, as urllib3's changelog says since 1.2). It
+    gives them last in, first out, as urllib3's own (queue.LifoQueue), and
+    holds no lock.
+
+    queue.LifoQueue takes its lock and gives it back in code of Python
+    (threading.Condition's __enter__ and __exit__): an interrupt such as
+    Ctrl-C, a MemoryError or a RecursionError as __exit__ starts would
+    leave it taken for good, and every later get or put would wait for it
+    without end: the call's own, as urllib3 gives the pool back what it was
+    taking after the error (HTTPConnectionPool.urlopen), the next call's,
+    Client.close()'s, and the pool's finalizer's as the pool is collected
+    (_close_pool_connections). Here a deque takes or gives an item whole,
+    in C: one of those errors in a get or a put, urllib3's fill of the pool
+    and its drains included, goes on as it is, and every later get or put
+    runs. It leaves at most the item the get or the put was moving out of
+    the pool, as after the same error in the steps of urllib3 just before
+    the put or just after the get, or, in a put, in the queue: one that
+    comes once the put appended its item and before it took the item back
+    out (below) leaves the queue one item over ``maxsize``, if it was full,
+    until a get takes an item out.
+
+    It never waits, whatever ``block`` and ``timeout`` ask, where
+    queue.LifoQueue would wait for another thread: get raises queue.Empty
+    when the queue holds nothing, and put appends its item, then, if the
+    queue holds more than ``maxsize`` items, takes that item back out and
+    raises queue.Full, for urllib3 to close it. The item is found by
+    equality, which for the library's connections is their identity,
+    compared in C; a put of None, urllib3's placeholder, takes back out the
+    first None the queue holds, Nones being all alike. A get that took the
+    connection in between was given it: put then raises nothing, as
+    urllib3 would close a connection the get's caller uses. A ``maxsize``
+    of 0 or less sets no limit, as queue.LifoQueue's. Puts made at the same
+    time, in several threads, can each find the queue over the limit and
+    each take its own item back out: the pool then keeps fewer connections
+    than it could, never more than ``maxsize``. urllib3 asks the library's
+    pools to wait for nothing: requests' adapter makes them non-blocking
+    (HTTPAdapter's pool_block), and urllib3 gives a connection back without
+    waiting (_put_conn)."""
+
+    def __init__(self, maxsize):
+        self._maxsize = maxsize
+        self._items = collections.deque()
+
+    def qsize(self):
+        return len(self._items)
+
+    def get(self, block=True, timeout=None):
+        failure = None
+        try:
+            item = self._items.pop()
+        except IndexError:
+            # What urllib3 catches, raised after this block.
+            failure = queue.Empty()
+        if failure is not None:
+            raise failure
+        return item
+
+    def put(self, item, block=True, timeout=None):
+        # Appended first, then taken back out over the limit: a length read
+        # before the append would let puts made at the same time each find
+        # room for the last item (above).
+        self._items.append(item)
+        if self._maxsize > 0 and len(self._items) > self._maxsize:
+            failure = queue.Full()
+            try:
+                self._items.remove(item)
+            except ValueError:
+                # A get took it since the append: it was given, not refused.
+                failure = None
+            if failure is not None:
+                raise failure
+
+
 class _Json2HTTPConnectionPool(urllib3.HTTPConnectionPool):
-    """urllib3's pool for http, whose connections are the library's."""
+    """urllib3's pool for http, whose connections are the library's, in the
+    library's queue (_PoolQueue)."""
 
     ConnectionCls = _Json2HTTPConnection
+    QueueCls = _PoolQueue
 
 
 class _Json2HTTPSConnectionPool(urllib3.HTTPSConnectionPool):
-    """urllib3's pool for https, whose connections are the library's."""
+    """urllib3's pool for https, whose connections are the library's, in the
+    library's queue (_PoolQueue)."""
 
     ConnectionCls = _Json2HTTPSConnection
+    QueueCls = _PoolQueue
 
 
 class _Json2Adapter(requests.adapters.HTTPAdapter):
