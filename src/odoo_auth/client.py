@@ -1203,11 +1203,13 @@ class _HTTPResponse(http.client.HTTPResponse):
     set, the answer reads the class's None, as it does once closed, and so
     does the file it keeps until its making ends: the close of an answer
     whose making stopped before it held its file closes nothing and raises
-    nothing, here or in IOBase's finalizer, which closes an answer still
-    open as it is collected, such as one whose making stopped before this
-    try, and reports whatever a close raises through sys.unraisablehook from
-    Python 3.13, and before in Python's development mode (-X dev) and its
-    debug builds ("Exception ignored" on stderr).
+    nothing, here or in IOBase's finalizer. That finalizer closes an answer
+    still open as it is collected, such as one whose making stopped before
+    this try, which nothing of the library holds, and reports whatever a
+    close raises through sys.unraisablehook from Python 3.13, and before in
+    Python's development mode (-X dev) and its debug builds ("Exception
+    ignored" on stderr): an interrupt, a MemoryError or a RecursionError that
+    comes inside that close stops there, never raised (README § Errors).
 
     An interrupt, a MemoryError or a RecursionError inside socket.makefile,
     once the socket counted the file and before makefile hands it back, as
@@ -1333,19 +1335,23 @@ class _AnswerClosing(http.client.HTTPConnection):
     closed such an answer's file, but not the answer, which, dropped as the
     next one replaced it, IOBase's finalizer would close as it is
     collected, where Python drops or reports one of those errors
-    (_HTTPResponse). getresponse closes the answer the connection keeps
-    before the next one is made, once http.client is done with it, its file
-    closed (HTTPResponse.isclosed): one of them in that close goes on as it
-    is.
-    An answer http.client is not done with, its body not read to its end,
-    is left as it is. http.client refuses to make the next answer while it
-    keeps it (ResponseNotReady), as it keeps one that keeps its connection;
-    one that closed its connection, which it does not keep, the next
-    getresponse replaces, unclosed, for IOBase's finalizer to close as it
-    is collected. No caller of the library's connections reaches that: a
-    connection carries a request only once the last answer on it was read
-    to its end or closed, or once the connection was closed (_Sending,
-    urllib3's pool).
+    (_HTTPResponse). The connection closes the answer it keeps once
+    http.client is done with it, its file forgotten (HTTPResponse.isclosed,
+    close_finished_answer), unless the answer is closed already, its file
+    at least marked closed, as urllib3's close may have left them:
+    getresponse, before the next one is made, and over
+    JSON-2 the pools' queue too, as urllib3 gives the connection back to
+    its pool (_Json2PoolQueue), so that one an error then leaves out of the
+    pool and Python collects keeps no answer open. One of them in that
+    close goes on as it is. An answer http.client is not done with, its
+    body not read to its end, is left as it is. http.client refuses to make
+    the next answer while it keeps it (ResponseNotReady), as it keeps one
+    that keeps its connection; one that closed its connection, which it
+    does not keep, the next getresponse replaces, unclosed, for IOBase's
+    finalizer to close as it is collected. No caller of Client's
+    connections reaches that: a connection carries a request only once the
+    last answer on it was read to its end or closed, or once the connection
+    was closed (_Sending, urllib3's pool).
 
     It wraps http.client's own getresponse and close, which urllib3's
     connection calls through super(): a connection of JSON-2 lists it after
@@ -1370,11 +1376,18 @@ class _AnswerClosing(http.client.HTTPConnection):
         self._made = _HTTPResponse(*args, **kwargs)
         return self._made
 
+    def close_finished_answer(self):
+        """Close the answer the connection keeps, once http.client is done
+        with it, unless the answer is closed already, its file at least
+        marked closed (above)."""
+        answer = self._answer
+        if answer is not None and answer.isclosed() and not answer.closed_with_its_file():
+            answer.close()
+
     def getresponse(self):
         # The answer before this one, once http.client is done with it, is
         # closed here, before the next one is made (above).
-        if self._answer is not None and self._answer.isclosed():
-            self._answer.close()
+        self.close_finished_answer()
         self._made = None
         try:
             self._answer = super().getresponse()
@@ -2235,7 +2248,8 @@ class _Json2HTTPSConnection(
 
 
 class _PoolQueue:
-    """The queue in which a pool of the library's keeps its connections:
+    """The queue in which a pool of the library's keeps its connections,
+    here without the step its put takes in the pools' own, _Json2PoolQueue:
     urllib3 makes it from the pool's class (ConnectionPool.QueueCls, which
     a pool's class may replace, as urllib3's changelog says since 1.2). It
     gives them last in, first out, as urllib3's own (queue.LifoQueue), and
@@ -2310,20 +2324,44 @@ class _PoolQueue:
                 raise failure
 
 
+class _Json2PoolQueue(_PoolQueue):
+    """The queue of the library's pools (_PoolQueue), whose put has each
+    connection urllib3 gives back close the answer it is done with first
+    (_AnswerClosing.close_finished_answer), so that a connection the pool
+    keeps holds no answer open. urllib3 leaves some answers it read to
+    their end unclosed (_AnswerClosing), and one of the three errors that
+    leaves a connection out of the pool, in the check before its reuse
+    (README § Library usage's fifth case) or in a pool's drain
+    (_Json2.close), would leave its answer's close to IOBase's finalizer, if
+    Python collects that connection before Client.close() closes it.
+    urllib3's placeholders, None, keep no answer.
+
+    One of the three in that close goes on as it is, and leaves the
+    connection out of the pool, as one before the put does: urllib3 gives a
+    connection back as the call reads its answer, which still holds the
+    connection, and the call closes that answer, its connection with it
+    (_Json2._post)."""
+
+    def put(self, item, block=True, timeout=None):
+        if item is not None:
+            item.close_finished_answer()
+        super().put(item, block, timeout)
+
+
 class _Json2HTTPConnectionPool(urllib3.HTTPConnectionPool):
     """urllib3's pool for http, whose connections are the library's, in the
-    library's queue (_PoolQueue)."""
+    library's queue (_Json2PoolQueue)."""
 
     ConnectionCls = _Json2HTTPConnection
-    QueueCls = _PoolQueue
+    QueueCls = _Json2PoolQueue
 
 
 class _Json2HTTPSConnectionPool(urllib3.HTTPSConnectionPool):
     """urllib3's pool for https, whose connections are the library's, in the
-    library's queue (_PoolQueue)."""
+    library's queue (_Json2PoolQueue)."""
 
     ConnectionCls = _Json2HTTPSConnection
-    QueueCls = _PoolQueue
+    QueueCls = _Json2PoolQueue
 
 
 class _Json2Adapter(requests.adapters.HTTPAdapter):
@@ -2699,7 +2737,10 @@ class _Json2:
         # gone, and the answers they held with them: an answer kept in a frame
         # of the error would keep its pool alive, whose connections urllib3
         # closes only once the pool is collected, and its headers, which can
-        # echo the key.
+        # echo the key. As each answer of urllib3 goes, IOBase's finalizer
+        # reads whether it is closed, in code of urllib3, and drops an
+        # interrupt, a MemoryError or a RecursionError that comes there: the
+        # call goes on as if it had not come (README § Errors).
         if failure is not None:
             raise failure
         return result

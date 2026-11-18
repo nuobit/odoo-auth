@@ -572,6 +572,32 @@ been an `OdooError`. Their class cannot tell the two causes apart.) The
 CLI lets them through too: Python prints their traceback, which shows no
 frame's locals.
 
+The finalizer of an answer or of a file, `io.IOBase`'s, which runs as
+Python collects it, stops one of the three too, where it runs code of
+Python. It reads whether each answer of `urllib3` is closed, which
+`urllib3` answers in code of Python, and drops one of the three that
+comes there, with nothing on stderr: the answers of a JSON-2 call are
+collected as the call ends, and the call then returns its result, or
+raises its own error, as if that one had not come; those a frame of an
+error holds, as that frame is collected. It also closes an answer of
+`http.client`, or a file, still open as it is collected, where Python
+reports one of the three that comes inside that close as ignored from
+Python 3.13 («Exception ignored» on stderr), and drops it silently
+before, but in its development mode (`-X dev`) and its debug builds.
+`Client` closes each answer of `http.client` its connections make before
+then, but two: one whose making one of the three stopped as it began,
+before the `try` that would close it, which only the frames of that
+error's traceback hold, and whose close closes nothing; and the last
+answer of a `Client` over XML-RPC that is collected without being
+closed. The one file is that of § Library usage's third case.
+`ServerProxy` with a profile reads and closes its answers as
+`xmlrpc.client`'s own `ServerProxy` does: the reading closes none of
+them; closing a connection the server keeps open, as `ServerProxy`'s
+close does, closes the last answer on it; and the finalizer closes each
+one still open as it is collected, where one of the three that comes
+inside that close is reported as ignored from Python 3.13, and dropped
+silently before, but in Python's development mode and its debug builds.
+
 ## Configure a profile
 
 One file per Odoo instance, `chmod 600`:
