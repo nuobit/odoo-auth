@@ -207,6 +207,24 @@ class StubTestCase(StoreMixin, unittest.TestCase):
         self.addCleanup(patcher.stop)
         return opened
 
+    def record_finalizer_closes(self):
+        """The list where each close of an answer of the library's
+        connections (_HTTPResponse) that IOBase's finalizer runs, as Python
+        collects the answer, is recorded, from now to the end of the test:
+        the finalizer marks the object it closes (``_finalizing``)."""
+        closes = []
+        close = odoo_auth.client._HTTPResponse.close
+
+        def recording(answer):
+            if getattr(answer, "_finalizing", False):
+                closes.append("an answer closed by IOBase's finalizer")
+            close(answer)
+
+        patcher = mock.patch.object(odoo_auth.client._HTTPResponse, "close", recording)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return closes
+
     @contextlib.contextmanager
     def interrupted_connect(self, number, interrupt):
         """For the with block: the TCP connect of the ``number``-th socket
@@ -3884,6 +3902,53 @@ class KeptConnectionTest(StubTestCase):
         self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
         self.assertEqual(odoo.requests, [(1, "call"), (2, "call")])
 
+    def test_a_kept_json2_connection_lost_in_its_check_leaves_no_answer_to_a_finalizer(self):
+        # urllib3 leaves unclosed an answer whose last read ended at its
+        # body's end, as requests' read of a body of 10,240 bytes, a JSON
+        # text of 10,238 characters, does (_AnswerClosing). The connection
+        # kept that answer: an interrupt in urllib3's check of the kept
+        # connection left the connection out of the pool, and once the
+        # interrupt was dropped and collected, before Client.close(),
+        # IOBase's finalizer closed the answer. The pools' queue closes it as
+        # urllib3 gives the connection back (_Json2PoolQueue): the finalizer
+        # finds it closed. The stub's answers close their connection: no
+        # socket is left open.
+        self.fail_on_resource_warnings()
+        odoo = self.start(Json2Odoo())
+        odoo.answers[("res.partner", "read")] = "x" * 10238
+        client = self.make_client(odoo.url, "json2", KEY)
+        self.assertEqual(client.call("res.partner", "read", [7]), "x" * 10238)
+        finalized = self.record_finalizer_closes()
+        interrupt = KeyboardInterrupt()
+        with mock.patch.object(
+            urllib3.connectionpool, "is_connection_dropped", side_effect=interrupt
+        ):
+            error = self.raised(KeyboardInterrupt, lambda: client.call("res.partner", "read", [7]))
+        self.assertIs(error, interrupt)
+        del error, interrupt
+        collect_garbage()
+        self.assertEqual(finalized, [])
+
+    def test_a_json2_connection_lost_in_a_pools_drain_leaves_no_answer_to_a_finalizer(self):
+        # The test above, as Client.close() drains the pool: an interrupt as
+        # the drain closes the connection it took out of the pool left that
+        # connection out of the pool, with its answer, and once the
+        # interrupt was dropped and collected, before a second
+        # Client.close(), IOBase's finalizer closed the answer.
+        self.fail_on_resource_warnings()
+        odoo = self.start(Json2Odoo())
+        odoo.answers[("res.partner", "read")] = "x" * 10238
+        client = self.make_client(odoo.url, "json2", KEY)
+        self.assertEqual(client.call("res.partner", "read", [7]), "x" * 10238)
+        finalized = self.record_finalizer_closes()
+        interrupt = KeyboardInterrupt()
+        with self.interrupted_as_it_starts(odoo_auth.client._SocketClosing.close, 1, interrupt):
+            error = self.raised(KeyboardInterrupt, client.close)
+        self.assertIs(error, interrupt)
+        del error, interrupt
+        collect_garbage()
+        self.assertEqual(finalized, [])
+
     def test_an_error_in_the_queue_of_a_pool_hangs_nothing(self):
         # urllib3's pool keeps its connections in a queue: a call takes its
         # kept connection out of it and gives it back, and Client.close()
@@ -4129,12 +4194,17 @@ class KeptConnectionTest(StubTestCase):
         # an answer was closed by IOBase's finalizer as it was collected,
         # which drops an interrupt raised in that close (silently before
         # Python 3.13): the call went on as if no interrupt had come. The
-        # connection closes the answer before it makes the next one
-        # (_AnswerClosing). An interrupt comes as each close of an answer the
-        # call runs starts, in turn, a new client each time, until the call
-        # runs whole: the call raises it, unchanged, and the next call works.
-        # Over XML-RPC the login is replaced; over JSON-2 the closes are the
-        # first call's answer, the redirect and the answer it leads to.
+        # connection closes the answer it keeps once http.client is done with
+        # it, before it makes the next one, and over JSON-2 as urllib3 gives
+        # the connection back to its pool (_AnswerClosing). An interrupt
+        # comes as each close of an answer the call runs starts, in turn, a
+        # new client each time, until the call runs whole: the call raises
+        # it, unchanged, and the next call works. Over XML-RPC the login is
+        # replaced, and the one close is the first call's answer's, as the
+        # second is made. Over JSON-2 the three are the redirect's, as
+        # urllib3 gives its connection back, and two of the answer it leads
+        # to, as urllib3 gives the connection back again and as urllib3 reads
+        # past that answer's end.
         self.fail_on_resource_warnings()
         cases = {
             "the second call on a kept XML-RPC connection": ("xmlrpc", PASSWORD, {}, 1),
@@ -4501,23 +4571,14 @@ class KeptConnectionTest(StubTestCase):
         client = self.make_client(stub.url, "xmlrpc", PASSWORD)
         with mock.patch.object(odoo_auth.client, "_log_in", return_value=UID):
             self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
-        finalized = []
-        close = odoo_auth.client._HTTPResponse.close
-
-        def recording(answer):
-            # IOBase's finalizer marks the object it closes so.
-            if getattr(answer, "_finalizing", False):
-                finalized.append("an answer closed by IOBase's finalizer")
-            close(answer)
-
+        finalized = self.record_finalizer_closes()
         interrupt = KeyboardInterrupt()
-        with mock.patch.object(odoo_auth.client._HTTPResponse, "close", recording):
-            with self.interrupted_as_it_starts(http.client.HTTPConnection.close, 1, interrupt):
-                error = self.raised(KeyboardInterrupt, client.close)
-            self.assertIs(error, interrupt)
-            client.close()
-            del error, interrupt
-            collect_garbage()
+        with self.interrupted_as_it_starts(http.client.HTTPConnection.close, 1, interrupt):
+            error = self.raised(KeyboardInterrupt, client.close)
+        self.assertIs(error, interrupt)
+        client.close()
+        del error, interrupt
+        collect_garbage()
         self.assertEqual(finalized, [])
 
     def test_an_interrupt_in_client_close_over_json2_goes_on_as_it_is(self):
