@@ -60,8 +60,7 @@ What else a 1.x caller meets:
   Debian's urllib3 2.3.0, whose `2.3.0-3+deb13u1` and later carry that
   refusal as a backport.
 - A profile is refused too when its `url` holds a backslash, port 0, a
-  query or a fragment, or a host IDNA refuses, or when its `url`, `db`,
-  `user` or `api` holds its `password` (§ Configure a profile).
+  query or a fragment, or a host IDNA refuses (§ Configure a profile).
 - `ServerProxy` with a profile refuses `verbose=True`, and the library's
   connections print nothing at `http.client`'s debug level, where 1.x
   printed the password with each request (§ Security model).
@@ -397,7 +396,10 @@ traceback holds them in a local, which a test runner or a debugger can
 print (`pytest -l`). `ServerProxy`'s own errors never quote the password
 either, and no local of their frames shows it; but a frame that holds the
 `ServerProxy`, as each of its calls' frames does, shows it one attribute
-down, in `_password`, which stays readable as in 1.x. The errors:
+down, in `_password`, which stays readable as in 1.x. Where the profile's
+`url`, `db`, `user` or `api` holds the password, or the password is text a
+message writes anyway, such as the profile's name, or a piece of it, more
+shows it: § Configure a profile says what. The errors:
 
 - `ConfigError`: the profile is missing, cannot be read (a folder in its
   place, a file this user may not read), is malformed or accessible by
@@ -657,18 +659,40 @@ another scheme, host or port than the `url` names, as for a host with a
 go; XML-RPC sends through `http.client`, which takes such a host as it is
 and looks it up.
 
-A profile whose `url`, `db`, `user` or `api` holds its `password`, in any
-of the forms an error is masked in (§ Errors, above), is refused as well,
-with a message that names the field and shows neither:
-a caller may print those values (`Client`'s repr shows the `api`). The
-check fails closed, so a password short or common enough to occur in one
-of them by chance is refused too, and has to change.
+A profile whose `url`, `db`, `user` or `api` holds its `password`, such as
+one whose `user` and `password` are both `admin`, loads and calls as any
+other: whether a user or a password is right is for Odoo to answer. Those
+four values are not secret, and the library holds them as they are, so a
+password one of them holds shows with them:
+
+- `Client`'s repr shows the profile's name and its `api`, and no other
+  value; `ServerProxy`'s shows the `url`'s host and path.
+- The frames of an error show the `url` at their own level, which a test
+  runner prints (`pytest -l`), where they hold a `ServerProxy`, of
+  `xmlrpc.client` or of the library: `common` in the frame of the XML-RPC
+  login, `Client`'s or `ServerProxy`'s, and `self` in that of
+  `ServerProxy.execute_kw`. One attribute down, which a debugger shows,
+  the frames of an error can hold the `url`, the `db`, the `user` and the
+  `api`: the profile's values (`config`) in those of the login hold all
+  four.
+- `ServerProxy` passes Odoo's `Fault` as it is, as in 1.x, so a `Fault`
+  whose text quotes such a value shows it. `Client`'s `OdooError` masks
+  Odoo's message wherever it holds the password, inside such a value too,
+  so that a message that quotes such a `user` shows `***` in its place.
+- A password the `url`'s host holds goes with the host to the DNS lookup,
+  and over https in the TLS handshake (SNI), before any answer.
+
+A password that is text a message of the library writes anyway, or a
+piece of it, shows in that message, as no mask can tell the two apart: the
+`api` value, as in `ServerProxy`'s refusal of a profile that has
+`api = json2`, the profile's name, which every message names, an HTTP
+status, a fixed word.
 
 ## Security model
 
 | Data | Leaves your machine? |
 |---|---|
-| Odoo credentials | No — read locally from `~/.config/`; over JSON-2 the API key goes only to the origin of the profile's url (scheme, host and port) |
+| Odoo credentials | No — read locally from `~/.config/`; over JSON-2 the password goes only to the origin of the profile's url (scheme, host and port); a password the url's host holds also goes with the host to the DNS lookup and, over https, in the TLS handshake (SNI), before any answer |
 | API call parameters | Yes — sent to Odoo via XML-RPC or JSON-2 |
 | API results | Yes — returned from Odoo via XML-RPC or JSON-2 |
 

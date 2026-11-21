@@ -369,17 +369,18 @@ class XmlRpcOdoo:
     ServerProxy use them.
 
     ``authenticate`` raises ``login_fault`` when the test sets one, such as
-    Odoo's Fault for a db it does not hold; else it gives UID for DB, USER
-    and ``password`` (PASSWORD unless the test sets another), False
-    otherwise. ``execute_kw`` checks the same db, uid and password, records
-    the call in ``calls`` and answers from ``answers``: the value set for
-    its model and method, or a Fault to raise.
+    Odoo's Fault for a db it does not hold; else it gives UID for DB,
+    ``user`` and ``password`` (USER and PASSWORD unless the test sets
+    others), False otherwise. ``execute_kw`` checks the same db, uid and
+    password, records the call in ``calls`` and answers from ``answers``:
+    the value set for its model and method, or a Fault to raise.
     """
 
     def __init__(self):
         self.answers = {}
         self.calls = []
         self.logins = 0
+        self.user = USER
         self.password = PASSWORD
         self.login_fault = None
 
@@ -405,7 +406,7 @@ class XmlRpcOdoo:
         self.logins += 1
         if self.login_fault is not None:
             raise self.login_fault
-        return UID if (db, user, password) == (DB, USER, self.password) else False
+        return UID if (db, user, password) == (DB, self.user, self.password) else False
 
     def execute_kw(self, db, uid, password, model, method, args, kwargs):
         if (db, uid, password) != (DB, UID, self.password):

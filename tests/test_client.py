@@ -161,11 +161,8 @@ class UrlTest(StoreTestCase):
     """A url xmlrpc.client would refuse, or keep with a password in it, is
     refused when the store is loaded: their errors quote the url, the repr of
     a ProtocolError or a ServerProxy quotes its user info, and a url line
-    that is wrong can hold a secret.
-
-    A url holding the profile's own password is refused before these checks
-    (PublicFieldTest): the urls here hold another secret, SECRET, such as
-    another account's password.
+    that is wrong can hold a secret: another account's password, SECRET in
+    most tests here, or the profile's own.
 
     So is a url through which no call could reach Odoo, over either API:
     one with a query or a fragment."""
@@ -181,53 +178,75 @@ class UrlTest(StoreTestCase):
         )
 
     def test_a_url_with_a_password_is_refused_unshown(self):
-        self.make_store_with_url(
-            "https://odoo_user_test:odoo_other_secret_test@odoo.example.com"
-        )
-        with self.assertRaises(ConfigError) as caught:
-            ServerProxy(profile="erp")
-        self.assertIn("must have no user or password before its host", str(caught.exception))
-        self.assertNeverShows(caught.exception, SECRET)
+        for secret in (SECRET, PASSWORD):
+            with self.subTest(secret=secret):
+                self.make_store_with_url(f"https://odoo_user_test:{secret}@odoo.example.com")
+                with self.assertRaises(ConfigError) as caught:
+                    ServerProxy(profile="erp")
+                self.assertEqual(
+                    str(caught.exception),
+                    f"The url in {self._home}/.config/odoo-auth/erp.conf "
+                    "must have no user or password before its host",
+                )
+                self.assertNeverShows(caught.exception, secret)
         self.common.authenticate.assert_not_called()
 
     def test_a_url_that_runs_onto_the_next_line_is_refused_unshown(self):
         # An indented line is read as part of the value above it.
-        self.make_store_with_url("https://odoo.example.com\n  odoo_other_secret_test")
-        with self.assertRaises(ConfigError) as caught:
-            ServerProxy(profile="erp")
-        self.assertIn(
-            "must be one line of printable ASCII without spaces", str(caught.exception)
-        )
-        self.assertNeverShows(caught.exception, SECRET)
+        for secret in (SECRET, PASSWORD):
+            with self.subTest(secret=secret):
+                self.make_store_with_url(f"https://odoo.example.com\n  {secret}")
+                with self.assertRaises(ConfigError) as caught:
+                    ServerProxy(profile="erp")
+                self.assertEqual(
+                    str(caught.exception),
+                    f"The url in {self._home}/.config/odoo-auth/erp.conf "
+                    "must be one line of printable ASCII without spaces",
+                )
+                self.assertNeverShows(caught.exception, secret)
 
     def test_a_url_with_a_space_is_refused_unshown(self):
-        self.make_store_with_url("https://odoo.example.com/ odoo_other_secret_test")
-        with self.assertRaises(ConfigError) as caught:
-            ServerProxy(profile="erp")
-        self.assertIn(
-            "must be one line of printable ASCII without spaces", str(caught.exception)
-        )
-        self.assertNeverShows(caught.exception, SECRET)
+        for secret in (SECRET, PASSWORD):
+            with self.subTest(secret=secret):
+                self.make_store_with_url(f"https://odoo.example.com/ {secret}")
+                with self.assertRaises(ConfigError) as caught:
+                    ServerProxy(profile="erp")
+                self.assertEqual(
+                    str(caught.exception),
+                    f"The url in {self._home}/.config/odoo-auth/erp.conf "
+                    "must be one line of printable ASCII without spaces",
+                )
+                self.assertNeverShows(caught.exception, secret)
 
     def test_a_url_outside_ascii_is_refused_unshown(self):
         # http.client cannot encode such a path, and its error keeps the url.
-        self.make_store_with_url("https://odoo.example.com/odoo_other_secret_test_€")
-        with self.assertRaises(ConfigError) as caught:
-            ServerProxy(profile="erp")
-        self.assertIn(
-            "must be one line of printable ASCII without spaces", str(caught.exception)
-        )
-        self.assertNeverShows(caught.exception, SECRET)
+        for secret in (SECRET, PASSWORD):
+            with self.subTest(secret=secret):
+                self.make_store_with_url(f"https://odoo.example.com/{secret}_€")
+                with self.assertRaises(ConfigError) as caught:
+                    ServerProxy(profile="erp")
+                self.assertEqual(
+                    str(caught.exception),
+                    f"The url in {self._home}/.config/odoo-auth/erp.conf "
+                    "must be one line of printable ASCII without spaces",
+                )
+                self.assertNeverShows(caught.exception, secret)
         self.common.authenticate.assert_not_called()
 
     def test_a_url_with_a_port_that_is_not_a_number_is_refused_unshown(self):
         # A host left out reads the user as the host and the password as
         # its port.
-        self.make_store_with_url("https://odoo_user_test:odoo_other_secret_test")
-        with self.assertRaises(ConfigError) as caught:
-            ServerProxy(profile="erp")
-        self.assertIn("cannot be parsed as a URL", str(caught.exception))
-        self.assertNeverShows(caught.exception, SECRET)
+        for secret in (SECRET, PASSWORD):
+            with self.subTest(secret=secret):
+                self.make_store_with_url(f"https://odoo_user_test:{secret}")
+                with self.assertRaises(ConfigError) as caught:
+                    ServerProxy(profile="erp")
+                self.assertEqual(
+                    str(caught.exception),
+                    f"The url in {self._home}/.config/odoo-auth/erp.conf "
+                    "cannot be parsed as a URL",
+                )
+                self.assertNeverShows(caught.exception, secret)
 
     def test_a_url_line_holding_a_secret_is_refused_unshown(self):
         self.make_store_with_url("odoo_other_secret_test")
@@ -235,6 +254,16 @@ class UrlTest(StoreTestCase):
             ServerProxy(profile="erp")
         self.assertIn("must start with http:// or https://", str(caught.exception))
         self.assertNeverShows(caught.exception, SECRET)
+
+    def test_a_url_line_holding_the_password_is_refused_unshown(self):
+        # The profile's own password, written on the wrong line: the url's
+        # check refuses it as it refuses any other text that is no url.
+        self.make_store_with_url(PASSWORD)
+        error = self.raised(ConfigError, lambda: ServerProxy(profile="erp"))
+        self.assertIn("must start with http:// or https://", str(error))
+        self.assertNeverShows(error, PASSWORD)
+        self.assertNoFrameHolds(error, PASSWORD)
+        self.common.authenticate.assert_not_called()
 
     def test_a_user_and_password_on_the_url_line_are_refused_unshown(self):
         # "odoouser:" reads as a scheme.
@@ -263,13 +292,17 @@ class UrlTest(StoreTestCase):
     def test_a_url_that_cannot_be_split_is_refused_unshown(self):
         # NFKC turns the fullwidth solidus of the password into "/": urlsplit
         # refuses the url, quoting its user info, the password with it.
-        self.make_store_with_url(
-            "https://odoo_user_test:odoo_other_secret_test／@odoo.example.com"
-        )
-        with self.assertRaises(ConfigError) as caught:
-            ServerProxy(profile="erp")
-        self.assertIn("cannot be parsed as a URL", str(caught.exception))
-        self.assertNeverShows(caught.exception, SECRET)
+        for secret in (SECRET, PASSWORD):
+            with self.subTest(secret=secret):
+                self.make_store_with_url(f"https://odoo_user_test:{secret}／@odoo.example.com")
+                with self.assertRaises(ConfigError) as caught:
+                    ServerProxy(profile="erp")
+                self.assertEqual(
+                    str(caught.exception),
+                    f"The url in {self._home}/.config/odoo-auth/erp.conf "
+                    "cannot be parsed as a URL",
+                )
+                self.assertNeverShows(caught.exception, secret)
 
     def test_a_url_with_a_backslash_is_refused_unshown_on_either_api(self):
         # RFC 3986 allows a backslash in a URL only as %5C. In the host,
@@ -349,15 +382,17 @@ class UrlTest(StoreTestCase):
             "an empty label": "odoo..example.invalid",
             "a leading dot": ".odoo.example.invalid",
             "a label of 64": "a" * 64 + ".example.invalid",
+            "an empty label after the password": f"{PASSWORD}..example.invalid",
         }
         for case, host in hosts.items():
             with self.subTest(case=case):
                 self.make_store_with_url(f"http://{host}:8069")
                 error = self.raised(ConfigError, lambda: ServerProxy(profile="erp"))
-                self.assertIn(
-                    "must name a host with no empty label between its dots, and "
-                    "none longer than 63 characters",
+                self.assertEqual(
                     str(error),
+                    f"The url in {self._home}/.config/odoo-auth/erp.conf "
+                    "must name a host with no empty label between its dots, and none longer "
+                    "than 63 characters",
                 )
                 self.assertNeverShows(error, "example.invalid")
                 self.assertNoFrameHolds(error, "example.invalid")
@@ -786,15 +821,21 @@ class Json2StoreTest(StoreTestCase):
             "an IPv6 zone that is the escape of a letter": ("http://[fe80::1%67]:8069", "fe80::1"),
             "a dot written %2e": ("http://odoo%2eexample.invalid", "example.invalid"),
             "a >": ("https://a>b.example.invalid", "example.invalid"),
+            "a host that starts with * and holds the password": (
+                f"https://*.{KEY}.example.invalid",
+                KEY,
+            ),
         }
         for case, (url, host) in urls.items():
             with self.subTest(case=case):
                 self.make_json2_store(url=url)
                 error = self.raised(ConfigError, lambda: Client(profile="erp"))
-                self.assertIn(
-                    "must be one requests sends to the same scheme, host and port, as "
-                    "`api = json2` goes through it",
+                self.assertEqual(
                     str(error),
+                    f"The url in {self._home}/.config/odoo-auth/erp.conf "
+                    "must be one requests sends to the same scheme, host and port, as "
+                    "`api = json2` goes through it: requests refuses a host that starts with *, "
+                    "and writes some others otherwise, such as one with a % or a > in it",
                 )
                 self.assertNeverShows(error, host)
                 self.assertNoFrameHolds(error, host)
@@ -814,24 +855,30 @@ class Json2StoreTest(StoreTestCase):
                 self.assertNeverShows(caught.exception, password)
 
     def test_a_db_that_cannot_go_in_a_header_is_refused_unshown(self):
-        # An indented line is read as part of the value above it.
-        for db in ("odoo db test", "odoo_db_test_é", "odoo_db_test\n  next"):
+        # An indented line is read as part of the value above it. A db that
+        # holds the password is read as any other (PublicValueTest): the
+        # message, pinned whole, shows no piece of the db, and no frame of
+        # the refusal holds the db either.
+        for db in ("odoo db test", "odoo_db_test_é", "odoo_db_test\n  next", f"odoo_db {KEY}"):
             with self.subTest(db=db):
                 self.make_json2_store(db=db)
-                with self.assertRaises(ConfigError) as caught:
-                    Client(profile="erp")
-                self.assertIn(
-                    "must be one line of printable ASCII without spaces, as "
-                    "JSON-2 sends it in a header",
-                    str(caught.exception),
+                error = self.raised(ConfigError, lambda: Client(profile="erp"))
+                self.assertEqual(
+                    str(error),
+                    f"The db of profile 'erp', in {self._home}/.config/odoo-auth/erp.conf, "
+                    "must be one line of printable ASCII without spaces, as JSON-2 sends it "
+                    "in a header. It is not shown.",
                 )
-                self.assertNeverShows(caught.exception, db.split("\n")[0])
+                first_line = db.split("\n")[0]
+                self.assertNeverShows(error, first_line)
+                self.assertNoFrameHolds(error, first_line)
 
 
-class PublicFieldTest(StoreTestCase):
-    """A caller may print a profile's url, db, user and api: a profile in
-    which one of them holds the password, or the API key, is refused before
-    any call, with a message that names the profile and the field."""
+class PublicValueTest(StoreTestCase):
+    """A profile's url, db, user and api are not secret: a profile in which
+    one of them holds the password, as one whose user and password are both
+    admin, is read as any other, each value as it is. Whether a user or a
+    password is right is for Odoo to answer (test_calls.PublicValueTest)."""
 
     def make_store_with(self, url, db, user, password, api):
         self.make_store(
@@ -843,70 +890,58 @@ class PublicFieldTest(StoreTestCase):
             f"api = {api}\n"
         )
 
-    def test_a_value_holding_the_password_is_refused_unshown(self):
-        # Answers written on the wrong line.
+    def test_a_value_holding_the_password_is_read_as_it_is(self):
+        # The profiles the library refused up to 2.0.0: the password written
+        # on the wrong line, escaped as JSON writes it, or by chance.
         profiles = {
-            "url": ("https://odoo_dummy_password_test.example.com", "odoo_db_test", "odoo_user_test"),
-            "db": ("https://odoo.example.com", "odoo_dummy_password_test", "odoo_user_test"),
-            "user": ("https://odoo.example.com", "odoo_db_test", "odoo_dummy_password_test"),
+            "the url": (
+                "https://odoo_dummy_password_test.example.com",
+                "odoo_db_test",
+                "odoo_user_test",
+                PASSWORD,
+                "xmlrpc",
+            ),
+            "the db": ("https://odoo.example.com", PASSWORD, "odoo_user_test", PASSWORD, "xmlrpc"),
+            "the user": ("https://odoo.example.com", "odoo_db_test", PASSWORD, PASSWORD, "xmlrpc"),
+            # As JSON writes the password: \" and \\.
+            "the db, escaped": (
+                "https://odoo.example.com",
+                'odoo_dummy\\"pass\\\\word_test',
+                "odoo_user_test",
+                'odoo_dummy"pass\\word_test',
+                "xmlrpc",
+            ),
+            "the url of a json2 profile": (
+                f"https://{KEY}.example.com",
+                "odoo_db_test",
+                "odoo_user_test",
+                KEY,
+                "json2",
+            ),
+            "the url, by chance": (
+                "https://lab.example.com",
+                "odoo_db_test",
+                "odoo_user_test",
+                "ab",  # a piece of "lab.example.com"
+                "xmlrpc",
+            ),
+            "the api, by chance": (
+                "https://odoo.example.com",
+                "odoo_db_test",
+                "odoo_user_test",
+                "rpc",  # a piece of "xmlrpc"
+                "xmlrpc",
+            ),
         }
-        for key, (url, db, user) in profiles.items():
-            with self.subTest(key=key):
-                self.make_store_with(url, db, user, PASSWORD, "xmlrpc")
-                error = self.raised(ConfigError, lambda: ServerProxy(profile="erp"))
-                self.assertIn(f"The {key} of profile 'erp', in ", str(error))
-                self.assertIn("holds its password", str(error))
-                self.assertNeverShows(error, PASSWORD)
-                self.assertNoFrameHolds(error, PASSWORD)
-        self.common.authenticate.assert_not_called()
-
-    def test_a_url_line_holding_the_password_is_refused_for_holding_it(self):
-        # The url checks would refuse this url too: the check for the
-        # password comes first, and its message says why.
-        self.make_store_with(
-            "odoo_dummy_password_test", "odoo_db_test", "odoo_user_test", PASSWORD, "xmlrpc"
-        )
-        error = self.raised(ConfigError, lambda: ServerProxy(profile="erp"))
-        self.assertIn("The url of profile 'erp', in ", str(error))
-        self.assertIn("holds its password", str(error))
-        self.assertNoFrameHolds(error, PASSWORD)
-
-    def test_a_value_holding_the_password_escaped_is_refused(self):
-        password = 'odoo_dummy"pass\\word_test'
-        # As JSON writes it: \" and \\.
-        self.make_store_with(
-            "https://odoo.example.com",
-            'odoo_dummy\\"pass\\\\word_test',
-            "odoo_user_test",
-            password,
-            "xmlrpc",
-        )
-        error = self.raised(ConfigError, lambda: ServerProxy(profile="erp"))
-        self.assertIn("The db of profile 'erp', in ", str(error))
-        self.common.authenticate.assert_not_called()
-
-    def test_a_url_holding_the_api_key_is_refused_unshown(self):
-        self.make_store_with(
-            f"https://{KEY}.example.com", "odoo_db_test", "odoo_user_test", KEY, "json2"
-        )
-        error = self.raised(ConfigError, lambda: Client(profile="erp"))
-        self.assertIn("The url of profile 'erp', in ", str(error))
-        self.assertNeverShows(error, KEY)
-        self.assertNoFrameHolds(error, KEY)
-
-    def test_a_password_that_occurs_in_a_value_by_chance_is_refused(self):
-        # It fails closed. The message is not checked for the password: the
-        # file's path it names holds such a short one too.
-        cases = {
-            "url": ("https://lab.example.com", "ab"),
-            "api": ("https://odoo.example.com", "rpc"),
-        }
-        for key, (url, password) in cases.items():
-            with self.subTest(key=key):
-                self.make_store_with(url, "odoo_db_test", "odoo_user_test", password, "xmlrpc")
-                error = self.raised(ConfigError, lambda: Client(profile="erp"))
-                self.assertIn(f"The {key} of profile 'erp', in ", str(error))
-                self.assertIn(f"occurs in the {key}", str(error))
+        for case, (url, db, user, password, api) in profiles.items():
+            with self.subTest(case=case):
+                self.make_store_with(url, db, user, password, api)
+                with Client(profile="erp") as odoo:
+                    self.assertEqual(repr(odoo), f"Client(profile='erp', api={api!r})")
+                self.assertEqual(
+                    _read_config("erp"),
+                    {"url": url, "db": db, "user": user, "password": password, "api": api},
+                )
 
 
 class CallTest(StoreTestCase):
@@ -1040,10 +1075,6 @@ class OneLineTest(StoreTestCase):
             "another api": (
                 store.replace("api = xmlrpc", "api = soap"),
                 rf"\AThe api line of profile 'erp\\nnext' must be [^\n]*, in {path}\. ",
-            ),
-            "a user holding the password": (
-                store.replace("user = odoo_user_test", "user = odoo_dummy_password_test"),
-                rf"\AThe user of profile 'erp\\nnext', in {path}, holds its password\. ",
             ),
             "a url with another scheme": (
                 store.replace("https://", "ftp://"),

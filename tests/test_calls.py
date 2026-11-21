@@ -2312,6 +2312,188 @@ def _deeper_than_str_follows():
     return depth
 
 
+class PublicValueTest(StubTestCase):
+    """A profile whose user is its password, as one whose user and password
+    are both admin, calls as any other, over either API: whether they are
+    right is for Odoo to answer. An error of its calls shows no form of the
+    password, and where Odoo's message quotes the user, the mask hides the
+    user too. So it goes for a profile whose url, db or api holds the
+    password."""
+
+    def make_profile_whose_user_is(self, url, api, password, profile="erp"):
+        """A profile whose user is ``password``, its password."""
+        self.make_store(
+            "[odoo]\n"
+            f"url = {url}\n"
+            f"db = {DB}\n"
+            f"user = {password}\n"
+            f"password = {password}\n"
+            f"api = {api}\n",
+            profile=profile,
+        )
+
+    def test_a_profile_whose_user_is_its_password_calls_over_xmlrpc(self):
+        odoo = self.start(XmlRpcOdoo())
+        odoo.user = PASSWORD
+        odoo.answers[("res.partner", "search_count")] = 3
+        self.make_profile_whose_user_is(odoo.url, "xmlrpc", PASSWORD)
+        with Client(profile="erp") as client:
+            self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        with ServerProxy(profile="erp") as proxy:
+            self.assertEqual(proxy.execute_kw("res.partner", "search_count", [[]], {}), 3)
+        self.assertEqual(odoo.logins, 2)
+
+    def test_a_profile_whose_user_is_its_api_key_calls_over_json2(self):
+        odoo = self.start(Json2Odoo())
+        odoo.answers[("res.partner", "search_count")] = 3
+        self.make_profile_whose_user_is(odoo.url, "json2", KEY)
+        with Client(profile="erp") as client:
+            self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertEqual(odoo.requests[0]["headers"]["authorization"], f"Bearer {KEY}")
+
+    def test_an_error_of_a_profile_whose_user_is_its_password_shows_none_of_it(self):
+        xmlrpc_odoo = self.start(XmlRpcOdoo())
+        xmlrpc_odoo.user = PASSWORD
+        xmlrpc_odoo.answers[("res.partner", "read")] = xmlrpc.client.Fault(
+            4, f"Sorry, {PASSWORD} (id=7) doesn't have 'read' access to: Contact (res.partner)"
+        )
+        json2_odoo = self.start(Json2Odoo())
+        json2_odoo.answers[("res.partner", "read")] = Answer(
+            403,
+            odoo_error(
+                "odoo.exceptions.AccessError",
+                f"Sorry, {KEY} (id=7) doesn't have 'read' access to: Contact (res.partner)",
+            ),
+        )
+        self.make_profile_whose_user_is(xmlrpc_odoo.url, "xmlrpc", PASSWORD, "xmlrpc")
+        self.make_profile_whose_user_is(json2_odoo.url, "json2", KEY, "json2")
+        # The stub's user and password are PASSWORD: it refuses this login.
+        self.make_profile_whose_user_is(
+            xmlrpc_odoo.url, "xmlrpc", "odoo_wrong_password_test", "refused"
+        )
+        cases = {
+            "xmlrpc": (
+                PASSWORD,
+                OdooError,
+                "Odoo answered a call of profile 'xmlrpc' with an error (code 4): Sorry, "
+                "*** (id=7) doesn't have 'read' access to: Contact (res.partner)",
+            ),
+            "json2": (
+                KEY,
+                OdooError,
+                "Odoo answered a call of profile 'json2' with an error (code 403): Sorry, "
+                "*** (id=7) doesn't have 'read' access to: Contact (res.partner)",
+            ),
+            "refused": (
+                "odoo_wrong_password_test",
+                AuthError,
+                "Authentication failed for profile 'refused'",
+            ),
+        }
+        for profile, (password, error_class, message) in cases.items():
+            with self.subTest(profile=profile):
+                with Client(profile=profile) as client, self.assertRaises(error_class) as caught:
+                    client.call("res.partner", "read", [7])
+                self.assertEqual(str(caught.exception), message)
+                self.assertNeverShows(caught.exception, password)
+
+    def test_a_profile_whose_url_db_or_api_holds_its_password_calls(self):
+        # Each holds it by chance, as a password short or common enough can.
+        xmlrpc_odoo = self.start(XmlRpcOdoo())
+        xmlrpc_odoo.answers[("res.partner", "search_count")] = 3
+        passwords = {
+            "the url": "127.0.0.1",  # a piece of the stub's url, http://127.0.0.1:<port>
+            "the db": "db_test",  # a piece of DB, odoo_db_test
+            "the api": "rpc",  # a piece of "xmlrpc"
+        }
+        for case, password in passwords.items():
+            with self.subTest(case=case):
+                xmlrpc_odoo.password = password
+                self.make_profile(xmlrpc_odoo.url, "xmlrpc", password)
+                with Client(profile="erp") as client:
+                    self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                with ServerProxy(profile="erp") as proxy:
+                    self.assertEqual(proxy.execute_kw("res.partner", "search_count", [[]], {}), 3)
+        json2_odoo = self.start(Json2Odoo())
+        json2_odoo.answers[("res.partner", "search_count")] = 3
+        # A db that is the API key, as JSON-2's header takes one.
+        self.make_store(
+            "[odoo]\n"
+            f"url = {json2_odoo.url}\n"
+            f"db = {KEY}\n"
+            f"user = {USER}\n"
+            f"password = {KEY}\n"
+            "api = json2\n"
+        )
+        with Client(profile="erp") as client:
+            self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+        self.assertEqual(json2_odoo.requests[0]["headers"]["x-odoo-database"], KEY)
+
+    def test_an_error_quoting_a_url_db_or_api_that_holds_the_password_shows_none_of_it(self):
+        # Where Odoo's message quotes the value, the mask hides the password
+        # inside it; the text of a refused connection's error of requests
+        # quotes the url, and the library's error quotes nothing of it.
+        db_odoo = self.start(XmlRpcOdoo())
+        db_odoo.password = "db_test"  # a piece of DB, odoo_db_test
+        db_odoo.answers[("res.partner", "read")] = xmlrpc.client.Fault(
+            4, 'Database "odoo_db_test" is read-only'
+        )
+        api_odoo = self.start(XmlRpcOdoo())
+        api_odoo.password = "rpc"  # a piece of "xmlrpc"
+        api_odoo.answers[("res.partner", "read")] = xmlrpc.client.Fault(
+            4, "A call over xmlrpc is deprecated"
+        )
+        json2_odoo = self.start(Json2Odoo())
+        json2_odoo.answers[("res.partner", "read")] = Answer(
+            422, odoo_error("odoo.exceptions.UserError", f"Database {KEY} is read-only")
+        )
+        self.make_profile(db_odoo.url, "xmlrpc", "db_test", "db")
+        self.make_profile(api_odoo.url, "xmlrpc", "rpc", "api")
+        # A db that is the API key, as JSON-2's header takes one.
+        self.make_store(
+            "[odoo]\n"
+            f"url = {json2_odoo.url}\n"
+            f"db = {KEY}\n"
+            f"user = {USER}\n"
+            f"password = {KEY}\n"
+            "api = json2\n",
+            profile="json2-db",
+        )
+        self.make_profile(f"http://127.0.0.1:{free_port()}/{KEY}", "json2", KEY, "json2-url")
+        cases = {
+            "db": (
+                "db_test",
+                OdooError,
+                "Odoo answered a call of profile 'db' with an error (code 4): Database "
+                '"odoo_***" is read-only',
+            ),
+            "api": (
+                "rpc",
+                OdooError,
+                "Odoo answered a call of profile 'api' with an error (code 4): A call over "
+                "xml*** is deprecated",
+            ),
+            "json2-db": (
+                KEY,
+                OdooError,
+                "Odoo answered a call of profile 'json2-db' with an error (code 422): "
+                "Database *** is read-only",
+            ),
+            "json2-url": (
+                KEY,
+                RequestError,
+                "A request of profile 'json2-url' failed: ConnectionError. Its message is not "
+                "shown, as it can quote the profile's values.",
+            ),
+        }
+        for profile, (password, error_class, message) in cases.items():
+            with self.subTest(profile=profile):
+                with Client(profile=profile) as client, self.assertRaises(error_class) as caught:
+                    client.call("res.partner", "read", [7])
+                self.assertEqual(str(caught.exception), message)
+                self.assertNeverShows(caught.exception, password)
+
+
 class ArgumentTest(StubTestCase):
     """A value the profile's API cannot carry is refused before anything is
     sent, the login included: an ArgumentError, also an instance of the
@@ -2894,7 +3076,10 @@ class FramesTest(StubTestCase):
     locals (pytest -l), and a log or a report can keep them. A frame that
     holds a ServerProxy, as each of its calls' frames does, shows its
     password one attribute down, in _password, readable as in 1.x:
-    support._shown does not open a ServerProxy."""
+    support._shown does not open a ServerProxy. A profile whose url, db,
+    user or api holds the password shows it with them, as they are not
+    secret, at a frame's own level too (README § Configure a profile): the
+    profiles here hold it in none of them."""
 
     def refusals(self, profile):
         """The error each reader of the store raises for ``profile``, a
@@ -2976,7 +3161,6 @@ class FramesTest(StubTestCase):
             profile="no-api",
         )
         self.make_profile("https://odoo.example.com", "xml-rpc", PASSWORD, "bad-api")
-        self.make_profile(f"https://{PASSWORD}.example.com", "xmlrpc", PASSWORD, "url-holding-it")
         self.make_profile("ftp://odoo.example.com", "xmlrpc", PASSWORD, "bad-url")
         self.make_profile("https://odoo.example.com", "json2", PASSWORD, "not-a-key")
         self.make_store(
@@ -2991,7 +3175,6 @@ class FramesTest(StubTestCase):
         cases = {
             "no-api": PASSWORD,
             "bad-api": PASSWORD,
-            "url-holding-it": PASSWORD,
             "bad-url": PASSWORD,
             "not-a-key": PASSWORD,
             "bad-db": KEY,
