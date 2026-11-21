@@ -61,9 +61,6 @@ _CUT_OFF_NOTE = (
 )
 _SECTION = "odoo"
 _REQUIRED_KEYS = ("url", "db", "user", "password")
-# The values of a profile a caller may print (Client's repr shows the api):
-# none of them may hold the password.
-_PUBLIC_KEYS = ("url", "db", "user", "api")
 # The values of the line `api = ...` every profile carries, with no default:
 # the API each call of a Client goes through, Odoo's XML-RPC (/xmlrpc/2) or
 # its External JSON-2 API (/json/2, from Odoo 19).
@@ -730,10 +727,6 @@ class _Secret:
             text[start:end] for start, end in zip(shown_starts, shown_ends)
         )
 
-    def occurs_in(self, text):
-        """Whether ``text`` holds the value, in any of its forms."""
-        return any(pattern.search(text) is not None for pattern in self._patterns)
-
     def __repr__(self):
         return f"<{len(self._value)} chars>"
 
@@ -770,41 +763,6 @@ def _check_api(profile, section, config_path):
             f"{_ACCEPTED_API_LINES}, in {_one_line(config_path)}. Its value is "
             "not shown."
         )
-
-
-def _check_public_fields(profile, section, config_path):
-    """Raise ConfigError when a value of _PUBLIC_KEYS in ``section``, the
-    profile's, holds its password, in any of the forms an error is masked
-    in (_public_key_holding_the_password).
-
-    A caller may print those values: a password written on the wrong line
-    would show through them. The check fails closed: a password short or
-    common enough to occur in one by chance is refused too. No message
-    quotes a value, and no frame here holds one in a local, nor the
-    password's _Secret, whose value a debugger shows one attribute down.
-    """
-    key = _public_key_holding_the_password(section)
-    if key is not None:
-        raise ConfigError(
-            f"The {key} of profile {profile!r}, in {_one_line(config_path)}, holds "
-            "its password. Either the password was written on the wrong "
-            "line: keep it on the password line only. Or the password is "
-            f"so short or so common that it occurs in the {key}: the "
-            f"password must change, as the {key} may be printed. Neither "
-            "is shown."
-        )
-
-
-def _public_key_holding_the_password(section):
-    """The first key of _PUBLIC_KEYS whose value in ``section``, the
-    profile's, holds its password in any of the forms an error is masked in
-    (_Secret.occurs_in), or None. Returned, not raised: the _Secret it
-    makes for the check goes with this frame, and no frame of the error
-    _check_public_fields raises holds it."""
-    password = _Secret(section["password"])
-    # _check_api has refused a profile without the api line.
-    holding = [key for key in _PUBLIC_KEYS if password.occurs_in(section[key])]
-    return holding[0] if holding else None
 
 
 def _check_url(section, config_path):
@@ -978,11 +936,15 @@ class _Config:
     ``password``, a _Secret.
 
     An object, not a dict, as the section it comes from (_read_section):
-    neither its repr nor the repr of any of its attributes shows the
-    password, the _Secret's showing only its length. A dict of the same
-    values would hold the _Secret among them, which a debugger shows as it
-    shows a local, with the password one attribute down. No frame that
-    holds the profile's values, such as the login's, shows it."""
+    its repr shows no value, and the repr of its password, a _Secret, only
+    its length. A dict of the same values would hold the _Secret among
+    them, which a debugger shows as it shows a local, with the password one
+    attribute down. A frame that holds a _Config, such as the login's,
+    shows no password but inside the url, the db, the user or the api when
+    one of them holds it: those are not secret, and a debugger shows them
+    one attribute down, as they are. The url also shows at a frame's own
+    level wherever the frame holds a ServerProxy, whose repr shows it, as
+    the login's does (README § Configure a profile)."""
 
     __slots__ = ("url", "db", "user", "password", "api")
 
@@ -1089,8 +1051,6 @@ def _checked_config(profile, section, config_path):
     ConfigError holds it, nor shows the password.
     """
     _check_api(profile, section, config_path)
-    # Before the checks whose frames hold a public value in a local.
-    _check_public_fields(profile, section, config_path)
     _check_url(section, config_path)
     # Only JSON-2 sends values of the store in headers.
     if section["api"] == "json2":
@@ -1909,7 +1869,13 @@ def _send(profile, call):
     that sends it: no frame here holds the password, and so no frame the
     RequestError raised gets from here does. A caller's frame can:
     ServerProxy.execute_kw's holds the ServerProxy, which shows it one
-    attribute down, in _password, readable as in 1.x.
+    attribute down, in _password, readable as in 1.x. And where the url,
+    the db, the user or the api holds the password, a caller's frame shows
+    it with them: _log_in's holds the profile's _Config, which shows the
+    four one attribute down, and the ServerProxy of the login, whose repr
+    shows the url at the frame's own level, as the ServerProxy that
+    ServerProxy.execute_kw's frame holds does (README § Configure a
+    profile).
     """
     failure = None
     try:
