@@ -60,7 +60,9 @@ What else a 1.x caller meets:
   Debian's urllib3 2.3.0, whose `2.3.0-3+deb13u1` and later carry that
   refusal as a backport.
 - A profile is refused too when its `url` holds a backslash, port 0, a
-  query or a fragment, or a host IDNA refuses (§ Configure a profile).
+  query or a fragment, or a host IDNA refuses (§ Configure a profile), and
+  by 2.0, not by 2.1, when its `url`, `db`, `user` or `api` holds its
+  `password` (§ Upgrading to 2.1).
 - `ServerProxy` with a profile refuses `verbose=True`, and the library's
   connections print nothing at `http.client`'s debug level, where 1.x
   printed the password with each request (§ Security model).
@@ -69,6 +71,24 @@ What else a 1.x caller meets:
   `Error: Odoo answered a call of profile 'x' with an error (code N):
   <message>`, the password shown as `***`, where 1.x printed the Fault's
   text alone.
+
+## Upgrading to 2.1
+
+Version 2.1 refuses no profile that 2.0 takes, and takes two kinds that
+2.0 refuses. What a 2.0 caller meets:
+
+- A profile whose `url`, `db`, `user` or `api` holds its `password`, such
+  as one whose `user` and `password` are both `admin`, loads and calls as
+  any other, where 2.0 refused it: § Configure a profile says what shows
+  its password then.
+- An `api = json2` profile whose `password` is not an Odoo API key loads,
+  where 2.0 refused it, when the password is one line of Latin-1
+  characters: the library sends it, and Odoo answers it with an HTTP 401,
+  an `AuthError`, or, on Odoo 19, an HTTP 403, an `OdooError`, when a NUL
+  is among its first 8 characters.
+- Over JSON-2, the message of the `AuthError` for a 401 adds, after
+  `Authentication failed for profile '<name>'`, that Odoo takes only one
+  of its API keys as the password.
 
 ## CLI usage
 
