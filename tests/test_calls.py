@@ -2560,7 +2560,8 @@ class ShownTest(unittest.TestCase):
     """What the frames tests below read of a local (support._shown): each
     holder of the key shows it, one attribute down of the answers, requests
     and errors a debugger opens, inside any container, and of any object of
-    the frame's level, never two attributes down."""
+    the frame's level, never two attributes down; and a value held as it is,
+    or in bytes, where its repr escapes it."""
 
     def test_the_key_one_attribute_down_of_each_holder_shows(self):
         bearer = {"Authorization": f"Bearer {KEY}"}
@@ -2719,6 +2720,61 @@ class ShownTest(unittest.TestCase):
         for order, local in orders.items():
             with self.subTest(order=order):
                 self.assertIn(PASSWORD, _shown(local))
+
+    def test_a_value_its_repr_escapes_shows_as_it_is_held(self):
+        # A repr escapes a tab, a carriage return, a character that does not
+        # print, such as U+0085, and each byte outside ASCII: a value held as
+        # it is, or as the bytes of its Latin-1 or UTF-8 encoding, shows all
+        # the same, at the frame's level and one attribute down.
+        holders = {
+            "a text with a tab": ("odoo_dummy\tpassword_test", "odoo_dummy\tpassword_test"),
+            "a text with a carriage return": (
+                "odoo_dummy\rpassword_test",
+                "odoo_dummy\rpassword_test",
+            ),
+            "a text with U+0085": ("odoo_dummy\x85password_test", "odoo_dummy\x85password_test"),
+            # b"\xe9" is é in Latin-1, b"\xc3\xa9" in UTF-8, and b"\xff" ÿ in
+            # Latin-1.
+            "bytes of its Latin-1 encoding": (
+                "odoo_dummy_password_test_é",
+                b"Bearer odoo_dummy_password_test_\xe9",
+            ),
+            "bytes of its UTF-8 encoding": (
+                "odoo_dummy_password_test_é",
+                b"Bearer odoo_dummy_password_test_\xc3\xa9",
+            ),
+            "a bytearray of its Latin-1 encoding": (
+                "odoo_dummy_password_test_ÿ",
+                bytearray(b"odoo_dummy_password_test_\xff"),
+            ),
+            "an object holding a text with a tab": (
+                "odoo_dummy\tpassword_test",
+                Holder("odoo_dummy\tpassword_test"),
+            ),
+            "an object holding a text with a carriage return": (
+                "odoo_dummy\rpassword_test",
+                Holder("odoo_dummy\rpassword_test"),
+            ),
+            "an object holding a text with U+0085": (
+                "odoo_dummy\x85password_test",
+                Holder("odoo_dummy\x85password_test"),
+            ),
+            "an object holding the bytes of its Latin-1 encoding": (
+                "odoo_dummy_password_test_é",
+                Holder(b"Bearer odoo_dummy_password_test_\xe9"),
+            ),
+            "an object holding the bytes of its UTF-8 encoding": (
+                "odoo_dummy_password_test_é",
+                Holder(b"Bearer odoo_dummy_password_test_\xc3\xa9"),
+            ),
+            "an object holding a bytearray of its Latin-1 encoding": (
+                "odoo_dummy_password_test_ÿ",
+                Holder(bytearray(b"odoo_dummy_password_test_\xff")),
+            ),
+        }
+        for holder, (value, local) in holders.items():
+            with self.subTest(holder=holder):
+                self.assertIn(value, _shown(local))
 
     def test_a_secret_two_attributes_down_of_an_object_shows_nothing(self):
         # One level down, never another: the holder shows the repr of what
