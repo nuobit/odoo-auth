@@ -93,7 +93,9 @@ class StoreMixin:
         traceback of ``error`` or of any error chained to it, its __cause__
         or its __context__, at any depth: a test runner or a debugger prints
         the repr of each local of each frame of the whole chain
-        (``pytest -l``). Fails naming each frame and local that does.
+        (``pytest -l``). A local holds it as _shown finds it: in a repr, as
+        it is, or in the bytes of its Latin-1 or UTF-8 encoding. Fails
+        naming each frame and local that does.
 
         ``error`` comes from ``raised``: the one assertRaises keeps has no
         traceback left to check."""
@@ -127,7 +129,10 @@ class StoreMixin:
 
 def _shown(local):
     """What a printer of a frame's locals shows of ``local``, and a debugger
-    one attribute down of each object in it.
+    one attribute down of each object in it, with each text and each bytes
+    in it as it is held (_held): a repr escapes a tab, a line break, a
+    character that does not print and each byte outside ASCII, and a value
+    a frame holds in such a form is held all the same.
 
     A printer shows a value's repr, or nothing when the repr fails, as it
     does for an object whose __init__ raised before setting what its repr
@@ -172,6 +177,7 @@ def _shown(local):
                 pending += [(item, frames_level) for item in value]
             else:
                 texts.append(_printed(value))
+                texts += _held(value)
                 pending += [(down, False) for down in _one_attribute_down(value, frames_level)]
     return "".join(texts)
 
@@ -183,6 +189,20 @@ def _printed(value):
     except (AttributeError, RecursionError):
         printed = ""
     return printed
+
+
+def _held(value):
+    """``value`` as a frame holds it, where its repr escapes it (_shown): a
+    text as it is, and bytes as the texts they are the Latin-1 and the UTF-8
+    encodings of, so that a value is found in the bytes that encode it, as
+    a request's head or body holds it. Nothing for any other value."""
+    if isinstance(value, str):
+        held = [value]
+    elif isinstance(value, (bytes, bytearray)):
+        held = [value.decode("latin-1"), value.decode("utf-8", "replace")]
+    else:
+        held = []
+    return held
 
 
 def _one_attribute_down(value, frames_level):
