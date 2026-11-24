@@ -18,6 +18,7 @@ Run from the repository root:
     PYTHONPATH=src python3 -m unittest discover -s tests
 """
 
+import configparser
 import contextlib
 import errno
 import io
@@ -39,6 +40,7 @@ from odoo_auth.client import (
     OdooError,
     RequestError,
     ServerProxy,
+    _checked_config,
     _read_config,
     _Secret,
     _send,
@@ -794,7 +796,8 @@ class ApiLineTest(StoreTestCase):
 class Json2StoreTest(StoreTestCase):
     """JSON-2 sends the password and the db in headers, which refuse some
     values with an error that quotes them: a json2 profile whose values
-    cannot go there is refused before any call, without showing them."""
+    cannot go there is refused before any call, without showing them, and
+    an xmlrpc profile takes them."""
 
     def make_json2_store(
         self, password=KEY, db="odoo_db_test", url="https://odoo.example.com", api="json2"
@@ -842,17 +845,57 @@ class Json2StoreTest(StoreTestCase):
                 self.make_json2_store(url=url, password=PASSWORD, api="xmlrpc")
                 Client(profile="erp").close()
 
-    def test_a_password_that_is_not_an_api_key_is_refused_unshown(self):
-        for password in (PASSWORD, KEY.upper(), KEY + "0", KEY[:-1] + "é"):
-            with self.subTest(password=password):
+    def test_a_password_a_header_cannot_carry_is_refused_unshown(self):
+        # http.client refuses a line break in a header with an error that
+        # quotes the value, and cannot encode a character outside Latin-1,
+        # with an error that holds it. An indented line is read as part of
+        # the value above it, as is an empty line followed by one.
+        passwords = {
+            "a line break": "odoo_dummy\n  password_test",
+            "an empty line": "odoo_dummy\n\n  password_test",
+            "the first character outside Latin-1": "odoo_dummy_password_test_Ā",
+            "a character far outside Latin-1": "odoo_dummy_password_test_€",
+        }
+        for case, password in passwords.items():
+            with self.subTest(case=case):
                 self.make_json2_store(password=password)
-                with self.assertRaises(ConfigError) as caught:
-                    Client(profile="erp")
-                self.assertIn(
-                    "must be an Odoo API key, 40 lowercase hexadecimal digits",
-                    str(caught.exception),
+                error = self.raised(ConfigError, lambda: Client(profile="erp"))
+                self.assertEqual(
+                    str(error),
+                    f"The password of profile 'erp', in {self._home}/.config/odoo-auth/erp.conf, "
+                    "must be one line of Latin-1 characters, as JSON-2 sends it in a header: an "
+                    "Odoo API key, the only password JSON-2 takes, always is. It is not shown.",
                 )
-                self.assertNeverShows(caught.exception, password)
+                self.assertNeverShows(error, "odoo_dummy")
+                self.assertNoFrameHolds(error, "odoo_dummy")
+
+    def test_a_password_with_a_carriage_return_is_refused_unshown(self):
+        # http.client quotes a carriage return in a header as it quotes a line
+        # feed. The store's file is read with universal newlines, which turn
+        # one into a line feed, so the section is made here, holding one.
+        parser = configparser.RawConfigParser()
+        parser.read_dict(
+            {
+                "odoo": {
+                    "url": "https://odoo.example.com",
+                    "db": "odoo_db_test",
+                    "user": "odoo_user_test",
+                    "password": "odoo_dummy\rpassword_test",
+                    "api": "json2",
+                }
+            }
+        )
+        error = self.raised(
+            ConfigError, lambda: _checked_config("erp", parser["odoo"], "/store/erp.conf")
+        )
+        self.assertEqual(
+            str(error),
+            "The password of profile 'erp', in /store/erp.conf, must be one line of Latin-1 "
+            "characters, as JSON-2 sends it in a header: an Odoo API key, the only password "
+            "JSON-2 takes, always is. It is not shown.",
+        )
+        self.assertNeverShows(error, "odoo_dummy")
+        self.assertNoFrameHolds(error, "odoo_dummy")
 
     def test_a_db_that_cannot_go_in_a_header_is_refused_unshown(self):
         # An indented line is read as part of the value above it. A db that
@@ -872,6 +915,59 @@ class Json2StoreTest(StoreTestCase):
                 first_line = db.split("\n")[0]
                 self.assertNeverShows(error, first_line)
                 self.assertNoFrameHolds(error, first_line)
+
+    def test_an_xmlrpc_profile_takes_a_password_and_a_db_no_header_can_carry(self):
+        # Only JSON-2 sends the store's values in headers: XML-RPC sends the
+        # db and the password in the body of each call, as they are. An
+        # indented line is read as part of the value above it, as is an empty
+        # line followed by one.
+        passwords = {
+            "a line break": ("odoo_dummy\n  password_test", "odoo_dummy\npassword_test"),
+            "an empty line": ("odoo_dummy\n\n  password_test", "odoo_dummy\n\npassword_test"),
+            "the first character outside Latin-1": (
+                "odoo_dummy_password_test_Ā",
+                "odoo_dummy_password_test_Ā",
+            ),
+            "a character far outside Latin-1": (
+                "odoo_dummy_password_test_€",
+                "odoo_dummy_password_test_€",
+            ),
+        }
+        for case, (line, password) in passwords.items():
+            with self.subTest(password=case):
+                self.make_json2_store(password=line, api="xmlrpc")
+                with Client(profile="erp") as odoo:
+                    self.assertEqual(odoo.api, "xmlrpc")
+                self.assertEqual(
+                    _read_config("erp"),
+                    {
+                        "url": "https://odoo.example.com",
+                        "db": "odoo_db_test",
+                        "user": "odoo_user_test",
+                        "password": password,
+                        "api": "xmlrpc",
+                    },
+                )
+        dbs = {
+            "a space": ("odoo db test", "odoo db test"),
+            "a letter outside ASCII": ("odoo_db_test_é", "odoo_db_test_é"),
+            "a line break": ("odoo_db_test\n  next", "odoo_db_test\nnext"),
+        }
+        for case, (line, db) in dbs.items():
+            with self.subTest(db=case):
+                self.make_json2_store(password=PASSWORD, db=line, api="xmlrpc")
+                with Client(profile="erp") as odoo:
+                    self.assertEqual(odoo.api, "xmlrpc")
+                self.assertEqual(
+                    _read_config("erp"),
+                    {
+                        "url": "https://odoo.example.com",
+                        "db": db,
+                        "user": "odoo_user_test",
+                        "password": PASSWORD,
+                        "api": "xmlrpc",
+                    },
+                )
 
 
 class PublicValueTest(StoreTestCase):
@@ -1080,9 +1176,11 @@ class OneLineTest(StoreTestCase):
                 store.replace("https://", "ftp://"),
                 rf"\AThe url in {path} must start with ",
             ),
-            "a json2 password that is no API key": (
-                store.replace("api = xmlrpc", "api = json2"),
-                rf"\AThe password of profile 'erp\\nnext', in {path}, must be an Odoo ",
+            "a json2 password a header cannot carry": (
+                store.replace("api = xmlrpc", "api = json2").replace(
+                    "password = odoo_dummy_password_test", "password = odoo_dummy_password_test_€"
+                ),
+                rf"\AThe password of profile 'erp\\nnext', in {path}, must be one line of ",
             ),
             "a json2 db with a space": (
                 store.replace("api = xmlrpc", "api = json2")

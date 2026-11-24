@@ -1353,15 +1353,77 @@ class Json2ClientTest(LoggersMixin, StubTestCase):
         client = self.make_client(self.odoo.url, "json2", other_key, "other")
         with self.assertRaises(AuthError) as caught:
             client.call("res.partner", "read", [7])
-        self.assertEqual(str(caught.exception), "Authentication failed for profile 'other'")
+        self.assertEqual(
+            str(caught.exception),
+            "Authentication failed for profile 'other': over JSON-2, Odoo takes only one of "
+            "its API keys as the password",
+        )
         self.assertNeverShows(caught.exception, other_key)
 
+    def test_a_password_that_is_no_api_key_goes_out_for_odoo_to_refuse(self):
+        # Odoo's JSON-2 takes only its own API keys, and answers any other
+        # password with a 401: each goes out as the store holds it, a
+        # character of Latin-1 outside ASCII as its one byte, and a NUL,
+        # which http.client takes in a header.
+        passwords = {
+            "a login password": PASSWORD,
+            "a key in capitals": KEY.upper(),
+            "a key one digit longer": KEY + "0",
+            "a key with a letter outside ASCII": KEY[:-1] + "é",
+            "the last character of Latin-1": "odoo_dummy_password_test_ÿ",
+            "a tab inside": "odoo_dummy\tpassword_test",
+            "a NUL inside": "odoo_dummy\x00password_test",
+        }
+        for case, password in passwords.items():
+            with self.subTest(case=case):
+                client = self.make_client(self.odoo.url, "json2", password, "other")
+                # A partial: the siblings' lambda would read the loop's client, a pylint W0640.
+                error = self.raised(
+                    AuthError, functools.partial(client.call, "res.partner", "read", [7])
+                )
+                self.assertEqual(
+                    self.odoo.requests[-1]["headers"]["authorization"], f"Bearer {password}"
+                )
+                self.assertEqual(
+                    str(error),
+                    "Authentication failed for profile 'other': over JSON-2, Odoo takes only "
+                    "one of its API keys as the password",
+                )
+                self.assertNeverShows(error, password)
+                self.assertNoFrameHolds(error, password)
+
+    def test_an_empty_password_goes_out_for_odoo_to_refuse(self):
+        # An empty line is a password as any other: the header carries
+        # "Bearer " and nothing after it.
+        client = self.make_client(self.odoo.url, "json2", "", "empty")
+        with self.assertRaises(AuthError) as caught:
+            client.call("res.partner", "read", [7])
+        self.assertEqual(self.odoo.requests[-1]["headers"]["authorization"], "Bearer ")
+        self.assertEqual(
+            str(caught.exception),
+            "Authentication failed for profile 'empty': over JSON-2, Odoo takes only one of "
+            "its API keys as the password",
+        )
+
+    def test_a_space_at_an_end_of_the_password_line_is_not_sent(self):
+        # configparser strips each line of a value: no password of the store
+        # starts or ends with a space or a tab, and the header carries the
+        # password without them.
+        self.odoo.answers[("res.partner", "search_count")] = 3
+        for case, password in {"before it": f" \t{KEY}", "after it": f"{KEY}\t "}.items():
+            with self.subTest(case=case):
+                client = self.make_client(self.odoo.url, "json2", password, "spaced")
+                self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
+                self.assertEqual(
+                    self.odoo.requests[-1]["headers"]["authorization"], f"Bearer {KEY}"
+                )
+
     def test_a_401_whose_body_cannot_be_read_is_an_auth_error(self):
-        # Odoo's refusal of the key, whatever its body, which is not read: one
-        # cut short or not the gzip it says changes nothing, and the answer's
-        # connection is closed. Each answer is held, as a traceback or a
-        # debugger can hold one, so that only its close lets its socket go,
-        # not the garbage collector.
+        # Odoo's refusal of the password, whatever its body, which is not
+        # read: one cut short or not the gzip it says changes nothing, and the
+        # answer's connection is closed. Each answer is held, as a traceback
+        # or a debugger can hold one, so that only its close lets its socket
+        # go, not the garbage collector.
         answers = {
             "cut short": b"Content-Length: 400\r\n\r\n{",
             "not the gzip it says": b"Content-Encoding: gzip\r\nContent-Length: 3\r\n\r\n[3]",
@@ -1386,7 +1448,11 @@ class Json2ClientTest(LoggersMixin, StubTestCase):
                 error = self.raised(
                     AuthError, lambda: self.client.call("res.partner", "read", [7])
                 )
-                self.assertEqual(str(error), "Authentication failed for profile 'erp'")
+                self.assertEqual(
+                    str(error),
+                    "Authentication failed for profile 'erp': over JSON-2, Odoo takes only one "
+                    "of its API keys as the password",
+                )
                 self.assertNeverShows(error, KEY)
                 self.assertNoFrameHolds(error, KEY)
                 self.assertEqual([sock for sock in opened if sock.fileno() != -1], [])
@@ -1522,7 +1588,7 @@ class Json2ClientTest(LoggersMixin, StubTestCase):
 
     def test_an_error_of_urllib3_that_requests_lets_through_is_a_request_error(self):
         # requests raises as it is an error of urllib3 its adapter does not
-        # know (HTTPAdapter.send), from frames that hold the key: under
+        # know (HTTPAdapter.send), from frames that hold the password: under
         # requests 2.34.2 and urllib3 2.3.0, the LocationParseError of a
         # redirect to <origin>//x:y. urllib3's pool raises each here, on any
         # version, the others with an __init__ or a repr of their own.
@@ -1545,7 +1611,7 @@ class Json2ClientTest(LoggersMixin, StubTestCase):
 
     def test_urllib3_logs_nothing_of_an_answer_the_client_reads(self):
         # urllib3 warns of headers it cannot parse, quoting them as the
-        # server sent them: here, a header whose name holds the key. An
+        # server sent them: here, a header whose name holds the password. An
         # application that configured logging prints every warning; the one
         # of another connection still reaches it.
         logged = io.StringIO()
@@ -1567,9 +1633,10 @@ class Json2ClientTest(LoggersMixin, StubTestCase):
 
     def test_no_logger_of_urllib3_logs_a_record_of_a_call(self):
         # At DEBUG, urllib3's pool logs each request line: here, that of a
-        # redirect within the origin whose location echoes the key. A filter
-        # set on urllib3's own logger sees none of its children's records.
-        # The records of another connection still reach the application.
+        # redirect within the origin whose location echoes the password. A
+        # filter set on urllib3's own logger sees none of its children's
+        # records. The records of another connection still reach the
+        # application.
         logged = io.StringIO()
         handler = logging.StreamHandler(logged)
         logging.getLogger().addHandler(handler)
@@ -1646,8 +1713,8 @@ class Json2ClientTest(LoggersMixin, StubTestCase):
 
     def test_urllib3_logs_nothing_of_an_https_call(self):
         # Offline, the TLS sockets fakes: an answer whose header's name
-        # holds the key, read at DEBUG over the call's connection, then over
-        # a connection of urllib3's own, which still logs.
+        # holds the password, read at DEBUG over the call's connection, then
+        # over a connection of urllib3's own, which still logs.
         logged = io.StringIO()
         handler = logging.StreamHandler(logged)
         logging.getLogger().addHandler(handler)
@@ -1721,12 +1788,13 @@ class Json2ClientTest(LoggersMixin, StubTestCase):
         self.assertEqual(self.sent_body(1), {"ids": [7]})
 
     def test_no_frame_of_an_error_keeps_an_answer_that_echoed_the_key(self):
-        # A redirect within the origin whose Location echoes the key, as a
-        # server can, then an answer that is not Odoo's own: a RequestError.
+        # A redirect within the origin whose Location echoes the password, as
+        # a server can, then an answer that is not Odoo's own: a RequestError.
         # The call keeps each answer urllib3 gives, to close it after an
         # interrupt. Kept until the error, in the frame that raises it, the
-        # redirect's held the key in its headers, and each answer its pool,
-        # whose connections urllib3 closes only once the pool is collected.
+        # redirect's held the password in its headers, and each answer its
+        # pool, whose connections urllib3 closes only once the pool is
+        # collected.
         self.odoo.answers[("res.partner", "write")] = Answer(
             303, b"", {"Location": f"/json/2/res.partner/read?echo={KEY}"}
         )
@@ -1739,8 +1807,8 @@ class Json2ClientTest(LoggersMixin, StubTestCase):
         self.assertNoFrameHolds(error, KEY)
 
     def test_no_frame_of_a_refused_redirect_keeps_its_answer_that_echoed_the_key(self):
-        # A redirect to another origin whose Location echoes the key: the
-        # library refuses it, and requests raises the refusal through the
+        # A redirect to another origin whose Location echoes the password:
+        # the library refuses it, and requests raises the refusal through the
         # call, which closes each answer it got before the error goes on. The
         # variable of that loop kept the last answer, the redirect's, in a
         # frame of the RequestError.
@@ -1770,8 +1838,8 @@ class Json2ClientTest(LoggersMixin, StubTestCase):
         # reads, then fails at a block of the reserved type, and more body
         # comes after it. requests read it decoded, then, after the decoding
         # error, the rest undecoded, which urllib3 refused with a RuntimeError
-        # that left the call raw, from frames holding the key. Read undecoded
-        # first, it is never decoded, and the redirect is followed.
+        # that left the call raw, from frames holding the password. Read
+        # undecoded first, it is never decoded, and the redirect is followed.
         digits = b"".join(
             hashlib.sha256(str(n).encode()).hexdigest().encode() for n in range(500)
         )
@@ -2010,7 +2078,7 @@ class Json2ClientTest(LoggersMixin, StubTestCase):
         )
 
     def test_no_proxy_of_the_environment_gets_the_call(self):
-        # A proxy would get the key in clear for an http url.
+        # A proxy would get the password in clear for an http url.
         proxy = self.start(HttpRecorder())
         self.odoo.answers[("res.partner", "read")] = []
         with mock.patch.dict(os.environ, {"HTTP_PROXY": proxy.url, "http_proxy": proxy.url}):
@@ -2351,6 +2419,22 @@ class PublicValueTest(StubTestCase):
             self.assertEqual(client.call("res.partner", "search_count", domain=[]), 3)
         self.assertEqual(odoo.requests[0]["headers"]["authorization"], f"Bearer {KEY}")
 
+    def test_a_profile_whose_user_is_its_password_and_no_api_key_gets_a_401_over_json2(self):
+        # JSON-2 sends no user: the password goes out as the store holds it,
+        # and Odoo refuses it as it refuses any password but one of its keys.
+        odoo = self.start(Json2Odoo())
+        self.make_profile_whose_user_is(odoo.url, "json2", PASSWORD)
+        with Client(profile="erp") as client:
+            error = self.raised(AuthError, lambda: client.call("res.partner", "read", [7]))
+        self.assertEqual(odoo.requests[0]["headers"]["authorization"], f"Bearer {PASSWORD}")
+        self.assertEqual(
+            str(error),
+            "Authentication failed for profile 'erp': over JSON-2, Odoo takes only one of its "
+            "API keys as the password",
+        )
+        self.assertNeverShows(error, PASSWORD)
+        self.assertNoFrameHolds(error, PASSWORD)
+
     def test_an_error_of_a_profile_whose_user_is_its_password_shows_none_of_it(self):
         xmlrpc_odoo = self.start(XmlRpcOdoo())
         xmlrpc_odoo.user = PASSWORD
@@ -2416,7 +2500,7 @@ class PublicValueTest(StubTestCase):
                     self.assertEqual(proxy.execute_kw("res.partner", "search_count", [[]], {}), 3)
         json2_odoo = self.start(Json2Odoo())
         json2_odoo.answers[("res.partner", "search_count")] = 3
-        # A db that is the API key, as JSON-2's header takes one.
+        # A db that is the profile's password, one JSON-2's header takes.
         self.make_store(
             "[odoo]\n"
             f"url = {json2_odoo.url}\n"
@@ -2449,7 +2533,7 @@ class PublicValueTest(StubTestCase):
         )
         self.make_profile(db_odoo.url, "xmlrpc", "db_test", "db")
         self.make_profile(api_odoo.url, "xmlrpc", "rpc", "api")
-        # A db that is the API key, as JSON-2's header takes one.
+        # A db that is the profile's password, one JSON-2's header takes.
         self.make_store(
             "[odoo]\n"
             f"url = {json2_odoo.url}\n"
@@ -2498,7 +2582,7 @@ class ArgumentTest(StubTestCase):
     """A value the profile's API cannot carry is refused before anything is
     sent, the login included: an ArgumentError, also an instance of the
     error the encoder raised, with the encoder's text, and no frame of it
-    holds the password or the key."""
+    holds the profile's password."""
 
     def assertRefusedUnsent(self, client, password, error_class, value):
         error = self.raised(
@@ -2663,7 +2747,7 @@ class ArgumentTest(StubTestCase):
 
     def test_the_reason_hides_the_key(self):
         # json's text names the type of a value it cannot hold, and a type's
-        # name can be anything: here, the key.
+        # name can be anything: here, the password.
         odoo = self.start(Json2Odoo())
         client = self.make_client(odoo.url, "json2", KEY)
         value = type(KEY, (), {})()
@@ -2740,10 +2824,10 @@ UnderscoresOnly = type("__", (), {"__slots__": ("__held",)})
 
 class ShownTest(unittest.TestCase):
     """What the frames tests below read of a local (support._shown): each
-    holder of the key shows it, one attribute down of the answers, requests
-    and errors a debugger opens, inside any container, and of any object of
-    the frame's level, never two attributes down; and a value held as it is,
-    or in bytes, where its repr escapes it."""
+    holder of the password shows it, one attribute down of the answers,
+    requests and errors a debugger opens, inside any container, and of any
+    object of the frame's level, never two attributes down; and a value held
+    as it is, or in bytes, where its repr escapes it."""
 
     def test_the_key_one_attribute_down_of_each_holder_shows(self):
         bearer = {"Authorization": f"Bearer {KEY}"}
@@ -2788,8 +2872,8 @@ class ShownTest(unittest.TestCase):
 
     def test_an_answers_status_text_and_a_requests_auth_show_below_the_frames_level(self):
         # Below the frame's level, a debugger opens an answer, a request or an
-        # error where the key can be (_opened_at_any_depth): the text of an
-        # answer's status line among them, which http.client reads from the
+        # error where the password can be (_opened_at_any_depth): the text of
+        # an answer's status line among them, which http.client reads from the
         # server's answer and urllib3 and requests copy, and a request's auth.
         echo = f"echo {KEY}"
         refused = requests.Response()
@@ -2843,8 +2927,8 @@ class ShownTest(unittest.TestCase):
     def test_an_answer_or_a_request_of_the_frames_level_shows_each_of_its_attributes(self):
         # At the frame's level, a debugger opens an answer or a request as any
         # object, by each of its attributes, not only by those it opens of one
-        # below that level (_opened_at_any_depth): here each holds the key in
-        # an attribute those leave out, as a subclass or another version of
+        # below that level (_opened_at_any_depth): here each holds the password
+        # in an attribute those leave out, as a subclass or another version of
         # its library can add one.
         head = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
         http_client_answer = http.client.HTTPResponse(
@@ -3162,7 +3246,7 @@ class FramesTest(StubTestCase):
         )
         self.make_profile("https://odoo.example.com", "xml-rpc", PASSWORD, "bad-api")
         self.make_profile("ftp://odoo.example.com", "xmlrpc", PASSWORD, "bad-url")
-        self.make_profile("https://odoo.example.com", "json2", PASSWORD, "not-a-key")
+        self.make_profile("https://odoo.example.com", "json2", f"{PASSWORD}_€", "not-in-a-header")
         self.make_store(
             "[odoo]\n"
             "url = https://odoo.example.com\n"
@@ -3176,7 +3260,7 @@ class FramesTest(StubTestCase):
             "no-api": PASSWORD,
             "bad-api": PASSWORD,
             "bad-url": PASSWORD,
-            "not-a-key": PASSWORD,
+            "not-in-a-header": PASSWORD,
             "bad-db": KEY,
         }
         for profile, password in cases.items():
@@ -3265,7 +3349,7 @@ class FramesTest(StubTestCase):
                 self.assertNoFrameHolds(error, PASSWORD)
 
     def test_no_frame_of_an_answer_refused_over_json2_holds_the_key(self):
-        # The answer's request carries the key in its headers, and Odoo's
+        # The answer's request carries the password in its headers, and Odoo's
         # error body can echo it, unmasked.
         answers = {
             "an error of Odoo echoing the key": (
@@ -3290,9 +3374,9 @@ class FramesTest(StubTestCase):
     def test_no_frame_of_a_call_made_in_the_middle_of_a_json2_call_reaches_its_answers(self):
         # A call over XML-RPC made in the middle of a call over JSON-2, as a
         # signal handler or a finalizer can make one, here once the answer
-        # came, whose headers echo the key, fails before anything is sent.
-        # The context of the call made in the middle, which a frame of its
-        # error holds, was a copy of the other's: it held the other's
+        # came, whose headers echo the password, fails before anything is
+        # sent. The context of the call made in the middle, which a frame of
+        # its error holds, was a copy of the other's: it held the other's
         # answers.
         json2_odoo = self.start(Json2Odoo())
         json2_odoo.answers[("res.partner", "search_count")] = Answer(200, 3, {"X-Echo": KEY})
@@ -3322,7 +3406,7 @@ class WireDebugTest(StubTestCase):
     """The library's own connections print nothing whatever the process's
     debug level: http.client.HTTPConnection.debuglevel = 1, as requests'
     docs set it to see the wire, would print each request's headers and
-    body, the API key or the password among them."""
+    body, the profile's password among them."""
 
     def setUp(self):
         super().setUp()
@@ -4944,11 +5028,11 @@ class KeptConnectionTest(StubTestCase):
         # own wrap_socket makes. urllib3 keeps the TCP socket in its connection
         # while ssl wraps it (HTTPSConnection.connect): before ssl takes it
         # over, the plain one, which would carry the next call unencrypted, the
-        # key in it; in the handshake, the one ssl detached. It closes that
-        # connection after anything a request raises, the interrupt too, and
-        # keeps it out of its pool (HTTPConnectionPool.urlopen): the reset,
-        # raised as the next call wraps its socket, shows that the call opened
-        # a new connection. The TLS socket that took the detached one's
+        # password in it; in the handshake, the one ssl detached. It closes
+        # that connection after anything a request raises, the interrupt too,
+        # and keeps it out of its pool (HTTPConnectionPool.urlopen): the
+        # reset, raised as the next call wraps its socket, shows that the call
+        # opened a new connection. The TLS socket that took the detached one's
         # descriptor over is out of urllib3's reach: ssl closes it after
         # anything the handshake raises, from Python 3.11.8 and 3.12.2
         # (SSLSocket._create). An earlier release's ssl, such as 3.11.6's,
