@@ -155,7 +155,7 @@ def _shown(local):
     values, and the library's loader holds the store's section for that
     (_read_section); a parser's sections show them all. Below that level,
     only the answers, the requests and the errors are opened, at any depth,
-    where the key or the password can be one attribute down of each."""
+    where the profile's password can be one attribute down of each."""
     texts = []
     # Each value to show, and whether it is of the frame's level.
     pending = [(local, True)]
@@ -230,14 +230,14 @@ def _one_attribute_down(value, frames_level):
 def _opened_at_any_depth(value):
     """What a debugger shows one attribute down of ``value``, an object below
     the frame's level (_one_attribute_down): of an answer, a request or an
-    error, at any depth, where the key or the password can be; of any other
+    error, at any depth, where the profile's password can be; of any other
     object, nothing.
 
     The repr of an answer, a request or an error of requests shows only a
     status, a method or a message; that of an answer of urllib3 or of
     http.client, or of a message's headers, only its class; that of
     xmlrpc.client's ProtocolError, not its headers. Each also shows what a
-    debugger shows one attribute down, where the key or the password can be:
+    debugger shows one attribute down, where the profile's password can be:
     requests' answer's body, url, status line's text (``reason``), headers,
     history (the answers of the redirects it followed, each shown so),
     request and the next request of a redirect it did not follow
@@ -247,7 +247,7 @@ def _opened_at_any_depth(value):
     status line's text, headers and body, once read; http.client's answer's
     status line's text and headers, and each header of a message; a
     ProtocolError's url and headers. A redirect's Location can echo the
-    key: in its answer's headers, and in the url of the request that
+    password: in its answer's headers, and in the url of the request that
     follows it, which is also the url of that request's answer."""
     if isinstance(value, requests.Response):
         down = [
@@ -512,9 +512,9 @@ class Json2Odoo(HttpRecorder):
     """Odoo's POST /json/2/<model>/<method>, as far as Client uses it.
 
     A request without ``Authorization: Bearer KEY`` gets the 401 Odoo sends
-    for a key it does not take. Any other answers from ``answers``: the
-    Answer or the RawAnswer set for its model and method, or a 200 with the
-    value set.
+    for a password that is not one of its API keys. Any other answers from
+    ``answers``: the Answer or the RawAnswer set for its model and method,
+    or a 200 with the value set.
     """
 
     def __init__(self):

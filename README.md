@@ -191,7 +191,7 @@ call above goes out as:
 | | `api = xmlrpc` | `api = json2` |
 |---|---|---|
 | Request | `execute_kw(db, uid, password, model, method, [ids], named)` on `/xmlrpc/2/object` (`[]` when `ids` is `None`; the leading arguments of eight ORM methods after the ids, below), after a login at the first call | `POST /json/2/<model>/<method>`, body `{"ids": ids, ...named}`, without `ids` when it is `None` |
-| Credential | the profile's `password`: a password or an API key | the profile's `password`, which must be an API key, as `Authorization: Bearer` |
+| Credential | the profile's `password`: a password or an API key | the profile's `password`, as `Authorization: Bearer`, which Odoo takes only as an API key |
 | Database | the profile's `db`, in each call | the profile's `db`, in the `X-Odoo-Database` header |
 
 `Client(profile)` reads the profile and sends nothing; its `api` attribute
@@ -406,7 +406,9 @@ shows it: § Configure a profile says what. The errors:
   others, has no valid `api` line, or holds a value its API cannot send
   (below).
 - `AuthError`: Odoo refuses the profile's credentials, at the XML-RPC login
-  or, over JSON-2, as an HTTP 401 for the API key.
+  or, over JSON-2, as an HTTP 401 for the password, which Odoo answers for
+  any password but one of its API keys, except, on Odoo 19, one with a NUL
+  among its first 8 characters, which gets an HTTP 403, an `OdooError`.
 - `RequestError`: a failure of the transport, in place of the error of
   `socket`, `ssl`, `http.client`, `xmlrpc.client`, `requests`, or `urllib3`,
   which `requests` raises as it is when it does not know one (such as the
@@ -419,8 +421,8 @@ shows it: § Configure a profile says what. The errors:
   a location that cannot be read as a URL (`RedirectError`). It carries the
   profile (`profile`), that error's class name (`error_class`) and its
   errno or HTTP status, if any (`code`), never its text, which can quote
-  the url, nor the request of `requests`, which holds the API key. It is
-  also an instance of that error's class, so `except OSError`,
+  the url, nor the request of `requests`, which holds the profile's
+  password. It is also an instance of that error's class, so `except OSError`,
   `except xmlrpc.client.ProtocolError`, `except requests.ConnectionError`
   and the like keep catching it; as a `ProtocolError` it keeps its
   `errcode`, while its `url` and `errmsg` are empty. For an answer that
@@ -623,7 +625,17 @@ chmod 600 ~/.config/odoo-auth/customer1.conf
 `api` names the API every call of the profile goes through:
 
 - `json2`, Odoo's External JSON-2 API, from Odoo 19. It takes only an Odoo
-  API key, which goes in `password`.
+  API key, which goes in `password`. That is Odoo's rule, which Odoo
+  enforces: the library sends the `password` the profile holds, and Odoo
+  answers one that is not one of its API keys with an HTTP 401, an
+  `AuthError` whose message says that JSON-2 takes only an API key
+  (§ Errors). Odoo 19 answers one with a NUL among its first 8 characters
+  with an HTTP 403 instead, an `OdooError`. The HTTP server that serves
+  Odoo, or a proxy in front of it, can refuse the header line that
+  carries the password before Odoo reads it, for its length or for a
+  character it does not take, with another status of its own, a
+  `RequestError`: a server built on Python's `http.server` answers a line
+  longer than 65,536 bytes with an HTTP 431.
 - `xmlrpc`, for Odoo 18 and earlier. Odoo 19 to 21 still serve it, but
   deprecated, and Odoo plans its removal for Odoo 22. On Odoo 19 the server
   logs a deprecation warning for each XML-RPC call, and an error with a
@@ -649,9 +661,12 @@ would swallow the path each request adds at the url's end
 `/json/2/<model>/<method>`), and no call could work; a path, as for a
 server behind a reverse proxy, is kept.
 An `api = json2` profile
-is refused too if its `password` is not an Odoo API key (40 lowercase
-hexadecimal digits) or its `db` is not one line of printable ASCII without
-spaces: JSON-2 sends both in headers. Neither is shown. It is refused as
+is refused too if its `password` is not one line of Latin-1 characters, as
+an Odoo API key always is, or its `db` is not one line of printable ASCII
+without spaces: JSON-2 sends both in headers, where `http.client`, which
+sends each request, refuses a line break with an error that quotes the
+value, and cannot encode a character outside Latin-1. Neither is shown.
+It is refused as
 well if `requests`, which JSON-2 sends through, refuses its `url` as it
 prepares a request, as for a host that starts with `*`, or prepares it for
 another scheme, host or port than the `url` names, as for a host with a
@@ -699,22 +714,22 @@ status, a fixed word.
 The wrapper is like `psql` reading `~/.pgpass` — credentials stay local,
 only the queries go over the wire. Over JSON-2, each request is checked as
 `requests` prepared it, the url as the connection reads it: one for another
-origin gets no key and is not sent, and a redirect to another origin is
-refused before anything is sent there. The client takes no proxy and no
+origin gets no password and is not sent, and a redirect to another origin
+is refused before anything is sent there. The client takes no proxy and no
 `~/.netrc` from the environment, as xmlrpc.client does not either.
 
 The library's own connections, `Client`'s over both APIs and `ServerProxy`'s
 with a profile, print nothing, whatever debug level the process sets:
 `http.client.HTTPConnection.debuglevel = 1`, the recipe of `requests`' docs
-to see the wire, would print each request's headers and body, the API key
-or the password among them. A `transport` the caller gives `ServerProxy`
+to see the wire, would print each request's headers and body, the profile's
+password among them. A `transport` the caller gives `ServerProxy`
 is not the library's, and prints them at that level (§ ServerProxy: the
 XML-RPC drop-in). To see what a call sends, use a local stub.
 While `Client` handles a call over JSON-2, no logger of `urllib3` logs a
 record either: at DEBUG, its pool's line for each request names the
 location of a redirect, and its warning for headers it cannot parse quotes
-them as the server sent them, either of which can carry the API key when
-the server echoes it, and an application that configured logging
+them as the server sent them, either of which can carry the profile's
+password when the server echoes it, and an application that configured logging
 (`logging.basicConfig()`) would print it. The records that `urllib3` logs
 in the call's thread or task while the call runs are dropped, whoever
 logs them: code that runs there meanwhile, such as a signal handler or a
@@ -733,16 +748,17 @@ What the transports take from the environment, and what they do not:
   setting for another bundle.
 - Both write the session keys of TLS to the file `SSLKEYLOGFILE` names,
   when it is set: urllib3 reads it for JSON-2, Python's `ssl` for XML-RPC.
-  Whoever reads that file can decrypt the traffic, the password or the key
+  Whoever reads that file can decrypt the traffic, the profile's password
   included.
 
 JSON-2 goes through `requests` and not the standard library's `urllib`
-because of the key: `urllib`'s redirect handler copies a request's headers,
-an `Authorization` header among them, to whatever host a redirect names
-(`urllib/request.py`, `HTTPRedirectHandler.redirect_request`), and gives no
-hook to check where a request goes. `requests` drops `Authorization` when a
-redirect changes host, and its session gives the two hooks the client uses:
-the auth, called with each request as prepared, which sets the key only for
+because of the profile's password: `urllib`'s redirect handler copies a
+request's headers, an `Authorization` header among them, to whatever host
+a redirect names (`urllib/request.py`,
+`HTTPRedirectHandler.redirect_request`), and gives no hook to check where
+a request goes. `requests` drops `Authorization` when a redirect changes
+host, and its session gives the two hooks the client uses: the auth,
+called with each request as prepared, which sets the password only for
 the profile's origin, and `rebuild_auth`, called on each redirect before
 anything is sent, which refuses any other origin.
 

@@ -69,10 +69,6 @@ _ACCEPTED_API_LINES = " or ".join(f"`api = {api}`" for api in _APIS)
 _URL_SCHEMES = ("http", "https")
 # The port a url names when it names none: an origin is compared by its port.
 _DEFAULT_PORTS = {"http": 80, "https": 443}
-# An Odoo API key, the only password JSON-2 takes: 20 random bytes in
-# lowercase hexadecimal (Odoo 19, odoo/addons/base/models/res_users.py,
-# API_KEY_SIZE and ResUsersApikeys._generate).
-_API_KEY = re.compile(r"[0-9a-f]{40}")
 # What xmlrpc.client's parser raises for an answer that is not XML-RPC (read
 # in Python 3.11's xmlrpc/client.py, the Unmarshaller and
 # Transport.parse_response): text that is not XML, such as a login page; XML
@@ -202,7 +198,9 @@ class ConfigError(Exception):
 
 class AuthError(Exception):
     """Raised when Odoo refuses the profile's credentials: its XML-RPC login,
-    or its API key over JSON-2 (an HTTP 401)."""
+    or its password over JSON-2, which takes only one of Odoo's API keys (an
+    HTTP 401). Odoo 19 answers a password with a NUL among its first 8
+    characters with a 403 instead, an OdooError."""
 
 
 class RequestError(Exception):
@@ -213,10 +211,10 @@ class RequestError(Exception):
     another origin, a redirect to a location that cannot be read.
 
     That error's text can quote the url, and an error of requests keeps the
-    request, which holds the API key, so this one carries only the profile
-    (``profile``), the error's class name (``error_class``) and its errno or
-    HTTP status, if any (``code``). Its class is also a subclass of that
-    error's class, so ``except OSError``, ``except
+    request, which holds the profile's password, so this one carries only
+    the profile (``profile``), the error's class name (``error_class``) and
+    its errno or HTTP status, if any (``code``). Its class is also a
+    subclass of that error's class, so ``except OSError``, ``except
     xmlrpc.client.ProtocolError``, ``except requests.ConnectionError`` and the
     like keep catching it; standing for an error of requests, its
     ``request`` and ``response`` are None, and standing for one of urllib3,
@@ -736,6 +734,26 @@ def _is_one_ascii_line(text):
     return " " not in text and text.isprintable() and text.isascii()
 
 
+def _is_one_latin1_line(text):
+    """Whether ``text``, a value of the store, is one line of Latin-1
+    characters, U+0000 to U+00FF: one a header carries as it is.
+
+    http.client, which sends each request of urllib3, encodes a header's
+    value as Latin-1, and refuses one with a line feed that no space or tab
+    follows, or a carriage return that no space, tab or line feed follows
+    (HTTPConnection.putheader): the UnicodeEncodeError holds the value, and
+    the ValueError quotes it. Both are refused here wherever they are, each
+    a line break: no line feed of the store has a space or a tab after it,
+    as configparser strips each line of a value, and the store's file is
+    read with universal newlines, which turn a carriage return into a line
+    feed."""
+    return (
+        "\n" not in text
+        and "\r" not in text
+        and all(ord(char) <= 0xFF for char in text)
+    )
+
+
 def _check_permissions(path, fd=None):
     mode = (os.fstat(fd) if fd is not None else os.stat(path)).st_mode
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
@@ -861,8 +879,8 @@ def _url_fault(url):
 def _requests_sends_elsewhere(url):
     """Whether requests, as it prepares a request for ``url``, which
     _url_fault let through, refuses it, or gives it another origin than
-    ``url``'s: the auth would refuse each call, as it sets the key only for
-    the url's own origin (_BearerKey). requests
+    ``url``'s: the auth would refuse each call, as it sets the profile's
+    password only for the url's own origin (_BearerKey). requests
     refuses a host that starts with * (PreparedRequest.prepare_url), and
     writes some hosts otherwise than urllib.parse reads them: it quotes a >
     or a {, writes the % of an IPv6 zone as %25 when no escape follows it
@@ -903,18 +921,24 @@ def _idna_refuses(hostname):
 
 def _check_json2(profile, section, config_path):
     """Raise ConfigError unless the values of ``section``, the profile's,
-    that JSON-2 sends in headers can go there: the password is an Odoo API
-    key, and the db one line of printable ASCII without spaces.
+    that JSON-2 sends in headers can go there: the password is one line of
+    Latin-1 characters (_is_one_latin1_line), and the db one line of
+    printable ASCII without spaces.
 
-    Each is checked before any call, since the transport would refuse it
-    with an error that quotes it. Neither is quoted here, nor held in a
-    local.
+    Each is checked before any call: the transport would refuse a line
+    break in either, or a character outside Latin-1, with an error that
+    holds or quotes the value. Neither is quoted here, nor held in a local.
+    Whether the password is one Odoo takes is for Odoo to answer: its
+    JSON-2 takes only an API key, and answers any other password with a
+    401, an AuthError (_Json2._outcome), but one with a NUL among its first
+    8 characters, which Odoo 19 answers with a 403, an OdooError.
     """
-    if not _API_KEY.fullmatch(section["password"]):
+    if not _is_one_latin1_line(section["password"]):
         raise ConfigError(
             f"The password of profile {profile!r}, in {_one_line(config_path)}, "
-            "must be an Odoo API key, 40 lowercase hexadecimal digits: "
-            "`api = json2` takes no other. It is not shown."
+            "must be one line of Latin-1 characters, as JSON-2 sends it in a "
+            "header: an Odoo API key, the only password JSON-2 takes, always "
+            "is. It is not shown."
         )
     if not _is_one_ascii_line(section["db"]):
         raise ConfigError(
@@ -1396,11 +1420,11 @@ class _Json2CallRecords(logging.Filter):
     (_IN_JSON2_CALL), whoever logs it, such as a signal handler or a
     finalizer that runs there meanwhile for another connection, as a record
     does not carry what would tell the library's apart; lets every other
-    through as it is. Such a record of the call can carry the API key, which
-    any application that configured logging would print: the pool's request
-    line, at DEBUG, names a redirect's location, which can echo it, and the
-    connection's warning for headers it cannot parse quotes them as the
-    server sent them."""
+    through as it is. Such a record of the call can carry the profile's
+    password, which any application that configured logging would print:
+    the pool's request line, at DEBUG, names a redirect's location, which
+    can echo it, and the connection's warning for headers it cannot parse
+    quotes them as the server sent them."""
 
     def filter(self, record):
         return not _IN_JSON2_CALL.get()
@@ -1452,8 +1476,8 @@ class _Quiet:
     over both APIs and ServerProxy's with a profile: it prints nothing,
     whatever the process's debug level. At http.client.HTTPConnection's
     debuglevel 1, as requests' docs set it to see the wire, a connection
-    prints each request's headers and body, the API key or the password
-    among them."""
+    prints each request's headers and body, the profile's password among
+    them."""
 
     debuglevel = 0
 
@@ -1882,9 +1906,9 @@ def _send(profile, call):
         result = call()
     except _TRANSPORT_ERRORS as error:
         # Its text can quote the url, and an error of requests keeps the
-        # request, which holds the API key, as the frames of its traceback
-        # hold the password: RequestError, raised after this block, keeps
-        # none of them.
+        # request, which holds the profile's password, as the frames of its
+        # traceback do: RequestError, raised after this block, keeps none
+        # of them.
         failure = _request_error(profile, error)
     if failure is not None:
         raise failure
@@ -2029,17 +2053,18 @@ def _is_odoo_error(answer):
 
 
 class _BearerKey(requests.auth.AuthBase):
-    """Puts the API key (``key``, a _Secret) in the Authorization header of
-    each request the session prepares for the origin of ``url``, and of no
-    other: a request for another origin raises InvalidURL before the key is
-    set, and nothing is sent. Its repr shows only the key's length."""
+    """Puts the profile's password (``key``, a _Secret), which JSON-2 takes
+    only as one of Odoo's API keys, in the Authorization header of each
+    request the session prepares for the origin of ``url``, and of no other:
+    a request for another origin raises InvalidURL before the password is
+    set, and nothing is sent. Its repr shows only the password's length."""
 
     def __init__(self, key, url):
         self._key = key
         self._origin = _origin(url)
 
     def goes_to(self, url):
-        """Whether the key may go to ``url``: one of its own origin."""
+        """Whether the password may go to ``url``: one of its own origin."""
         return _origin(url) == self._origin
 
     def __call__(self, request):
@@ -2050,7 +2075,7 @@ class _BearerKey(requests.auth.AuthBase):
         if not self.goes_to(request.url):
             raise requests.exceptions.InvalidURL(
                 "The request would go to another origin than the profile's "
-                "url: the key was not set, and nothing was sent"
+                "url: the password was not set, and nothing was sent"
             )
         request.headers["Authorization"] = f"Bearer {self._key.reveal()}"
         return request
@@ -2407,14 +2432,14 @@ def _drained_redirect(response, **kwargs):
 
 
 class _OriginSession(requests.Session):
-    """A requests session whose auth sends the API key only to the origin
-    of ``url``, and which follows a redirect only within that origin: a
-    request or a redirect for any other raises before anything is sent
-    there. A redirect's body is read undecoded and dropped as it comes
+    """A requests session whose auth sends the profile's password only to
+    the origin of ``url``, and which follows a redirect only within that
+    origin: a request or a redirect for any other raises before anything is
+    sent there. A redirect's body is read undecoded and dropped as it comes
     (_drained_redirect).
 
     It takes no proxy from the environment, which for an http url would
-    receive the key (xmlrpc.client, the other transport, uses none), no
+    receive the password (xmlrpc.client, the other transport, uses none), no
     ~/.netrc and no CA bundle (REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE): requests
     checks certificates against its own, where xmlrpc.client uses the
     system's store. urllib3 still reads SSLKEYLOGFILE, as Python's ssl does
@@ -2666,7 +2691,7 @@ def _fault_text(value):
 
 class _Json2:
     """Client.call over Odoo's External JSON-2 API (Odoo 19 and later): one
-    POST to /json/2/<model>/<method> per call, the API key as a bearer
+    POST to /json/2/<model>/<method> per call, the password as a bearer
     token and the profile's db in the X-Odoo-Database header, under
     ``timeout``, a (connect, read) pair of seconds, as requests takes it."""
 
@@ -2703,7 +2728,7 @@ class _Json2:
         # gone, and the answers they held with them: an answer kept in a frame
         # of the error would keep its pool alive, whose connections urllib3
         # closes only once the pool is collected, and its headers, which can
-        # echo the key. As each answer of urllib3 goes, IOBase's finalizer
+        # echo the password. As each answer of urllib3 goes, IOBase's finalizer
         # reads whether it is closed, in code of urllib3, and drops an
         # interrupt, a MemoryError or a RecursionError that comes there: the
         # call goes on as if it had not come (README § Errors).
@@ -2759,7 +2784,7 @@ class _Json2:
             # connection alone. Each is taken out of the list as it is closed,
             # into no local: this frame stays in the traceback of the error,
             # and a loop's variable would keep the last answer, whose headers
-            # can echo the key.
+            # can echo the password.
             while answers:
                 answers.pop().close()
             raise
@@ -2774,19 +2799,26 @@ class _Json2:
         transport with the answer's status as its code (_request_error).
 
         Returned, not raised: the frame that raises the error holds neither
-        the answer, whose request carries the key in its headers, nor its
-        body, which can echo the key, unmasked.
+        the answer, whose request carries the profile's password in its
+        headers, nor its body, which can echo it, unmasked.
         """
         status = response.status_code
         if status == 401:
-            # Odoo's answer to a key it does not take (Odoo 19,
-            # odoo/addons/base/models/ir_http.py, _auth_method_bearer). Its
-            # body adds nothing to the refusal and is not read, so that one
-            # that cannot be read does not stand for it. An answer left unread
-            # keeps its connection until it is closed (requests' stream=True).
+            # Odoo's answer to a password that is not one of its API keys
+            # (Odoo 19, odoo/addons/base/models/ir_http.py,
+            # _auth_method_bearer), but one with a NUL among its first 8
+            # characters, which its key lookup cannot put into SQL: Odoo
+            # answers that one with a 403, an OdooError. The 401's body adds
+            # nothing to the refusal and is not read, so that one that cannot
+            # be read does not stand for it. An answer left unread keeps its
+            # connection until it is closed (requests' stream=True).
             response.close()
             return (
-                AuthError(f"Authentication failed for profile {self._profile!r}"),
+                AuthError(
+                    f"Authentication failed for profile {self._profile!r}: "
+                    "over JSON-2, Odoo takes only one of its API keys as the "
+                    "password"
+                ),
                 None,
             )
         failure = None
